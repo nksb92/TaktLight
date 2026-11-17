@@ -46,3 +46,4 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the complete system archi
 
 * **Backend / Real-Time Core:** Rust (`Tauri v2`, `tokio`, `socket2`, `spin_sleep`, `parking_lot`, `serde_json`, `quick-xml`, `symphonia`, `cpal`)
 * **Frontend / Studio UI:** React, TypeScript, Zustand, Tailwind CSS, HTML5 2D Canvas
+* **Design System:** Another German Engineer (AGE) Design System V1.0 (`VOID #0A0F18`, `PITCH #0D1117`, `SLATE_DARK #111827`, `SLATE #1A2535`, `STEEL #4A5A6A`, `MIST #E8EEF6`, `FOG #8898A8`, `EMBER #FF5500`, `COBALT #2255AA`, `PLUM #8833AA`, `PINE #1E6B35`, `SIGNAL #CC0000`; `DM Sans` + `Fira Code`)

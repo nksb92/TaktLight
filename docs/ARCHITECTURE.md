@@ -76,7 +76,39 @@ flowchart LR
 * **React Frontend (`package.json`):**
   * `zustand` (UI state store synced with Rust backend)
   * `HTML5 Canvas 2D` or `pixi.js` (for the 2D Fixture Grid and Phase 2 Super Scene waveform/timeline)
-  * `lucide-react` + `tailwindcss` (Dark-mode lighting console UI)
+  * `lucide-react` + `tailwindcss` configured with the **Another German Engineer (AGE) Design System V1.0** color palette and typography (`DM Sans` + `Fira Code`)
+
+---
+
+## 2.1 UI Design System (AGE Design Guide V1.0)
+
+TaktLight's studio interface strictly follows the **Another German Engineer Design System V1.0** so the software UI visually matches the channel's hardware diagrams, code overlays, and Manim animations.
+
+### Color Palette Tokens
+
+| Token | Hex | UI Role in TaktLight |
+| :--- | :--- | :--- |
+| **`VOID`** | `#0A0F18` | 2D Fixture Grid canvas background & outer workspace frame |
+| **`PITCH`** | `#0D1117` | Deepest inset backgrounds (Super Scene track lanes, 512ch DMX Monitor cells, JSON/XML preview) |
+| **`SLATE_DARK`** | `#111827` | Primary application background & main docking shell |
+| **`INK`** | `#1A2030` | Input fields, fader tracks, metric badges, and inactive scene buttons |
+| **`SLATE`** | `#1A2535` | Inspector cards, modals, Fixture Builder panels, and FX Block bodies |
+| **`STEEL`** | `#4A5A6A` | `1px` panel hairlines, card borders (`rounded-[10px]`), and 2D canvas grid lines |
+| **`FOG`** | `#8898A8` | Secondary labels, DMX channel indices (`001..512`), and inactive tab text |
+| **`MIST`** | `#E8EEF6` | Primary UI text, active fixture names, and parameter values |
+| **`FROST`** | `#F2F6FB` | High-contrast cursor/handle highlights |
+| **`EMBER`** | `#FF5500` | Primary hot accent: selected fixture ring, active fader fill, timeline playhead, and header accent bars |
+| **`BURNT`** | `#D94400` | Hover/pressed state for `EMBER` interactive controls |
+| **`COBALT`** | `#2255AA` | 1D/2D oscillator wave curves, sACN universe badges, and Pan/Tilt vector paths |
+| **`PLUM`** | `#8833AA` | BPM / beat-grid markers, phase-offset (`0°..360°`) indicators, and 16-bit channel badges |
+| **`PINE`** | `#1E6B35` | Network output healthy (`44.0 Hz`), ArtPoll node online, and valid patch state |
+| **`SIGNAL`** | `#CC0000` | Blackout active, Channel Park override warning, and DMX address collision alert |
+
+### Typography & Component Styling
+
+* **Primary UI Font (`FONT_SANS`):** `DM Sans` (`400` regular for body, `500` medium for labels, `600` semibold for panel headers).
+* **Technical / Monospace Font (`FONT_CODE`):** `Fira Code` for all numerical metrics, DMX addresses (`U1.001`), raw `0..255` / `0x00..0xFF` values, IP addresses, frame rate (`44.0 Hz`), and timeline timecode (`00:01:24.50`).
+* **Card & Header Pattern:** Panels use `SLATE` (`#1A2535`) fill with a `1.5px` `STEEL` (`#4A5A6A`) border, `10px` corner radius, an uppercase `Fira Code` category tag in `FOG` (`#8898A8`), a `DM Sans` title in `MIST` (`#E8EEF6`), and a short `EMBER` (`#FF5500`) accent rule underneath.
 
 ---
 
