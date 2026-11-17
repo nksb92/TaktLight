@@ -33,6 +33,9 @@ Designed as a streamlined, modern studio show designer inspired by the **Dasligh
   * DAW-style multi-track timeline synchronized to `.wav`, `.mp3`, and `.flac` audio playback with visual waveforms, beat-grid markers, and draggable `FxBlock` clips with fade handles.
 * **Tuned XML Project Files (`.takt.xml`):**
   * Human-readable, Git-friendly `<TaktLightShow>` XML schema unifying Phase 1 looping scenes and Phase 2 timecode tracks under the same `<FxBlock>` model.
+* **Strict Test-Driven Development (TDD) Architecture:**
+  * Every feature slice is developed test-first (`Red -> Green -> Refactor`).
+  * Pure Rust core engine (`taktlight-engine`) with deterministic time injection `evaluate_frame(t_sec)` and trait-mocked `PacketSink` allows 100% unit test coverage (`cargo test` + `vitest`) of protocol framing, fixture parsing, float trait mixing, and 1D/2D FX math without launching a GUI window or opening physical sockets.
 
 ---
 

@@ -307,11 +307,40 @@ Both protocols are simple enough that Rust can construct the UDP payloads direct
 
 ---
 
-## 6. Phased Implementation Plan (6 Vertical Slices)
+## 6. Test-Driven Development (TDD) Mandate & Test Architecture
 
-1. **Slice 1 (Scaffold & UDP Engine):** Initialize Tauri v2 (Rust + React/TS). Build the Rust 44 Hz loop, Art-Net v4 + sACN packet senders, ArtPoll discovery list, and the React **512-Channel DMX Monitor & Park Matrix**. Verify output using Wireshark or an Art-Net/sACN node.
-2. **Slice 2 (Fixture `.fixture.json` Schema & In-App Builder):** Implement the Rust `FixtureProfile` structs (`serde_json`) and build the React **Fixture Builder UI** to create/edit channels, 16-bit pairs, Color/Shutter capability ranges, and multi-cell layouts.
-3. **Slice 3 (Patch Manager, `.takt.xml` Show File & 2D Fixture Grid):** Implement `<TaktLightShow>` XML load/save, Universe Patch table, and the interactive **2D Fixture Grid Canvas** (drag/rotate fixtures and multi-cell bars, lasso selection, 1D selection ordering modes).
-4. **Slice 4 (Trait-Space Mixer & Smart Attribute Palettes):** Implement the 4-stage Rust `f32` Trait-Space Mixer (Virtual Dimmer, RGBW extraction, Color-Wheel nearest-slot matching, 16-bit Pan/Tilt) + React **Smart Controls** (Color Picker/Wheel palette, XY Pan/Tilt pad with fanning, Shutter controls) + live color/dot feedback on the 2D Grid.
-5. **Slice 5 (Scene Manager & 1D/2D FX Engine):** Implement `FxBlock` evaluators (Static/Fanning, Step Chases, 1D Waveforms & Lissajous Pan/Tilt shapes, and 2D Spatial Shaders sampled on the 2D Grid) with Hz and BPM/Tap-Tempo timing.
-6. **Slice 6 (Phase 2: Super Scene Timeline):** Add Rust audio decoding/playback (`symphonia`/`cpal`), waveform peak extraction, and the multi-track React Canvas timeline that schedules the existing `FxBlock` and `Scene` clips against audio timecode.
+> [!IMPORTANT]
+> **Strict TDD Rule (`Red -> Green -> Refactor`):** Every feature across both the Rust engine and TypeScript frontend must be developed test-first. No feature slice is complete until its unit test suite passes (`cargo test --workspace` and `npm run test`).
+
+### 6.1 Decoupling the Engine for 100% Unit Testability
+
+To make the entire lighting engine deterministically testable without launching a Tauri GUI window or binding real OS network interfaces:
+1. **Pure Core Library (`taktlight-engine`):** All domain logic (schemas, patch validation, 2D spatial indexing, FX math, Trait-Space Mixer, DMX quantizer, and UDP packet builders) lives in a standalone Rust library crate or pure modules with zero Tauri dependencies.
+2. **Deterministic Clock Injection:** The 44 Hz pipeline never calls `Instant::now()` inside evaluators; instead, time `t_sec: f64` and `bpm: f32` are passed explicitly into ` Engine::evaluate_frame(t_sec)`. Unit tests can assert exact DMX output bytes at arbitrary timestamps (`t = 0.0s`, `t = 0.25s`, `t = 1.5s`).
+3. **Mock Network Transport (`PacketSink` Trait):** The network layer writes constructed packets (`&[u8]`) to a `PacketSink` trait. Production uses `UdpSocketSink`; unit tests use `MockPacketSink` to inspect exact packet lengths and byte offsets without touching the OS network stack.
+
+### 6.2 Mandatory Unit Test Coverage Matrix
+
+| Subsystem | Required Unit Tests (`cargo test` / `vitest`) |
+| :--- | :--- |
+| **1. Protocol Framing (`Art-Net v4` & `sACN`)** | Byte-exact header verification: `ArtDmx` (530 bytes, OpCode `0x5000` LE, `Net`/`SubUni` packing), `ArtSync` (14 bytes, `0x5200`), `ArtPollReply` parsing, and `sACN E1.31` (638 bytes, multicast IP `239.255.Hi.Lo` calculation, sequence rollover `255 -> 0`). |
+| **2. Fixture `.fixture.json` & Patch Validation** | JSON round-trip serialization, multi-cell channel expansion (`start_channel + cell_idx * stride + offset`), 16-bit `fine_index` bounds checking, and universe address collision detection (`> 512` overflow rejection). |
+| **3. Show `.takt.xml` Persistence** | XML serialization and deserialization round-trips (`<TaktLightShow>`), ensuring zero data loss across `<NetworkOutputs>`, `<Patch>`, `<Groups>`, `<Scenes>`, and `<SuperScenes>`. |
+| **4. 1D Group Ordering & 2D Grid Math** | Normalized index $u_i \in [0, 1]$ calculation for `Linear`, `Reverse`, `Symmetrical Center Out`, `Mirror`, and `Odd/Even` group orders; bounding-box normalization and rotation transforms on the 2D canvas. |
+| **5. Pure FX Evaluators $f(t)$** | Waveform outputs (`Sine`, `Triangle`, `Saw`, `Square`, `Circle`, `Lissajous`) at known phases ($\phi = 0, 0.25, 0.5, 0.75$), phase-spread distribution across $N$ cells, and 2D spatial shader sampling. |
+| **6. Trait-Space Mixer (`f32`)** | `HTP` (`max`) dimmer merging, `LTP` crossfade alpha blending, `Relative +/-` Pan/Tilt and dimmer modulation clamping (`0.0..=1.0`), and Master Dimmer scaling. |
+| **7. Trait-to-DMX Hardware Quantizer** | 16-bit `f32 -> u16 -> (coarse_u8, fine_u8)` splitting, Virtual Dimmer multiplication on RGB-only cells, RGBW white extraction, nearest-slot Euclidean color matching on mechanical Color Wheels, and Channel Park overrides. |
+| **8. Frontend Store & Canvas Logic (`Vitest`)** | Zustand state mutations, fixture builder validation rules, multi-cell selection lasso hit-testing, and timeline beat-to-pixel coordinate conversions. |
+
+---
+
+## 7. Phased Implementation Plan (6 Vertical TDD Slices)
+
+Each vertical slice follows the strict workflow: **1. Define Types/Contracts -> 2. Write Failing Unit Tests -> 3. Implement Logic -> 4. Verify `cargo test` & `vitest` -> 5. Wire UI.**
+
+1. **Slice 1 (Scaffold, TDD Harness & UDP Engine):** Initialize Tauri v2 + `vitest` + `cargo test` workspace. Write unit tests for `ArtDmx`, `ArtSync`, `ArtPoll`, and `sACN` packet framing and Channel Park overrides using `MockPacketSink`. Implement the Rust 44 Hz loop and the React **512-Channel DMX Monitor & Park Matrix**.
+2. **Slice 2 (Fixture `.fixture.json` Schema & In-App Builder):** Write unit tests for `.fixture.json` serialization, multi-cell channel expansion, and capability range validation. Implement the Rust `FixtureProfile` structs and React **Fixture Builder UI**.
+3. **Slice 3 (Patch Manager, `.takt.xml` Show File & 2D Fixture Grid):** Write unit tests for `<TaktLightShow>` XML round-trips, patch collision detection, and 1D/2D spatial ordering math. Implement the Universe Patch table and interactive **2D Fixture Grid Canvas**.
+4. **Slice 4 (Trait-Space Mixer & Smart Attribute Palettes):** Write unit tests for HTP/LTP/Relative float mixing, 16-bit Pan/Tilt splitting, Virtual Dimmer, and RGB-to-ColorWheel slot quantization. Implement the 4-stage Rust mixer and React **Smart Controls** (Color Picker/Wheel palette, XY Pan/Tilt pad) + live 2D Grid feedback.
+5. **Slice 5 (Scene Manager & 1D/2D FX Engine):** Write deterministic time-stepped unit tests (`evaluate_frame(t)`) for Static/Fanning, Step Chases, 1D Oscillators, and 2D Spatial Shaders under both Hz and BPM clocks. Wire up the Scene & FX Inspector UI.
+6. **Slice 6 (Phase 2: Super Scene Timeline):** Write unit tests for timecode-to-beat conversion, clip fade-in/fade-out envelopes, and multi-track clip priority. Add Rust audio decoding/playback (`symphonia`/`cpal`), waveform peak extraction, and the multi-track React Canvas timeline.
