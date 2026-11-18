@@ -16,8 +16,6 @@ tauri-build = { version = "2", features = [] }
 arc-swap.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 taktlight-engine = { path = "../crates/taktlight-engine" }
 tauri = { version = "2", features = [] }
 tokio.workspace = true
-uuid.workspace = true
