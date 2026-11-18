@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::show::spatial::{compute_order_u, OrderRule};
 use crate::show::targets::TargetRef;
 use crate::show::ShowError;
-use crate::state::plan::{CompiledFixture, CompiledGroup};
+use crate::state::plan::{CompiledFixture, CompiledGroup, RenderPlan};
 
 use super::color::{
     linear_rgb_to_oklab, oklab_to_linear_rgb, parse_hex_to_linear_rgb, CompiledColorPalette,
@@ -421,6 +421,24 @@ pub fn evaluate_layer_stack_inputs(
     }
 
     (fixture_states, cell_states)
+}
+
+pub fn evaluate_layer_stack(
+    plan: &RenderPlan,
+    layers: &[SmartControlLayer],
+    grand_master: f32,
+    blackout: bool,
+) -> (Vec<FixtureTraitState>, Vec<CellTraitState>) {
+    evaluate_layer_stack_inputs(
+        &plan.fixtures,
+        &plan.groups,
+        &plan.color_palettes,
+        &plan.dimmer_palettes,
+        plan.cell_count as usize,
+        layers,
+        grand_master,
+        blackout,
+    )
 }
 
 #[cfg(test)]

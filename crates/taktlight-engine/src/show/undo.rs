@@ -9,7 +9,9 @@ use super::patch::{
     validate_patch_no_collisions, FixtureCalibration, FixtureInstance,
 };
 use super::spatial::GridPos;
-use super::xml::{serialize_show_xml, FixtureGroupDef, ShowState};
+use super::xml::{
+    serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef, ShowState,
+};
 use super::ShowError;
 
 pub const DEFAULT_MAX_UNDO_ENTRIES: usize = 500;
@@ -52,6 +54,23 @@ pub enum ShowCommand {
     UpsertGroup {
         before: Option<FixtureGroupDef>,
         after: FixtureGroupDef,
+    },
+    DeleteGroup {
+        removed: FixtureGroupDef,
+    },
+    UpsertColorPalette {
+        before: Option<ColorPaletteDef>,
+        after: ColorPaletteDef,
+    },
+    DeleteColorPalette {
+        removed: ColorPaletteDef,
+    },
+    UpsertDimmerPalette {
+        before: Option<DimmerPaletteDef>,
+        after: DimmerPaletteDef,
+    },
+    DeleteDimmerPalette {
+        removed: DimmerPaletteDef,
     },
     ReplaceShowState {
         before: Box<ShowState>,
@@ -212,6 +231,34 @@ impl ShowCommand {
                 }
                 Ok(())
             }
+            Self::DeleteGroup { removed } => {
+                state.groups.retain(|g| g.id != removed.id);
+                Ok(())
+            }
+            Self::UpsertColorPalette { after, .. } => {
+                if let Some(existing) = state.color_palettes.iter_mut().find(|p| p.id == after.id) {
+                    *existing = after.clone();
+                } else {
+                    state.color_palettes.push(after.clone());
+                }
+                Ok(())
+            }
+            Self::DeleteColorPalette { removed } => {
+                state.color_palettes.retain(|p| p.id != removed.id);
+                Ok(())
+            }
+            Self::UpsertDimmerPalette { after, .. } => {
+                if let Some(existing) = state.dimmer_palettes.iter_mut().find(|p| p.id == after.id) {
+                    *existing = after.clone();
+                } else {
+                    state.dimmer_palettes.push(after.clone());
+                }
+                Ok(())
+            }
+            Self::DeleteDimmerPalette { removed } => {
+                state.dimmer_palettes.retain(|p| p.id != removed.id);
+                Ok(())
+            }
             Self::ReplaceShowState { after, .. } => {
                 *state = (**after).clone();
                 Ok(())
@@ -303,6 +350,41 @@ impl ShowCommand {
                 } else {
                     state.groups.retain(|g| g.id != after.id);
                 }
+                Ok(())
+            }
+            Self::DeleteGroup { removed } => {
+                state.groups.push(removed.clone());
+                Ok(())
+            }
+            Self::UpsertColorPalette { before, after } => {
+                if let Some(prev) = before {
+                    if let Some(existing) = state.color_palettes.iter_mut().find(|p| p.id == prev.id)
+                    {
+                        *existing = prev.clone();
+                    }
+                } else {
+                    state.color_palettes.retain(|p| p.id != after.id);
+                }
+                Ok(())
+            }
+            Self::DeleteColorPalette { removed } => {
+                state.color_palettes.push(removed.clone());
+                Ok(())
+            }
+            Self::UpsertDimmerPalette { before, after } => {
+                if let Some(prev) = before {
+                    if let Some(existing) =
+                        state.dimmer_palettes.iter_mut().find(|p| p.id == prev.id)
+                    {
+                        *existing = prev.clone();
+                    }
+                } else {
+                    state.dimmer_palettes.retain(|p| p.id != after.id);
+                }
+                Ok(())
+            }
+            Self::DeleteDimmerPalette { removed } => {
+                state.dimmer_palettes.push(removed.clone());
                 Ok(())
             }
             Self::ReplaceShowState { before, .. } => {

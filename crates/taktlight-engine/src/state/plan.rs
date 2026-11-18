@@ -2,6 +2,8 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mixer::color::{CompiledColorPalette, CompiledDimmerPalette};
+use crate::mixer::traits::SmartControlLayer;
 use crate::ofl::expander::{ChannelRole, ChannelTarget};
 use crate::show::patch::FixtureCalibration;
 use crate::show::spatial::OrderRule;
@@ -105,6 +107,9 @@ pub struct RenderPlan {
     pub fixtures: Vec<CompiledFixture>,
     pub cells: Vec<CompiledCell>,
     pub groups: Vec<CompiledGroup>,
+    pub color_palettes: Vec<CompiledColorPalette>,
+    pub dimmer_palettes: Vec<CompiledDimmerPalette>,
+    pub static_layers: Vec<SmartControlLayer>,
 }
 
 impl Default for RenderPlan {
@@ -142,6 +147,9 @@ impl RenderPlan {
             fixtures: Vec::new(),
             cells: Vec::new(),
             groups: Vec::new(),
+            color_palettes: Vec::new(),
+            dimmer_palettes: Vec::new(),
+            static_layers: Vec::new(),
         }
     }
 }
