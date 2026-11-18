@@ -40,8 +40,12 @@ const OKLAB_STOPS = [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1];
 
 export function PalettesAndControls({
   hideUndoRedo = false,
+  hideGroups = false,
+  daslightDock = false,
 }: {
   hideUndoRedo?: boolean;
+  hideGroups?: boolean;
+  daslightDock?: boolean;
 }) {
   const showState = useTaktStore((s) => s.showState);
   const liveLayers = useTaktStore((s) => s.liveLayers);
@@ -76,6 +80,9 @@ export function PalettesAndControls({
   );
 
   const [layerSeq, setLayerSeq] = useState(1);
+  const [dockFilter, setDockFilter] = useState<
+    "all" | "dimmer" | "color" | "shutter" | "palettes"
+  >("all");
 
   const softwareStrobeWarning = useMemo(
     () => hasSoftwareStrobeOverCap(liveLayers, showState, fixtureDetailsCache),
@@ -234,21 +241,21 @@ export function PalettesAndControls({
   };
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Header Bar */}
-      <section className="bg-slate border border-steel rounded-panel p-3 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <h2 className="font-sans text-sm font-semibold text-frost">
-            Trait Space Mixer &amp; Referenceable Palettes
-          </h2>
-          {softwareStrobeWarning && (
-            <span className="px-2.5 py-1 rounded bg-signal/15 border border-signal text-signal font-mono text-xs font-semibold flex items-center gap-1.5">
-              <AlertTriangle className="w-3.5 h-3.5" />
-              <span>SOFTWARE STROBE CAPPED AT 11 HZ</span>
-            </span>
-          )}
-        </div>
-        {!hideUndoRedo && (
+    <div className="flex flex-col gap-3">
+      {/* Header Bar (omitted inside unified Daslight dock when host handles Undo/Redo) */}
+      {!hideUndoRedo && (
+        <section className="bg-slate border border-steel rounded-panel p-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h2 className="font-sans text-sm font-semibold text-frost">
+              Trait Space Mixer &amp; Referenceable Palettes
+            </h2>
+            {softwareStrobeWarning && (
+              <span className="px-2.5 py-1 rounded bg-signal/15 border border-signal text-signal font-mono text-xs font-semibold flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span>SOFTWARE STROBE CAPPED AT 11 HZ</span>
+              </span>
+            )}
+          </div>
           <div className="flex items-center gap-1.5">
             <button
               type="button"
@@ -269,11 +276,58 @@ export function PalettesAndControls({
               <span>Redo</span>
             </button>
           </div>
-        )}
-      </section>
+        </section>
+      )}
 
-      {/* Palettes & Groups Row */}
-      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      {hideUndoRedo && softwareStrobeWarning && (
+        <div className="px-2.5 py-1 rounded bg-signal/15 border border-signal text-signal font-mono text-xs font-semibold flex items-center gap-1.5">
+          <AlertTriangle className="w-3.5 h-3.5" />
+          <span>SOFTWARE STROBE CAPPED AT 11 HZ</span>
+        </div>
+      )}
+
+      {/* Daslight EDIT / LIVE Trait Dock */}
+      <div
+        className={
+          daslightDock
+            ? "flex flex-col sm:flex-row gap-2.5 bg-slate border border-steel rounded-panel p-2.5"
+            : "flex flex-col gap-4"
+        }
+      >
+        {daslightDock && (
+          <div className="flex sm:flex-col gap-1 sm:w-24 shrink-0 bg-ink border border-steel rounded p-1 font-mono text-[10px]">
+            {(
+              [
+                { id: "all", label: "EDIT | ALL" },
+                { id: "dimmer", label: "DIMMER" },
+                { id: "color", label: "COLOR" },
+                { id: "shutter", label: "SHUTTER" },
+                { id: "palettes", label: "PALETTES" },
+              ] as const
+            ).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                aria-pressed={dockFilter === item.id}
+                onClick={() => setDockFilter(item.id)}
+                className={`px-2 py-1.5 rounded text-left transition-colors ${
+                  dockFilter === item.id
+                    ? "bg-ember text-frost font-semibold"
+                    : "text-fog hover:text-mist"
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="flex-1 min-w-0 flex flex-col gap-3">
+          {/* Palettes & Optional Groups Row */}
+          {(dockFilter === "all" || dockFilter === "palettes") && (
+            <section
+              className={`grid grid-cols-1 ${hideGroups ? "lg:grid-cols-2" : "lg:grid-cols-3"} gap-3`}
+            >
         {/* Color Palettes */}
         <div className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
           <div className="flex items-center gap-2">
@@ -511,7 +565,8 @@ export function PalettesAndControls({
         </div>
 
         {/* Target Groups */}
-        <div className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
+        {!hideGroups && (
+          <div className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
           <div className="flex items-center gap-2">
             <Users className="w-4 h-4 text-plum" />
             <h3 className="font-sans text-sm font-semibold text-frost">
@@ -614,10 +669,13 @@ export function PalettesAndControls({
             ))}
           </div>
         </div>
+        )}
       </section>
+          )}
 
       {/* Priority Layer Stack & Smart Controls */}
-      <section className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
+      {dockFilter !== "palettes" && (
+      <section className="bg-pitch border border-steel rounded-panel p-2.5 flex flex-col gap-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <Sliders className="w-4 h-4 text-ember" />
@@ -1032,9 +1090,15 @@ export function PalettesAndControls({
           </div>
         )}
       </section>
+      )}
+        </div>
+      </div>
 
       {/* Live Cell Output Strip */}
-      <section className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-2">
+      <section
+        data-testid="scene-live-cell-preview"
+        className="bg-slate border border-steel rounded-panel p-2.5 flex flex-col gap-2"
+      >
         <div className="flex items-center justify-between">
           <h3 className="font-sans text-sm font-semibold text-frost">
             Live Evaluated Cell Output ({compiledCells.length} cells)

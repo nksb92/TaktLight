@@ -459,6 +459,58 @@ impl AppState {
         )
     }
 
+    pub fn resolve_split_fixtures(&self) -> Result<ShowSnapshotDto, String> {
+        let before_show = self.show_state.read().clone();
+        let mut after_show = before_show.clone();
+        let mut moved_count = 0usize;
+
+        for idx in 0..after_show.patch.len() {
+            let fx = after_show.patch[idx].clone();
+            if fx.address + fx.channel_count.saturating_sub(1) <= 512 {
+                continue;
+            }
+            let outcome = find_placement(
+                &after_show.patch,
+                &after_show.network_outputs.universes,
+                &fx.name,
+                fx.universe,
+                fx.address,
+                fx.channel_count,
+                false,
+                Some(&fx.id),
+            )
+            .map_err(|e| e.to_string())?;
+
+            for auto_u in outcome.auto_create_universes {
+                if !after_show
+                    .network_outputs
+                    .universes
+                    .iter()
+                    .any(|u| u.id == auto_u.id)
+                {
+                    after_show.network_outputs.universes.push(auto_u);
+                }
+            }
+            after_show.network_outputs.universes.sort_by_key(|u| u.id);
+            after_show.patch[idx].universe = outcome.universe;
+            after_show.patch[idx].address = outcome.address;
+            moved_count += 1;
+        }
+
+        if moved_count == 0 {
+            return Ok(self.build_show_snapshot(None, false));
+        }
+
+        self.execute_show_command(
+            ShowCommand::ReplaceShowState {
+                before: Box::new(before_show),
+                after: Box::new(after_show),
+            },
+            Some(format!("Moved {moved_count} split fixture(s) to valid addresses")),
+            false,
+        )
+    }
+
     pub fn undo(&self) -> Result<ShowSnapshotDto, String> {
         let mut show = self.show_state.write();
         let mut history = self.undo_history.lock();
@@ -1295,6 +1347,11 @@ fn analyze_audio_command(
     )
 }
 
+#[tauri::command]
+fn resolve_split_fixtures_command(state: State<'_, AppState>) -> Result<ShowSnapshotDto, String> {
+    state.resolve_split_fixtures()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
@@ -1348,6 +1405,7 @@ pub fn run() {
             set_timeline_transport_command,
             set_latency_offset_ms_command,
             analyze_audio_command,
+            resolve_split_fixtures_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building TaktLight application");

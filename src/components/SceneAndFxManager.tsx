@@ -120,8 +120,10 @@ function buildElementFromForm(params: {
 
 export function SceneAndFxManager({
   hideUndoRedo = false,
+  daslightUpper = false,
 }: {
   hideUndoRedo?: boolean;
+  daslightUpper?: boolean;
 }) {
   const showState = useTaktStore((s) => s.showState);
   const activeScenes = useTaktStore((s) => s.activeScenes);
@@ -182,6 +184,22 @@ export function SceneAndFxManager({
   const [sceneBlockRef, setSceneBlockRef] = useState(
     showState.fx_library[0]?.id ?? "",
   );
+  const [selectedBank, setSelectedBank] = useState<string>("all");
+
+  const bankNames = useMemo(() => {
+    const set = new Set<string>();
+    for (const sc of showState.scenes) {
+      set.add(sc.bank?.trim() || "standalone");
+    }
+    return Array.from(set);
+  }, [showState.scenes]);
+
+  const visibleScenes = useMemo(() => {
+    if (selectedBank === "all") return showState.scenes;
+    return showState.scenes.filter(
+      (sc) => (sc.bank?.trim() || "standalone") === selectedBank,
+    );
+  }, [selectedBank, showState.scenes]);
 
   const targetOptions = useMemo(() => {
     const opts = [{ value: "all", label: "All Patched Fixtures" }];
@@ -351,122 +369,284 @@ export function SceneAndFxManager({
         </div>
       </div>
 
-      {/* Live Scene Trigger Pads */}
-      <section className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
-        <div className="flex items-center justify-between">
-          <h3 className="font-sans text-sm font-semibold text-frost">
-            Live Scene Trigger Pads ({showState.scenes.length})
-          </h3>
-          <span className="font-mono text-xs text-fog">
-            Active instances: {activeScenes.length} | Same bank triggers crossfade release
-          </span>
-        </div>
-
-        {showState.scenes.length === 0 ? (
-          <div className="bg-pitch border border-steel rounded p-4 font-mono text-xs text-fog">
-            No scenes defined.
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">
-            {showState.scenes.map((scene) => {
-              const inst = activeById.get(scene.id);
-              const isActive = inst && inst.release_t_sec === null;
-              const isReleasing = inst && inst.release_t_sec !== null;
-              const borderClass = isActive
-                ? "border-ember bg-ember/10"
-                : isReleasing
-                  ? "border-signal/70 bg-signal/10"
-                  : "border-steel bg-pitch";
-
-              return (
-                <div
-                  key={scene.id}
-                  className={`flex flex-col gap-2 rounded border p-3 transition-colors ${borderClass}`}
+      {/* Upper Split Workspace: Left = Banks & Scenes (Daslight style), Right = FX Rack */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 items-start">
+        {/* Left 8 Cols: Bank Tabs + Scene Pads + Scene Composer */}
+        <section
+          data-testid="daslight-scene-banks"
+          className="xl:col-span-8 bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1 bg-ink border border-steel rounded p-0.5 font-mono text-[11px]">
+              <button
+                type="button"
+                aria-pressed={selectedBank === "all"}
+                onClick={() => setSelectedBank("all")}
+                className={`px-2 py-0.5 rounded transition-colors ${
+                  selectedBank === "all"
+                    ? "bg-ember text-frost font-semibold"
+                    : "text-fog hover:text-mist"
+                }`}
+              >
+                All Banks ({showState.scenes.length})
+              </button>
+              {bankNames.map((bank) => (
+                <button
+                  key={bank}
+                  type="button"
+                  aria-pressed={selectedBank === bank}
+                  onClick={() => setSelectedBank(bank)}
+                  className={`px-2 py-0.5 rounded transition-colors ${
+                    selectedBank === bank
+                      ? "bg-ember text-frost font-semibold"
+                      : "text-fog hover:text-mist"
+                  }`}
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="font-sans text-sm font-semibold text-frost">
+                  {bank}
+                </button>
+              ))}
+            </div>
+            <span className="font-mono text-[11px] text-fog">
+              Active: {activeScenes.length}
+            </span>
+          </div>
+
+          {visibleScenes.length === 0 ? (
+            <div className="bg-pitch border border-steel rounded p-4 font-mono text-xs text-fog">
+              No scenes defined.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 bg-pitch border border-steel rounded p-2.5">
+              {visibleScenes.map((scene) => {
+                const inst = activeById.get(scene.id);
+                const isActive = inst && inst.release_t_sec === null;
+                const isReleasing = inst && inst.release_t_sec !== null;
+                const borderClass = isActive
+                  ? "border-ember bg-ember/15"
+                  : isReleasing
+                    ? "border-signal/70 bg-signal/10"
+                    : "border-steel bg-ink";
+
+                return (
+                  <div
+                    key={scene.id}
+                    className={`relative flex flex-col gap-1.5 rounded border p-2.5 pr-3.5 transition-colors overflow-hidden ${borderClass}`}
+                  >
+                    <div
+                      className={`absolute top-0 right-0 bottom-0 w-1.5 ${
+                        isActive
+                          ? "bg-ember"
+                          : isReleasing
+                            ? "bg-signal"
+                            : "bg-steel/40"
+                      }`}
+                    />
+                    <div className="flex items-start justify-between gap-1">
+                      <div className="font-sans text-xs font-semibold text-frost truncate">
                         {scene.name}
                       </div>
-                      <div className="font-mono text-[11px] text-fog">
-                        ID: {scene.id} | Bank: {scene.bank ?? "standalone"}
-                      </div>
+                      <span
+                        className={`px-1.5 py-0.5 rounded font-mono text-[9px] font-semibold shrink-0 ${
+                          isActive
+                            ? "bg-ember text-frost"
+                            : isReleasing
+                              ? "bg-signal text-void"
+                              : "bg-pitch text-fog border border-steel"
+                        }`}
+                      >
+                        {isActive ? "ACTIVE" : isReleasing ? "RELEASING" : "IDLE"}
+                      </span>
                     </div>
 
-                    <span
-                      className={`px-2 py-0.5 rounded font-mono text-[10px] font-semibold ${
-                        isActive
-                          ? "bg-ember text-frost"
-                          : isReleasing
-                            ? "bg-signal text-void"
-                            : "bg-ink text-fog border border-steel"
-                      }`}
-                    >
-                      {isActive ? "ACTIVE" : isReleasing ? "RELEASING" : "IDLE"}
-                    </span>
+                    <div className="font-mono text-[10px] text-fog truncate">
+                      {scene.bank ?? "standalone"} | P{scene.priority} | {scene.fade_in_sec}s/{scene.fade_out_sec}s
+                    </div>
+
+                    <div className="flex items-center gap-1 pt-0.5">
+                      <button
+                        type="button"
+                        data-testid={`trigger-scene-${scene.id}`}
+                        onClick={() => void triggerScene(scene.id)}
+                        className="flex items-center gap-1 px-2 py-0.5 rounded bg-ember hover:bg-burnt text-frost font-mono text-[11px] font-medium transition-colors"
+                      >
+                        <Play className="w-2.5 h-2.5" />
+                        <span>Trigger</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        data-testid={`release-scene-${scene.id}`}
+                        onClick={() => void releaseScene(scene.id)}
+                        className="flex items-center gap-1 px-2 py-0.5 rounded border border-steel bg-pitch hover:border-fog text-mist font-mono text-[11px] transition-colors"
+                      >
+                        <Square className="w-2.5 h-2.5" />
+                        <span>Release</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        aria-label={`Delete Scene ${scene.name}`}
+                        onClick={() => void deleteScene(scene.id)}
+                        className="ml-auto p-1 rounded border border-steel bg-pitch text-signal hover:bg-slate-dark transition-colors"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
                   </div>
+                );
+              })}
+            </div>
+          )}
 
-                  <div className="font-mono text-[11px] text-mist flex flex-wrap gap-2">
-                    <span>Priority: {scene.priority}</span>
-                    <span>In: {scene.fade_in_sec}s</span>
-                    <span>Out: {scene.fade_out_sec}s</span>
-                  </div>
+          {/* Compact Inline Scene Composer */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 bg-pitch border border-steel rounded p-2 items-end">
+            <label className="flex flex-col gap-1 lg:col-span-2">
+              <span className="font-mono text-[10px] text-fog">Scene Name</span>
+              <input
+                aria-label="Scene Name"
+                type="text"
+                value={sceneName}
+                onChange={(e) => setSceneName(e.target.value)}
+                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-sans text-frost"
+              />
+            </label>
 
-                  <div className="font-mono text-[11px] text-fog truncate">
-                    Blocks: {scene.block_refs.join(", ") || "None"}
-                  </div>
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-[10px] text-fog">Bank</span>
+              <input
+                aria-label="Scene Bank"
+                type="text"
+                value={sceneBank}
+                onChange={(e) => setSceneBank(e.target.value)}
+                placeholder="main"
+                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
+              />
+            </label>
 
-                  <div className="flex items-center gap-1.5 pt-1">
-                    <button
-                      type="button"
-                      data-testid={`trigger-scene-${scene.id}`}
-                      onClick={() => void triggerScene(scene.id)}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded bg-ember hover:bg-ember/90 text-frost font-mono text-xs font-medium transition-colors"
-                    >
-                      <Play className="w-3 h-3" />
-                      <span>Trigger</span>
-                    </button>
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-[10px] text-fog">Priority</span>
+              <input
+                aria-label="Scene Priority"
+                type="number"
+                min={0}
+                max={255}
+                value={scenePriority}
+                onChange={(e) => setScenePriority(Number(e.target.value) || 0)}
+                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
+              />
+            </label>
 
-                    <button
-                      type="button"
-                      data-testid={`release-scene-${scene.id}`}
-                      onClick={() => void releaseScene(scene.id)}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded border border-steel bg-ink hover:border-fog text-mist font-mono text-xs transition-colors"
-                    >
-                      <Square className="w-3 h-3" />
-                      <span>Release</span>
-                    </button>
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-[10px] text-fog">Fade In</span>
+              <input
+                aria-label="Scene Fade In"
+                type="number"
+                min={0}
+                step={0.1}
+                value={sceneFadeIn}
+                onChange={(e) => setSceneFadeIn(Number(e.target.value) || 0)}
+                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
+              />
+            </label>
 
-                    <button
-                      type="button"
-                      aria-label={`Delete Scene ${scene.name}`}
-                      onClick={() => void deleteScene(scene.id)}
-                      className="ml-auto p-1 rounded border border-steel bg-ink text-signal hover:bg-slate-dark transition-colors"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-[10px] text-fog">Fade Out</span>
+              <input
+                aria-label="Scene Fade Out"
+                type="number"
+                min={0}
+                step={0.1}
+                value={sceneFadeOut}
+                onChange={(e) => setSceneFadeOut(Number(e.target.value) || 0)}
+                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
+              />
+            </label>
+
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-[10px] text-fog">FX Block</span>
+              <select
+                aria-label="Scene Block Ref"
+                value={effectiveBlockRef}
+                onChange={(e) => setSceneBlockRef(e.target.value)}
+                className="bg-ink border border-steel rounded px-1.5 py-1 text-xs font-mono text-frost"
+              >
+                {showState.fx_library.length === 0 ? (
+                  <option value="">None</option>
+                ) : (
+                  showState.fx_library.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name} ({b.id})
+                    </option>
+                  ))
+                )}
+              </select>
+            </label>
+
+            <button
+              type="button"
+              onClick={() => void handleSaveScene()}
+              className="flex items-center justify-center gap-1 px-2.5 py-1 rounded bg-plum hover:bg-plum/90 font-sans text-xs font-semibold text-frost transition-colors h-[26px]"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Save Scene</span>
+            </button>
+
+            <label className="flex flex-col gap-1 col-span-2 sm:col-span-4 lg:col-span-8">
+              <select
+                aria-label="Scene Target Override"
+                value={sceneTargetOverride}
+                onChange={(e) => setSceneTargetOverride(e.target.value)}
+                className="bg-ink border border-steel rounded px-2 py-1 text-[11px] font-mono text-fog"
+              >
+                <option value="">Target Override: Block Default</option>
+                {targetOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
-        )}
-      </section>
+        </section>
 
-      {/* Main Builders Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* FX Block Builder */}
-        <section className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
+        {/* Right 4 Cols: Daslight FX Type Tiles & FX Block Library */}
+        <section
+          data-testid="daslight-fx-rack"
+          className="xl:col-span-4 bg-slate border border-steel rounded-panel p-3 flex flex-col gap-2.5"
+        >
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Layers className="w-4 h-4 text-cobalt" />
               <h3 className="font-sans text-sm font-semibold text-frost">
-                FX Block Builder &amp; Library
+                FX Engine ({showState.fx_library.length})
               </h3>
             </div>
-            <span className="font-mono text-xs text-fog">
-              {showState.fx_library.length} blocks
-            </span>
+          </div>
+
+          {/* Daslight 2x2 Effect Type Tile Matrix */}
+          <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
+            {(
+              [
+                { kind: "curve_1d", label: "CURVE FX" },
+                { kind: "step_chase", label: "CHASER FX" },
+                { kind: "spatial_shader_2d", label: "2D SHADER" },
+                { kind: "static_trait", label: "STATIC FX" },
+              ] as const
+            ).map((tile) => (
+              <button
+                key={tile.kind}
+                type="button"
+                aria-pressed={fxKind === tile.kind}
+                onClick={() => setFxKind(tile.kind)}
+                className={`py-2 px-2 rounded border text-center font-semibold tracking-wider transition-colors ${
+                  fxKind === tile.kind
+                    ? "bg-cobalt/30 border-cobalt text-frost"
+                    : "bg-pitch border-steel text-fog hover:text-mist"
+                }`}
+              >
+                {tile.label}
+              </button>
+            ))}
           </div>
 
           <div className="grid grid-cols-2 gap-2 bg-pitch border border-steel rounded p-2.5">
@@ -966,215 +1146,52 @@ export function SceneAndFxManager({
             ))}
           </div>
         </section>
+      </div>
 
-        {/* Scene Builder */}
-        <section className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
+      {/* Live Evaluated Cell Preview (rendered directly when standalone; unified in bottom dock when in Studio) */}
+      {!daslightUpper && (
+        <section className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-2">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-plum" />
-              <h3 className="font-sans text-sm font-semibold text-frost">
-                Scene Composer
-              </h3>
-            </div>
-            <span className="font-mono text-xs text-fog">
-              Bind FX Blocks + Fade Envelope + Mutual Exclusion Bank
-            </span>
+            <h3 className="font-sans text-sm font-semibold text-frost">
+              Live Evaluated Cell Output ({compiledCells.length} cells)
+            </h3>
           </div>
 
-          <div className="grid grid-cols-2 gap-2 bg-pitch border border-steel rounded p-2.5">
-            <label className="flex flex-col gap-1">
-              <span className="font-mono text-[11px] text-fog">Scene Name</span>
-              <input
-                aria-label="Scene Name"
-                type="text"
-                value={sceneName}
-                onChange={(e) => setSceneName(e.target.value)}
-                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-sans text-frost"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1">
-              <span className="font-mono text-[11px] text-fog">
-                Exclusion Bank
+          <div
+            data-testid="scene-live-cell-preview"
+            className="flex flex-wrap gap-1.5 bg-void border border-steel rounded p-2.5"
+          >
+            {compiledCells.length === 0 ? (
+              <span className="font-mono text-xs text-fog">
+                No patched cells.
               </span>
-              <input
-                aria-label="Scene Bank"
-                type="text"
-                value={sceneBank}
-                onChange={(e) => setSceneBank(e.target.value)}
-                placeholder="main"
-                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1">
-              <span className="font-mono text-[11px] text-fog">Priority</span>
-              <input
-                aria-label="Scene Priority"
-                type="number"
-                min={0}
-                max={255}
-                value={scenePriority}
-                onChange={(e) => setScenePriority(Number(e.target.value) || 0)}
-                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1">
-              <span className="font-mono text-[11px] text-fog">
-                Target Override
-              </span>
-              <select
-                aria-label="Scene Target Override"
-                value={sceneTargetOverride}
-                onChange={(e) => setSceneTargetOverride(e.target.value)}
-                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
-              >
-                <option value="">Use FX Block Target</option>
-                {targetOptions.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="flex flex-col gap-1">
-              <span className="font-mono text-[11px] text-fog">
-                Fade In (Sec)
-              </span>
-              <input
-                aria-label="Scene Fade In"
-                type="number"
-                min={0}
-                step={0.1}
-                value={sceneFadeIn}
-                onChange={(e) => setSceneFadeIn(Number(e.target.value) || 0)}
-                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1">
-              <span className="font-mono text-[11px] text-fog">
-                Fade Out (Sec)
-              </span>
-              <input
-                aria-label="Scene Fade Out"
-                type="number"
-                min={0}
-                step={0.1}
-                value={sceneFadeOut}
-                onChange={(e) => setSceneFadeOut(Number(e.target.value) || 0)}
-                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1 col-span-2">
-              <span className="font-mono text-[11px] text-fog">FX Block</span>
-              <select
-                aria-label="Scene Block Ref"
-                value={effectiveBlockRef}
-                onChange={(e) => setSceneBlockRef(e.target.value)}
-                className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost"
-              >
-                {showState.fx_library.length === 0 ? (
-                  <option value="">No FX blocks available</option>
-                ) : (
-                  showState.fx_library.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.name} ({b.id})
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-
-            <button
-              type="button"
-              onClick={() => void handleSaveScene()}
-              className="col-span-2 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded bg-plum hover:bg-plum/90 font-sans text-xs font-semibold text-frost transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Save Scene</span>
-            </button>
-          </div>
-
-          {/* Active Envelopes Readout */}
-          <div className="bg-pitch border border-steel rounded p-2.5 flex flex-col gap-1.5">
-            <div className="font-mono text-xs text-mist">
-              Active Playback Queue ({activeScenes.length})
-            </div>
-            {activeScenes.length === 0 ? (
-              <div className="font-mono text-[11px] text-fog">
-                Trigger any Scene pad above to start beat clock playback.
-              </div>
             ) : (
-              activeScenes.map((inst) => (
-                <div
-                  key={`${inst.scene_id}-${inst.trigger_order}`}
-                  className="flex items-center justify-between font-mono text-[11px] text-mist border-t border-steel/60 pt-1"
-                >
-                  <span>
-                    {inst.scene_id} (#{inst.trigger_order})
-                  </span>
-                  <span className="text-fog">
-                    Bank: {inst.bank ?? "none"} |{" "}
-                    {inst.release_t_sec === null
-                      ? "Holding"
-                      : `Releasing at ${inst.release_t_sec.toFixed(2)}s`}
-                  </span>
-                </div>
-              ))
+              compiledCells.map((cell, idx) => {
+                const base = idx * 4;
+                const r = cellPreviewRgbd[base] ?? 0;
+                const g = cellPreviewRgbd[base + 1] ?? 0;
+                const b = cellPreviewRgbd[base + 2] ?? 0;
+                const d = cellPreviewRgbd[base + 3] ?? 0;
+                const scale = d / 255;
+                const bg = `rgb(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)})`;
+
+                return (
+                  <div
+                    key={`${cell.fixture_id}-${cell.cell_index}`}
+                    title={`${cell.fixture_id}:${cell.cell_index} RGB(${r},${g},${b}) D=${d}`}
+                    className="w-10 h-10 rounded border border-steel flex flex-col items-center justify-end p-0.5 font-mono text-[9px] text-frost"
+                    style={{ backgroundColor: bg }}
+                  >
+                    <span className="bg-void/70 px-1 rounded">
+                      {cell.pixel_key}
+                    </span>
+                  </div>
+                );
+              })
             )}
           </div>
         </section>
-      </div>
-
-      {/* Live Evaluated Cell Preview */}
-      <section className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-2">
-        <div className="flex items-center justify-between">
-          <h3 className="font-sans text-sm font-semibold text-frost">
-            Live Evaluated Cell Output ({compiledCells.length} cells)
-          </h3>
-          <span className="font-mono text-[11px] text-fog">
-            Active scenes + Live layers merged per Stage 1 to Stage 4
-          </span>
-        </div>
-
-        <div
-          data-testid="scene-live-cell-preview"
-          className="flex flex-wrap gap-1.5 bg-void border border-steel rounded p-2.5"
-        >
-          {compiledCells.length === 0 ? (
-            <span className="font-mono text-xs text-fog">
-              Patch fixtures to inspect evaluated FX output across all cells.
-            </span>
-          ) : (
-            compiledCells.map((cell, idx) => {
-              const base = idx * 4;
-              const r = cellPreviewRgbd[base] ?? 0;
-              const g = cellPreviewRgbd[base + 1] ?? 0;
-              const b = cellPreviewRgbd[base + 2] ?? 0;
-              const d = cellPreviewRgbd[base + 3] ?? 0;
-              const scale = d / 255;
-              const bg = `rgb(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)})`;
-
-              return (
-                <div
-                  key={`${cell.fixture_id}-${cell.cell_index}`}
-                  title={`${cell.fixture_id}:${cell.cell_index} RGB(${r},${g},${b}) D=${d}`}
-                  className="w-10 h-10 rounded border border-steel flex flex-col items-center justify-end p-0.5 font-mono text-[9px] text-frost"
-                  style={{ backgroundColor: bg }}
-                >
-                  <span className="bg-void/70 px-1 rounded">
-                    {cell.pixel_key}
-                  </span>
-                </div>
-              );
-            })
-          )}
-        </div>
-      </section>
+      )}
     </div>
   );
 }

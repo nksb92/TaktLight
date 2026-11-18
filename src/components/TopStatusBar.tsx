@@ -1,5 +1,4 @@
 import {
-  Activity,
   Cpu,
   Lock,
   Network,
@@ -32,12 +31,10 @@ export function TopStatusBar() {
   const discoveryAvailable = useTaktStore((s) => s.discoveryAvailable);
   const activeInterface = useTaktStore((s) => s.activeInterface);
   const discoveredNodes = useTaktStore((s) => s.discoveredNodes);
-  const histogramOpen = useTaktStore((s) => s.histogramOpen);
 
   const setBlackout = useTaktStore((s) => s.setBlackout);
   const setGrandMaster = useTaktStore((s) => s.setGrandMaster);
   const setNetworkAdapter = useTaktStore((s) => s.setNetworkAdapter);
-  const toggleHistogram = useTaktStore((s) => s.toggleHistogram);
 
   const parkedCount = Object.keys(parkedChannels).length;
   const onlineNodeCount = discoveredNodes.filter((n) => n.online).length;
@@ -54,17 +51,10 @@ export function TopStatusBar() {
       {/* Brand + Frame Timing Telemetry */}
       <div className="flex items-center gap-4">
         <div className="flex items-center gap-2.5">
-          <div className="w-1.5 h-7 rounded-full bg-ember" />
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-sans font-semibold text-base tracking-wide text-mist">
-                TAKTLIGHT
-              </span>
-              <span className="font-mono text-[10px] uppercase tracking-widest px-1.5 py-0.5 rounded bg-ink border border-steel text-fog">
-                STUDIO
-              </span>
-            </div>
-          </div>
+          <div className="w-1.5 h-6 rounded-full bg-ember" />
+          <span className="font-sans font-semibold text-base tracking-wide text-mist">
+            TAKTLIGHT
+          </span>
         </div>
 
         {/* 44 Hz Telemetry Pill */}
@@ -162,21 +152,6 @@ export function TopStatusBar() {
           />
           <span>NODES: {onlineNodeCount}</span>
         </div>
-
-        {/* Histogram Toggle */}
-        <button
-          type="button"
-          onClick={toggleHistogram}
-          aria-pressed={histogramOpen}
-          className={`flex items-center gap-1.5 px-3 py-1 rounded-md border font-sans text-xs font-medium transition-colors ${
-            histogramOpen
-              ? "bg-ember/15 border-ember text-mist"
-              : "bg-ink border-steel text-fog hover:text-mist"
-          }`}
-        >
-          <Activity className="w-3.5 h-3.5 text-ember" />
-          <span>Jitter Histogram</span>
-        </button>
 
         {/* Grand Master */}
         <div className="flex items-center gap-2 bg-ink border border-steel rounded-md px-3 py-1">

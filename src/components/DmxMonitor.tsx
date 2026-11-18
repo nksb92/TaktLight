@@ -1,4 +1,4 @@
-import { Lock, Unlock, X } from "lucide-react";
+import { Activity, Lock, Unlock, X } from "lucide-react";
 import {
   DisplayFormat,
   parkKey,
@@ -42,12 +42,14 @@ export function DmxMonitor() {
   const parkedChannels = useTaktStore((s) => s.parkedChannels);
   const displayFormat = useTaktStore((s) => s.displayFormat);
   const selectedChannel = useTaktStore((s) => s.selectedChannel);
+  const histogramOpen = useTaktStore((s) => s.histogramOpen);
 
   const setSelectedUniverse = useTaktStore((s) => s.setSelectedUniverse);
   const setDisplayFormat = useTaktStore((s) => s.setDisplayFormat);
   const selectChannel = useTaktStore((s) => s.selectChannel);
   const setChannelPark = useTaktStore((s) => s.setChannelPark);
   const clearAllParked = useTaktStore((s) => s.clearAllParked);
+  const toggleHistogram = useTaktStore((s) => s.toggleHistogram);
 
   const dmx = dmxByUniverse[selectedUniverseId] ?? new Uint8Array(512);
   const universeParkedCount = Object.keys(parkedChannels).filter((k) =>
@@ -66,18 +68,25 @@ export function DmxMonitor() {
     <section className="bg-slate border-[1.5px] border-steel rounded-panel p-4 flex flex-col gap-4">
       {/* Header & Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <div className="font-mono text-[11px] uppercase tracking-widest text-fog">
-            LIVE OUTPUT & CHANNEL PARK MATRIX
-          </div>
-          <h2 className="font-sans text-base font-semibold text-mist mt-0.5">
-            512 Channel DMX Monitor (U{selectedUniverseId}.001 to U
-            {selectedUniverseId}.512)
-          </h2>
-          <div className="h-[2px] w-14 bg-ember mt-1.5" />
-        </div>
+        <h2 className="font-sans text-base font-semibold text-mist">
+          512 Channel DMX Monitor (U{selectedUniverseId}.001 to U
+          {selectedUniverseId}.512)
+        </h2>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            type="button"
+            onClick={toggleHistogram}
+            aria-pressed={histogramOpen}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-md border font-sans text-xs font-medium transition-colors ${
+              histogramOpen
+                ? "bg-ember/15 border-ember text-mist"
+                : "bg-ink border-steel text-fog hover:text-mist"
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5 text-ember" />
+            <span>Jitter Histogram</span>
+          </button>
           {/* Universe Tabs */}
           <div className="flex items-center gap-1.5 bg-ink p-1 rounded-md border border-steel">
             {universes.map((uni) => {
@@ -214,17 +223,12 @@ export function DmxMonitor() {
           data-testid="park-inspector"
           className="w-full xl:w-72 shrink-0 bg-ink border-[1.5px] border-steel rounded-panel p-3.5"
         >
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="font-mono text-[10px] uppercase tracking-widest text-fog">
-                CHANNEL PARK INSPECTOR
-              </div>
-              <h3 className="font-sans text-sm font-semibold text-mist mt-0.5">
-                {selectedChannel !== null
-                  ? `U${selectedUniverseId}.${String(selectedChannel).padStart(3, "0")}`
-                  : "Select Any Channel"}
-              </h3>
-            </div>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-sans text-sm font-semibold text-mist">
+              {selectedChannel !== null
+                ? `U${selectedUniverseId}.${String(selectedChannel).padStart(3, "0")}`
+                : "Select Any Channel"}
+            </h3>
             {selectedChannel !== null && (
               <button
                 type="button"
@@ -236,7 +240,6 @@ export function DmxMonitor() {
               </button>
             )}
           </div>
-          <div className="h-[2px] w-10 bg-ember mt-1.5 mb-3" />
 
           {selectedChannel === null ? (
             <p className="font-mono text-xs text-fog">

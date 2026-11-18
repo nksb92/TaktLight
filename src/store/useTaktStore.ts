@@ -1203,6 +1203,7 @@ export interface TaktStoreState {
     durationSec?: number,
     sensitivity?: number,
   ) => Promise<AudioAnalysisResult>;
+  resolveSplitFixtures: () => Promise<void>;
   selectFixtureInstance: (id: string | null) => void;
   setFocusedPatchUniverse: (universeId: number) => void;
   dismissToast: () => void;
@@ -2484,6 +2485,74 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   },
 
   selectFixtureInstance: (id) => set({ selectedFixtureInstanceId: id }),
+
+  resolveSplitFixtures: async () => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>(
+        "resolve_split_fixtures_command",
+      );
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const workingPatch = structuredClone(prevShow.patch);
+    const workingUnis = [...prevShow.network_outputs.universes];
+    let movedCount = 0;
+
+    for (let i = 0; i < workingPatch.length; i++) {
+      const fx = workingPatch[i];
+      if (fx.address + fx.channel_count - 1 <= 512) continue;
+
+      const outcome = previewPlacement(
+        workingPatch,
+        workingUnis,
+        fx.name,
+        fx.universe,
+        fx.address,
+        fx.channel_count,
+        false,
+        fx.id,
+      );
+      for (const u of outcome.autoCreateUniverses) {
+        if (!workingUnis.some((existing) => existing.id === u.id)) {
+          workingUnis.push(u);
+        }
+      }
+      workingUnis.sort((a, b) => a.id - b.id);
+      workingPatch[i] = {
+        ...fx,
+        universe: outcome.universe,
+        address: outcome.address,
+      };
+      movedCount += 1;
+    }
+
+    if (movedCount === 0) return;
+
+    const nextShow: ShowStateDto = {
+      ...prevShow,
+      network_outputs: { ...prevShow.network_outputs, universes: workingUnis },
+      patch: workingPatch,
+    };
+    const nextUndo = [...state._simUndo, { show: prevShow, coalesceKey: null }];
+    set({
+      showState: nextShow,
+      universes: workingUnis,
+      compiledCells: compileCellsLocally(
+        nextShow.patch,
+        state.fixtureDetailsCache,
+      ),
+      patchToast: `Moved ${movedCount} split fixture(s) to valid addresses`,
+      crossProtocolWarning: false,
+      _simUndo: nextUndo,
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
 
   upsertTimeline: async (timeline, coalesceKey) => {
     if (isTauriEnvironment()) {

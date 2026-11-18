@@ -61,6 +61,12 @@ describe("TaktLight Slice 1 Studio UI", () => {
     expect(
       screen.queryByText("44 Hz Frame Timing & Jitter Histogram"),
     ).not.toBeInTheDocument();
+
+    // Switching away from Monitor hides the Jitter Histogram toggle completely
+    fireEvent.click(screen.getByRole("button", { name: /^Patch$/i }));
+    expect(
+      screen.queryByRole("button", { name: /Jitter Histogram/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("switches to Fixture Builder, inspects RLCV3, builds a custom fixture, and flags invalid JSON paths", async () => {
@@ -147,9 +153,25 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
     // Rollover active: no red cross-protocol warning shown
     expect(screen.queryByText(/CROSS PROTOCOL SPLIT/i)).not.toBeInTheDocument();
 
-    // Switching Rollover OFF exposes the cross-protocol warning
+    // Switching Rollover OFF exposes the cross-protocol warning and one-click relocation button
     fireEvent.click(rolloverSwitch);
     expect(screen.getByText(/CROSS PROTOCOL SPLIT/i)).toBeInTheDocument();
+    const resolveBtn = screen.getByTestId("resolve-split-fixtures-button");
+    expect(resolveBtn).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(resolveBtn);
+      await Promise.resolve();
+    });
+    expect(useTaktStore.getState().showState.patch[0].universe).toBe(2);
+    expect(useTaktStore.getState().showState.patch[0].address).toBe(1);
+    expect(screen.queryByText(/CROSS PROTOCOL SPLIT/i)).not.toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("toast-undo-button"));
+      await Promise.resolve();
+    });
+    expect(useTaktStore.getState().showState.patch[0].universe).toBe(1);
+    expect(useTaktStore.getState().showState.patch[0].address).toBe(505);
 
     fireEvent.keyDown(window, { key: "r" });
     expect(screen.queryByText(/CROSS PROTOCOL SPLIT/i)).not.toBeInTheDocument();
@@ -632,6 +654,10 @@ describe("TaktLight Slice 7 UI Consolidation & Centered Bottom Navigation", () =
     expect(within(nav).getByRole("button", { name: /^Monitor$/i })).toBeInTheDocument();
 
     fireEvent.click(within(nav).getByRole("button", { name: /Studio \/ 2D Grid/i }));
+    expect(screen.getByTestId("daslight-scene-banks")).toBeInTheDocument();
+    expect(screen.getByTestId("daslight-fx-rack")).toBeInTheDocument();
+    expect(screen.getByTestId("daslight-groups-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("daslight-bottom-dock")).toBeInTheDocument();
     expect(screen.getByTestId("fixture-grid-canvas")).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^Undo$/i })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: /^Redo$/i })).toHaveLength(1);

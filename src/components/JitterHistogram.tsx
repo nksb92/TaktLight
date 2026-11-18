@@ -118,16 +118,10 @@ export function JitterHistogram() {
 
   return (
     <section className="bg-slate border-[1.5px] border-steel rounded-panel p-4">
-      <div className="flex flex-wrap items-start justify-between gap-4 mb-3">
-        <div>
-          <div className="font-mono text-[11px] uppercase tracking-widest text-fog">
-            REAL TIME ENGINE TELEMETRY
-          </div>
-          <h2 className="font-sans text-base font-semibold text-mist mt-0.5">
-            44 Hz Frame Timing & Jitter Histogram
-          </h2>
-          <div className="h-[2px] w-14 bg-ember mt-1.5" />
-        </div>
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-3">
+        <h2 className="font-sans text-base font-semibold text-mist">
+          44 Hz Frame Timing &amp; Jitter Histogram
+        </h2>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
           <div className="bg-pitch border border-steel rounded-md px-3 py-1.5">

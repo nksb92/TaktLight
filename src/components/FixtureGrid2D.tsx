@@ -14,8 +14,10 @@ const ROTATION_HANDLE_NORM_RADIUS = 0.065;
 
 export function FixtureGrid2D({
   hideUndoRedo = false,
+  compact = false,
 }: {
   hideUndoRedo?: boolean;
+  compact?: boolean;
 }) {
   const showState = useTaktStore((s) => s.showState);
   const compiledCells = useTaktStore((s) => s.compiledCells);
@@ -294,9 +296,19 @@ export function FixtureGrid2D({
   }, [fixtureDetailsCache, orderRule, showState.patch, targetRefInput]);
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-      {/* Left 2 Columns: Interactive 2D Normalized Layout Canvas */}
-      <section className="xl:col-span-2 bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
+    <div
+      className={
+        compact
+          ? "grid grid-cols-1 lg:grid-cols-12 gap-3"
+          : "grid grid-cols-1 xl:grid-cols-3 gap-4"
+      }
+    >
+      {/* Left: Interactive 2D Normalized Layout Canvas */}
+      <section
+        className={`${
+          compact ? "lg:col-span-7" : "xl:col-span-2"
+        } bg-slate border border-steel rounded-panel p-3 flex flex-col gap-2.5`}
+      >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="font-sans text-sm font-semibold text-frost">
             2D Spatial Fixture Canvas
@@ -367,8 +379,12 @@ export function FixtureGrid2D({
         </div>
       </section>
 
-      {/* Right Column: GridPos Inspector & 1D OrderRule Preview */}
-      <section className="flex flex-col gap-4">
+      {/* Right Column: SELECTIONS & Transform + 1D OrderRule Preview */}
+      <section
+        className={`${
+          compact ? "lg:col-span-5" : ""
+        } flex flex-col gap-3`}
+      >
         <div className="bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
           <div className="flex items-center justify-between">
             <h2 className="font-sans text-sm font-semibold text-frost">

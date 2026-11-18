@@ -180,15 +180,9 @@ export function FixtureBuilder() {
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
       {/* Left Column: Local OFL Library & Offline Importer */}
       <section className="lg:col-span-3 bg-slate border-[1.5px] border-steel rounded-panel p-4 flex flex-col gap-3">
-        <div>
-          <div className="font-mono text-[10px] uppercase tracking-widest text-fog">
-            LOCAL LIBRARY | OFL JSON
-          </div>
-          <h2 className="font-sans text-base font-semibold text-mist mt-0.5">
-            Local OFL Fixture Library
-          </h2>
-          <div className="h-[2px] w-12 bg-ember mt-1.5" />
-        </div>
+        <h2 className="font-sans text-base font-semibold text-mist">
+          Local OFL Fixture Library
+        </h2>
 
         <div className="flex flex-col gap-2">
           <input
@@ -286,15 +280,9 @@ export function FixtureBuilder() {
       {/* Center Column: Visual Builder & Raw OFL JSON Editor */}
       <section className="lg:col-span-5 bg-slate border-[1.5px] border-steel rounded-panel p-4 flex flex-col gap-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <div className="font-mono text-[10px] uppercase tracking-widest text-fog">
-              OPEN FIXTURE LIBRARY AUTHORING
-            </div>
-            <h2 className="font-sans text-base font-semibold text-mist mt-0.5">
-              Visual Fixture Builder
-            </h2>
-            <div className="h-[2px] w-12 bg-ember mt-1.5" />
-          </div>
+          <h2 className="font-sans text-base font-semibold text-mist">
+            Visual Fixture Builder
+          </h2>
 
           <div className="flex items-center gap-1 bg-ink border border-steel rounded-md p-0.5">
             <button
@@ -741,7 +729,7 @@ export function FixtureBuilder() {
         {/* Save & Export Bar */}
         <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-steel/50">
           <div className="font-mono text-xs text-fog">
-            {statusMessage ?? "Ready"}
+            {statusMessage ?? ""}
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -770,15 +758,9 @@ export function FixtureBuilder() {
       {/* Right Column: Schema Validator & Expanded DMX Footprint */}
       <section className="lg:col-span-4 bg-slate border-[1.5px] border-steel rounded-panel p-4 flex flex-col gap-3">
         <div className="flex items-start justify-between gap-2">
-          <div>
-            <div className="font-mono text-[10px] uppercase tracking-widest text-fog">
-              OFFLINE SCHEMA VALIDATION & EXPANSION
-            </div>
-            <h2 className="font-sans text-base font-semibold text-mist mt-0.5">
-              Channel Footprint
-            </h2>
-            <div className="h-[2px] w-12 bg-ember mt-1.5" />
-          </div>
+          <h2 className="font-sans text-base font-semibold text-mist">
+            Channel Footprint
+          </h2>
 
           {validation?.valid ? (
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-pine/25 border border-pine text-mist font-mono text-[11px] font-medium">
@@ -832,20 +814,15 @@ export function FixtureBuilder() {
 
         {/* Cell Mapping Strip */}
         {activeMode && (
-          <div className="bg-pitch border border-steel rounded p-2.5">
-            <div className="font-mono text-[10px] uppercase text-fog mb-1.5">
-              0 BASED CELL MAPPING ({activeMode.cells.length} CELLS)
-            </div>
-            <div className="flex flex-wrap gap-1">
-              {activeMode.cells.map((cell) => (
-                <span
-                  key={cell.cell_index}
-                  className="px-1.5 py-0.5 rounded bg-ink border border-steel font-mono text-[10px] text-mist"
-                >
-                  C{cell.cell_index} → K{cell.pixel_key}
-                </span>
-              ))}
-            </div>
+          <div className="bg-pitch border border-steel rounded p-2.5 flex flex-wrap gap-1">
+            {activeMode.cells.map((cell) => (
+              <span
+                key={cell.cell_index}
+                className="px-1.5 py-0.5 rounded bg-ink border border-steel font-mono text-[10px] text-mist"
+              >
+                C{cell.cell_index} → K{cell.pixel_key}
+              </span>
+            ))}
           </div>
         )}
 

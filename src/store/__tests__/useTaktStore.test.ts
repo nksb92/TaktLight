@@ -392,4 +392,32 @@ describe("useTaktStore", () => {
       useTaktStore.getState().showState.timelines.some((t) => t.id === "tl_custom"),
     ).toBe(true);
   });
+
+  it("moves split fixtures to valid unsplit addresses when rollover is off with Undo support", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Split Tube",
+        1,
+        1,
+        505,
+      );
+
+    expect(useTaktStore.getState().showState.patch[0].universe).toBe(1);
+    expect(useTaktStore.getState().showState.patch[0].address).toBe(505);
+
+    await useTaktStore.getState().setRolloverEnabled(false);
+    await useTaktStore.getState().resolveSplitFixtures();
+
+    const moved = useTaktStore.getState().showState.patch[0];
+    expect(moved.universe).toBe(2);
+    expect(moved.address).toBe(1);
+
+    await useTaktStore.getState().undoShow();
+    const restored = useTaktStore.getState().showState.patch[0];
+    expect(restored.universe).toBe(1);
+    expect(restored.address).toBe(505);
+  });
 });

@@ -95,6 +95,7 @@ export function PatchView() {
     (s) => s.updateFixtureCalibration,
   );
   const setRolloverEnabled = useTaktStore((s) => s.setRolloverEnabled);
+  const resolveSplitFixtures = useTaktStore((s) => s.resolveSplitFixtures);
   const markUniverseReviewed = useTaktStore((s) => s.markUniverseReviewed);
   const undoShow = useTaktStore((s) => s.undoShow);
   const redoShow = useTaktStore((s) => s.redoShow);
@@ -477,10 +478,20 @@ export function PatchView() {
             {!rolloverEnabled &&
               (crossProtocolWarning ||
                 showState.patch.some((inst) => getFixtureFootprint(inst).tail !== null)) && (
-              <span className="px-2 py-0.5 rounded bg-signal/20 border border-signal text-signal font-mono font-semibold flex items-center gap-1">
-                <AlertTriangle className="w-3.5 h-3.5" />
-                <span>CROSS PROTOCOL SPLIT</span>
-              </span>
+              <>
+                <span className="px-2 py-0.5 rounded bg-signal/20 border border-signal text-signal font-mono font-semibold flex items-center gap-1">
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  <span>CROSS PROTOCOL SPLIT</span>
+                </span>
+                <button
+                  type="button"
+                  data-testid="resolve-split-fixtures-button"
+                  onClick={() => void resolveSplitFixtures()}
+                  className="px-2.5 py-0.5 rounded bg-ember hover:bg-burnt text-frost font-mono text-xs font-semibold transition-colors"
+                >
+                  Move Split Fixtures to Valid Spot
+                </button>
+              </>
             )}
             {movingFixture && (
               <span className="px-2 py-0.5 rounded bg-ember/20 border border-ember text-ember font-mono">
