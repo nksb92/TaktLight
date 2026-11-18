@@ -36,6 +36,18 @@ pub enum ProtocolKind {
 pub struct UniverseConfig {
     pub id: u16,
     pub protocol: ProtocolKind,
+    #[serde(default)]
+    pub review_output: bool,
+}
+
+impl UniverseConfig {
+    pub fn new(id: u16, protocol: ProtocolKind) -> Self {
+        Self {
+            id,
+            protocol,
+            review_output: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,23 +70,23 @@ impl RenderPlan {
         Self {
             revision: 1,
             universes: vec![
-                UniverseConfig {
-                    id: 1,
-                    protocol: ProtocolKind::ArtNet {
+                UniverseConfig::new(
+                    1,
+                    ProtocolKind::ArtNet {
                         mode: ArtNetOutputMode::Broadcast,
                         net: 0,
                         subnet: 0,
                         uni: 0,
                     },
-                },
-                UniverseConfig {
-                    id: 2,
-                    protocol: ProtocolKind::Sacn {
+                ),
+                UniverseConfig::new(
+                    2,
+                    ProtocolKind::Sacn {
                         mode: SacnOutputMode::Multicast,
                         sacn_universe: 2,
                         priority: 100,
                     },
-                },
+                ),
             ],
             artsync_enabled: true,
             cell_count: 0,

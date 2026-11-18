@@ -1,3 +1,4 @@
+pub mod patch;
 pub mod spatial;
 pub mod targets;
 
