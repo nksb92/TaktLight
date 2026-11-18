@@ -10,7 +10,6 @@ arc-swap.workspace = true
 if-addrs.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 socket2.workspace = true
 spin_sleep.workspace = true
 thiserror.workspace = true
