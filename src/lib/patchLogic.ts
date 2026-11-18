@@ -1,5 +1,10 @@
 import type { UniverseConfig } from "../store/useTaktStore";
-import type { ColorPaletteDef, DimmerPaletteDef } from "./mixerLogic";
+import type {
+  ColorPaletteDef,
+  DimmerPaletteDef,
+  FxBlockDef,
+  SceneDef,
+} from "./mixerLogic";
 
 export type WhiteMode = "replace" | "add" | "off";
 export type OrderRuleStr =
@@ -70,6 +75,8 @@ export interface ShowStateDto {
   dimmer_palettes: DimmerPaletteDef[];
   patch: FixtureInstance[];
   groups: FixtureGroupDef[];
+  fx_library: FxBlockDef[];
+  scenes: SceneDef[];
 }
 
 export interface UniverseSegment {

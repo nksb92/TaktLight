@@ -233,4 +233,72 @@ describe("useTaktStore", () => {
     expect(xml).toContain('id="pal_pure_white"');
     expect(xml).toContain('id="grp_tube"');
   });
+
+  it("triggers scenes with bank exclusivity, phase-continuous tap tempo, and FX block CRUD", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube FX",
+        1,
+        1,
+        1,
+      );
+
+    await useTaktStore.getState().upsertFxBlock({
+      id: "blk_pulse",
+      name: "Pulse",
+      target_group: "all",
+      duration_beats: 4,
+      loop_block: true,
+      elements: [
+        {
+          kind: "curve_1d",
+          trait: "dimmer",
+          op: "htp",
+          waveform: "sine",
+          amplitude: 1,
+          offset: 0,
+          rate_beats: 2,
+          speed_hz: null,
+          phase_spread_deg: 360,
+          duty: 0.5,
+          palette_ref: null,
+          order: null,
+        },
+      ],
+    });
+
+    await useTaktStore.getState().upsertScene({
+      id: "sc_pulse",
+      name: "Pulse Scene",
+      bank: "main",
+      target_group: null,
+      priority: 15,
+      fade_in_sec: 0,
+      fade_out_sec: 1,
+      block_refs: ["blk_pulse"],
+    });
+
+    await useTaktStore.getState().triggerScene("sc_cyber_wave", 0);
+    expect(useTaktStore.getState().activeScenes).toHaveLength(1);
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
+
+    await useTaktStore.getState().triggerScene("sc_pulse", 1);
+    const active = useTaktStore.getState().activeScenes;
+    expect(active).toHaveLength(2);
+    expect(active.find((s) => s.scene_id === "sc_cyber_wave")?.release_t_sec).toBe(1);
+
+    await useTaktStore.getState().tapTempo(5.0);
+    await useTaktStore.getState().tapTempo(5.4);
+    expect(useTaktStore.getState().liveBpm).toBeCloseTo(150, 1);
+
+    await useTaktStore.getState().releaseAllScenes(2.0);
+    expect(
+      useTaktStore
+        .getState()
+        .activeScenes.every((s) => s.release_t_sec === 2.0),
+    ).toBe(true);
+  });
 });

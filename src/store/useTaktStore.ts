@@ -16,10 +16,20 @@ import {
   validateAndExpandOflLocally,
 } from "../lib/oflBuilder";
 import {
+  type ActiveSceneInstance,
+  type BeatClockAnchor,
   ColorPaletteDef,
+  computeBeatAt,
+  computeSceneAlphaAt,
   DimmerPaletteDef,
   evaluateSimulationLayersToDmx,
+  type FxBlockDef,
+  type FxElementDef,
+  type MergeOp,
+  type SceneDef,
+  type Shader2DKind,
   SmartControlLayer,
+  type Waveform1D,
 } from "../lib/mixerLogic";
 import {
   CompiledCell,
@@ -36,7 +46,13 @@ import {
 } from "../lib/patchLogic";
 
 export type DisplayFormat = "DEC" | "HEX" | "PCT";
-export type WorkspaceTab = "monitor" | "patch" | "grid" | "palettes" | "fixtures";
+export type WorkspaceTab =
+  | "monitor"
+  | "patch"
+  | "grid"
+  | "palettes"
+  | "scenes"
+  | "fixtures";
 
 export type ArtNetOutputMode =
   | { mode: "broadcast" }
@@ -117,6 +133,8 @@ export interface EngineSnapshotDto {
   blackout: boolean;
   parked_channels: ParkedChannelDto[];
   live_layers: SmartControlLayer[];
+  active_scenes: ActiveSceneInstance[];
+  live_bpm: number;
   universes: UniverseConfig[];
   interfaces: NetworkInterfaceInfo[];
   adapter_selection: AdapterSelection;
@@ -223,6 +241,47 @@ function createInitialShowState(): ShowStateDto {
     ],
     patch: [],
     groups: [],
+    fx_library: [
+      {
+        id: "blk_cyber_wave",
+        name: "Cyberpunk Wave",
+        target_group: "all",
+        duration_beats: 4,
+        loop_block: true,
+        elements: [
+          {
+            kind: "static_trait",
+            trait: "dimmer",
+            op: "htp",
+            palette_ref: "dim_full",
+            value_start: null,
+            value_end: null,
+            order: null,
+          },
+          {
+            kind: "static_trait",
+            trait: "color",
+            op: "ltp",
+            palette_ref: "pal_cyber",
+            value_start: null,
+            value_end: null,
+            order: "mirror",
+          },
+        ],
+      },
+    ],
+    scenes: [
+      {
+        id: "sc_cyber_wave",
+        name: "Cyberpunk Wave",
+        bank: "main",
+        target_group: null,
+        priority: 10,
+        fade_in_sec: 0,
+        fade_out_sec: 0.5,
+        block_refs: ["blk_cyber_wave"],
+      },
+    ],
   };
 }
 
@@ -302,6 +361,8 @@ function createInitialState() {
 
     showState: createInitialShowState(),
     liveLayers: [] as SmartControlLayer[],
+    activeScenes: [] as ActiveSceneInstance[],
+    liveBpm: 120,
     compiledCells: [] as CompiledCell[],
     cellPreviewRgbd: new Uint8Array(0),
     canUndo: false,
@@ -314,6 +375,9 @@ function createInitialState() {
     _simUndo: [] as SimUndoEntry[],
     _simRedo: [] as SimUndoEntry[],
     _simNextSeq: 1,
+    _simSceneSeq: 1,
+    _simBeatClock: { bpm: 120, t_anchor_sec: 0, beat_anchor: 0 } as BeatClockAnchor,
+    _simTapHistory: [] as number[],
   };
 }
 
@@ -323,6 +387,8 @@ function synthesizeSimulationBuffer(state: {
   grandMaster: number;
   blackout: boolean;
   liveLayers: SmartControlLayer[];
+  activeScenes: ActiveSceneInstance[];
+  _simBeatClock: BeatClockAnchor;
   telemetry: TelemetrySummary;
   jitterSamplesUs: number[];
   showState: ShowStateDto;
@@ -333,6 +399,8 @@ function synthesizeSimulationBuffer(state: {
     show: state.showState,
     fixtureDetailsCache: state.fixtureDetailsCache,
     liveLayers: state.liveLayers,
+    activeScenes: state.activeScenes,
+    beatClock: state._simBeatClock,
     universes: state.universes,
     grandMaster: state.grandMaster,
     blackout: state.blackout,
@@ -503,6 +571,47 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
     })
     .join("\n");
 
+  const fxLines = show.fx_library
+    .map((b) => {
+      const elemLines = b.elements
+        .map((el) => {
+          if (el.kind === "static_trait") {
+            const pr = el.palette_ref ? ` palette_ref="${esc(el.palette_ref)}"` : "";
+            const ord = el.order ? ` order="${esc(el.order)}"` : "";
+            return `      <StaticTrait trait="${esc(el.trait)}" op="${esc(el.op)}"${pr}${ord} />`;
+          }
+          if (el.kind === "curve_1d") {
+            const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
+            const sh = el.speed_hz !== null ? ` speed_hz="${el.speed_hz}"` : "";
+            const pr = el.palette_ref ? ` palette_ref="${esc(el.palette_ref)}"` : "";
+            return `      <Curve1D trait="${esc(el.trait)}" op="${esc(el.op)}" waveform="${esc(el.waveform)}" amplitude="${el.amplitude}" offset="${el.offset}"${rb}${sh} phase_spread_deg="${el.phase_spread_deg}"${pr} />`;
+          }
+          if (el.kind === "step_chase") {
+            const sb = el.step_beats !== null ? ` step_beats="${el.step_beats}"` : "";
+            const ar = el.active_ratio !== null ? ` active_ratio="${el.active_ratio}"` : "";
+            return `      <StepChase trait="${esc(el.trait)}" op="${esc(el.op)}"${sb}${ar} fade="${el.fade}" amplitude="${el.amplitude}" />`;
+          }
+          const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
+          const pr = el.palette_ref ? ` palette_ref="${esc(el.palette_ref)}"` : "";
+          return `      <SpatialShader2D trait="${esc(el.trait)}" op="${esc(el.op)}" shader="${esc(el.shader)}"${pr}${rb} spatial_freq="${el.spatial_freq}" direction_deg="${el.direction_deg}" center_x="${el.center_x}" center_y="${el.center_y}" />`;
+        })
+        .join("\n");
+      const tg = b.target_group ? ` target_group="${esc(b.target_group)}"` : "";
+      return `    <FxBlock id="${esc(b.id)}" name="${esc(b.name)}"${tg} duration_beats="${b.duration_beats}" loop="${b.loop_block}">\n${elemLines}\n    </FxBlock>`;
+    })
+    .join("\n");
+
+  const sceneLines = show.scenes
+    .map((sc) => {
+      const bStr = sc.bank ? ` bank="${esc(sc.bank)}"` : "";
+      const tg = sc.target_group ? ` target_group="${esc(sc.target_group)}"` : "";
+      const refs = sc.block_refs
+        .map((r) => `      <BlockRef ref="${esc(r)}" />`)
+        .join("\n");
+      return `    <Scene id="${esc(sc.id)}" name="${esc(sc.name)}"${bStr}${tg} priority="${sc.priority}" fade_in_sec="${sc.fade_in_sec}" fade_out_sec="${sc.fade_out_sec}">\n${refs}\n    </Scene>`;
+    })
+    .join("\n");
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <TaktLightShow version="1.0" name="${esc(show.name)}" bpm="${show.bpm}">
   <NetworkOutputs frame_rate_hz="${show.network_outputs.frame_rate_hz}" adapter="${esc(show.network_outputs.adapter)}" offline_fallback="${show.network_outputs.offline_fallback}" artsync="${show.network_outputs.artsync}">
@@ -517,6 +626,12 @@ ${patchLines}
   <Groups>
 ${groupLines}
   </Groups>
+  <FxLibrary>
+${fxLines}
+  </FxLibrary>
+  <Scenes>
+${sceneLines}
+  </Scenes>
 </TaktLightShow>
 `;
 }
@@ -645,6 +760,118 @@ function parseShowXmlLocally(
     });
   });
 
+  const fx_library: FxBlockDef[] = [];
+  root.querySelectorAll("FxLibrary > FxBlock").forEach((el) => {
+    const elements: FxElementDef[] = [];
+    Array.from(el.children).forEach((child) => {
+      const tag = child.tagName;
+      const trait = child.getAttribute("trait") ?? "dimmer";
+      const op = (child.getAttribute("op") as MergeOp) ?? "htp";
+      const palette_ref = child.getAttribute("palette_ref");
+      if (tag === "StaticTrait") {
+        elements.push({
+          kind: "static_trait",
+          trait,
+          op,
+          palette_ref,
+          value_start: child.getAttribute("value_start")
+            ? Number(child.getAttribute("value_start"))
+            : null,
+          value_end: child.getAttribute("value_end")
+            ? Number(child.getAttribute("value_end"))
+            : null,
+          order: (child.getAttribute("order") as OrderRuleStr) ?? null,
+        });
+      } else if (tag === "Curve1D") {
+        elements.push({
+          kind: "curve_1d",
+          trait,
+          op,
+          waveform: (child.getAttribute("waveform") as Waveform1D) ?? "sine",
+          amplitude: Number(child.getAttribute("amplitude") ?? 1),
+          offset: Number(child.getAttribute("offset") ?? 0),
+          rate_beats: child.getAttribute("rate_beats")
+            ? Number(child.getAttribute("rate_beats"))
+            : null,
+          speed_hz: child.getAttribute("speed_hz")
+            ? Number(child.getAttribute("speed_hz"))
+            : null,
+          phase_spread_deg: Number(child.getAttribute("phase_spread_deg") ?? 0),
+          duty: child.getAttribute("duty")
+            ? Number(child.getAttribute("duty"))
+            : null,
+          palette_ref,
+          order: (child.getAttribute("order") as OrderRuleStr) ?? null,
+        });
+      } else if (tag === "StepChase") {
+        elements.push({
+          kind: "step_chase",
+          trait,
+          op,
+          step_beats: child.getAttribute("step_beats")
+            ? Number(child.getAttribute("step_beats"))
+            : null,
+          speed_hz: child.getAttribute("speed_hz")
+            ? Number(child.getAttribute("speed_hz"))
+            : null,
+          active_ratio: child.getAttribute("active_ratio")
+            ? Number(child.getAttribute("active_ratio"))
+            : null,
+          fade: Number(child.getAttribute("fade") ?? 0),
+          amplitude: Number(child.getAttribute("amplitude") ?? 1),
+          palette_ref,
+          order: (child.getAttribute("order") as OrderRuleStr) ?? null,
+        });
+      } else if (tag === "SpatialShader2D") {
+        elements.push({
+          kind: "spatial_shader_2d",
+          trait,
+          op,
+          shader:
+            (child.getAttribute("shader") as Shader2DKind) ?? "linear_sweep",
+          palette_ref,
+          rate_beats: child.getAttribute("rate_beats")
+            ? Number(child.getAttribute("rate_beats"))
+            : null,
+          speed_hz: child.getAttribute("speed_hz")
+            ? Number(child.getAttribute("speed_hz"))
+            : null,
+          spatial_freq: Number(child.getAttribute("spatial_freq") ?? 1),
+          direction_deg: Number(child.getAttribute("direction_deg") ?? 0),
+          center_x: Number(child.getAttribute("center_x") ?? 0.5),
+          center_y: Number(child.getAttribute("center_y") ?? 0.5),
+        });
+      }
+    });
+    fx_library.push({
+      id: el.getAttribute("id") ?? `blk_${fx_library.length + 1}`,
+      name: el.getAttribute("name") ?? "FX Block",
+      target_group: el.getAttribute("target_group"),
+      duration_beats: Number(el.getAttribute("duration_beats") ?? 4),
+      loop_block: el.getAttribute("loop") !== "false",
+      elements,
+    });
+  });
+
+  const scenes: SceneDef[] = [];
+  root.querySelectorAll("Scenes > Scene").forEach((el) => {
+    const block_refs: string[] = [];
+    el.querySelectorAll("BlockRef").forEach((bEl) => {
+      const ref = bEl.getAttribute("ref");
+      if (ref) block_refs.push(ref);
+    });
+    scenes.push({
+      id: el.getAttribute("id") ?? `sc_${scenes.length + 1}`,
+      name: el.getAttribute("name") ?? "Scene",
+      bank: el.getAttribute("bank"),
+      target_group: el.getAttribute("target_group"),
+      priority: Number(el.getAttribute("priority") ?? 10),
+      fade_in_sec: Number(el.getAttribute("fade_in_sec") ?? 0),
+      fade_out_sec: Number(el.getAttribute("fade_out_sec") ?? 0.5),
+      block_refs,
+    });
+  });
+
   return {
     version,
     name,
@@ -662,6 +889,8 @@ function parseShowXmlLocally(
     dimmer_palettes,
     patch,
     groups,
+    fx_library,
+    scenes,
   };
 }
 
@@ -691,6 +920,8 @@ export interface TaktStoreState {
 
   showState: ShowStateDto;
   liveLayers: SmartControlLayer[];
+  activeScenes: ActiveSceneInstance[];
+  liveBpm: number;
   compiledCells: CompiledCell[];
   cellPreviewRgbd: Uint8Array;
   canUndo: boolean;
@@ -703,6 +934,9 @@ export interface TaktStoreState {
   _simUndo: SimUndoEntry[];
   _simRedo: SimUndoEntry[];
   _simNextSeq: number;
+  _simSceneSeq: number;
+  _simBeatClock: BeatClockAnchor;
+  _simTapHistory: number[];
 
   setActiveTab: (tab: WorkspaceTab) => void;
   applyBinaryFrame: (buffer: ArrayBuffer) => void;
@@ -772,6 +1006,15 @@ export interface TaktStoreState {
   upsertGroup: (group: FixtureGroupDef) => Promise<void>;
   deleteGroup: (id: string) => Promise<void>;
   setLiveLayers: (layers: SmartControlLayer[]) => Promise<void>;
+  upsertFxBlock: (block: FxBlockDef) => Promise<void>;
+  deleteFxBlock: (id: string) => Promise<void>;
+  upsertScene: (scene: SceneDef) => Promise<void>;
+  deleteScene: (id: string) => Promise<void>;
+  triggerScene: (sceneId: string, tSec?: number) => Promise<void>;
+  releaseScene: (sceneId: string, tSec?: number) => Promise<void>;
+  releaseAllScenes: (tSec?: number) => Promise<void>;
+  setLiveBpm: (bpm: number, tSec?: number) => Promise<void>;
+  tapTempo: (tSec?: number) => Promise<void>;
   selectFixtureInstance: (id: string | null) => void;
   setFocusedPatchUniverse: (universeId: number) => void;
   dismissToast: () => void;
@@ -824,6 +1067,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         blackout: snapshot.blackout,
         parkedChannels: parked,
         liveLayers: snapshot.live_layers ?? state.liveLayers,
+        activeScenes: snapshot.active_scenes ?? state.activeScenes,
+        liveBpm: snapshot.live_bpm ?? state.liveBpm,
         universes: snapshot.universes,
         dmxByUniverse: nextDmx,
         interfaces: snapshot.interfaces,
@@ -1763,6 +2008,274 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       get().applyEngineSnapshot(snap);
     } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    }
+  },
+
+  upsertFxBlock: async (block) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>(
+        "upsert_fx_block_command",
+        { block },
+      );
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const exists = prevShow.fx_library.some((b) => b.id === block.id);
+    const nextBlocks = exists
+      ? prevShow.fx_library.map((b) => (b.id === block.id ? block : b))
+      : [...prevShow.fx_library, block];
+    set({
+      showState: { ...prevShow, fx_library: nextBlocks },
+      patchToast: `Saved FX block ${block.name}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  deleteFxBlock: async (id) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>(
+        "delete_fx_block_command",
+        { id },
+      );
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    set({
+      showState: {
+        ...prevShow,
+        fx_library: prevShow.fx_library.filter((b) => b.id !== id),
+      },
+      patchToast: `Deleted FX block ${id}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  upsertScene: async (scene) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>("upsert_scene_command", {
+        scene,
+      });
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const exists = prevShow.scenes.some((s) => s.id === scene.id);
+    const nextScenes = exists
+      ? prevShow.scenes.map((s) => (s.id === scene.id ? scene : s))
+      : [...prevShow.scenes, scene];
+    set({
+      showState: { ...prevShow, scenes: nextScenes },
+      patchToast: `Saved scene ${scene.name}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  deleteScene: async (id) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>("delete_scene_command", {
+        id,
+      });
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    set({
+      showState: {
+        ...prevShow,
+        scenes: prevShow.scenes.filter((s) => s.id !== id),
+      },
+      patchToast: `Deleted scene ${id}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  triggerScene: async (sceneId, tSec) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>("trigger_scene_command", {
+        sceneId,
+        tSec: tSec ?? null,
+      });
+      get().applyEngineSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const scene = state.showState.scenes.find((s) => s.id === sceneId);
+    if (!scene) return;
+    const tNow = tSec ?? state.telemetry.tSec;
+    const normBank = scene.bank?.trim() ? scene.bank.trim() : null;
+
+    const remaining = state.activeScenes
+      .filter((inst) => {
+        const a = computeSceneAlphaAt(inst, tNow);
+        return !(inst.release_t_sec !== null && a <= 1e-6);
+      })
+      .filter((inst) => inst.scene_id !== sceneId)
+      .map((inst) => {
+        if (
+          normBank &&
+          inst.bank === normBank &&
+          inst.release_t_sec === null
+        ) {
+          return {
+            ...inst,
+            release_start_alpha: computeSceneAlphaAt(inst, tNow),
+            release_t_sec: tNow,
+          };
+        }
+        return inst;
+      });
+
+    const seq = state._simSceneSeq;
+    const triggerBeat = computeBeatAt(state._simBeatClock, tNow);
+    const nextInst: ActiveSceneInstance = {
+      scene_id: scene.id,
+      bank: normBank,
+      trigger_t_sec: tNow,
+      trigger_beat: triggerBeat,
+      trigger_order: seq,
+      fade_in_sec: Math.max(0, scene.fade_in_sec),
+      fade_out_sec: Math.max(0, scene.fade_out_sec),
+      release_t_sec: null,
+      release_start_alpha: 1,
+    };
+
+    set({
+      activeScenes: [...remaining, nextInst],
+      _simSceneSeq: seq + 1,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  releaseScene: async (sceneId, tSec) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>("release_scene_command", {
+        sceneId,
+        tSec: tSec ?? null,
+      });
+      get().applyEngineSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const tNow = tSec ?? state.telemetry.tSec;
+    const updated = state.activeScenes
+      .map((inst) =>
+        inst.scene_id === sceneId && inst.release_t_sec === null
+          ? {
+              ...inst,
+              release_start_alpha: computeSceneAlphaAt(inst, tNow),
+              release_t_sec: tNow,
+            }
+          : inst,
+      )
+      .filter(
+        (inst) =>
+          !(inst.release_t_sec !== null && computeSceneAlphaAt(inst, tNow) <= 1e-6),
+      );
+    set({ activeScenes: updated });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  releaseAllScenes: async (tSec) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>(
+        "release_all_scenes_command",
+        { tSec: tSec ?? null },
+      );
+      get().applyEngineSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const tNow = tSec ?? state.telemetry.tSec;
+    const updated = state.activeScenes
+      .map((inst) =>
+        inst.release_t_sec === null
+          ? {
+              ...inst,
+              release_start_alpha: computeSceneAlphaAt(inst, tNow),
+              release_t_sec: tNow,
+            }
+          : inst,
+      )
+      .filter(
+        (inst) =>
+          !(inst.release_t_sec !== null && computeSceneAlphaAt(inst, tNow) <= 1e-6),
+      );
+    set({ activeScenes: updated });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  setLiveBpm: async (bpm, tSec) => {
+    const clampedBpm = Number.isNaN(bpm)
+      ? 120
+      : Math.max(20, Math.min(300, bpm));
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>("set_live_bpm_command", {
+        bpm: clampedBpm,
+        tSec: tSec ?? null,
+      });
+      get().applyEngineSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const tNow = tSec ?? state.telemetry.tSec;
+    const nextAnchor: BeatClockAnchor = {
+      bpm: clampedBpm,
+      t_anchor_sec: tNow,
+      beat_anchor: computeBeatAt(state._simBeatClock, tNow),
+    };
+    set({
+      liveBpm: clampedBpm,
+      _simBeatClock: nextAnchor,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  tapTempo: async (tSec) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>("tap_tempo_command", {
+        tSec: tSec ?? null,
+      });
+      get().applyEngineSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const tNow = tSec ?? Date.now() / 1000;
+    const prev = state._simTapHistory;
+    const last = prev[prev.length - 1];
+    const baseHistory =
+      last !== undefined && (Math.abs(tNow - last) > 3 || tNow < last)
+        ? []
+        : prev;
+    const nextHistory = [...baseHistory, tNow].slice(-8);
+    set({ _simTapHistory: nextHistory });
+    if (nextHistory.length >= 2) {
+      const span = nextHistory[nextHistory.length - 1] - nextHistory[0];
+      const intervals = nextHistory.length - 1;
+      if (span > 1e-4) {
+        await get().setLiveBpm((60 * intervals) / span, tNow);
+      }
     }
   },
 

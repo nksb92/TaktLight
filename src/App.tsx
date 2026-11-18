@@ -5,6 +5,7 @@ import { FixtureGrid2D } from "./components/FixtureGrid2D";
 import { JitterHistogram } from "./components/JitterHistogram";
 import { PalettesAndControls } from "./components/PalettesAndControls";
 import { PatchView } from "./components/PatchView";
+import { SceneAndFxManager } from "./components/SceneAndFxManager";
 import { TopStatusBar } from "./components/TopStatusBar";
 import { useTaktStore } from "./store/useTaktStore";
 
@@ -33,6 +34,7 @@ export function App() {
         {activeTab === "patch" && <PatchView />}
         {activeTab === "grid" && <FixtureGrid2D />}
         {activeTab === "palettes" && <PalettesAndControls />}
+        {activeTab === "scenes" && <SceneAndFxManager />}
         {activeTab === "fixtures" && <FixtureBuilder />}
       </main>
     </div>

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import App from "./App";
 import {
@@ -347,5 +347,129 @@ describe("TaktLight Slice 4 Palettes & Smart Controls UI", () => {
     expect(
       screen.getByText(/SOFTWARE STROBE CAPPED AT 11 HZ/i),
     ).toBeInTheDocument();
+  });
+});
+
+describe("TaktLight Slice 5 Scenes & FX Engine UI", () => {
+  beforeEach(() => {
+    useTaktStore.getState().resetForTest();
+  });
+
+  it("manages FX blocks, scenes with Undo/Redo, bank exclusivity, tap tempo, and live DMX output", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube Stage",
+        1,
+        1,
+        1,
+      );
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Scenes & FX/i }));
+
+    // Tempo controls
+    fireEvent.change(screen.getByLabelText("Live BPM"), {
+      target: { value: "140" },
+    });
+    await Promise.resolve();
+    expect(useTaktStore.getState().liveBpm).toBe(140);
+
+    fireEvent.click(screen.getByRole("button", { name: /Tap Tempo/i }));
+    await Promise.resolve();
+
+    // Create an FX Block
+    fireEvent.change(screen.getByLabelText("FX Block Name"), {
+      target: { value: "Sine Wave Boost" },
+    });
+    fireEvent.change(screen.getByLabelText("FX Block Target Group"), {
+      target: { value: "all" },
+    });
+    fireEvent.change(screen.getByLabelText("FX Block Duration Beats"), {
+      target: { value: "4" },
+    });
+    fireEvent.change(screen.getByLabelText("FX Generator Kind"), {
+      target: { value: "curve_1d" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Save FX Block/i }));
+      await Promise.resolve();
+    });
+
+    const createdBlock = useTaktStore
+      .getState()
+      .showState.fx_library.find((b) => b.name === "Sine Wave Boost");
+    expect(createdBlock).toBeDefined();
+    expect(screen.getByText("Sine Wave Boost")).toBeInTheDocument();
+
+    // Create a Scene in the "main" bank referencing the FX block + Undo/Redo
+    fireEvent.change(screen.getByLabelText("Scene Name"), {
+      target: { value: "Boost Wash" },
+    });
+    fireEvent.change(screen.getByLabelText("Scene Bank"), {
+      target: { value: "main" },
+    });
+    fireEvent.change(screen.getByLabelText("Scene Priority"), {
+      target: { value: "20" },
+    });
+    fireEvent.change(screen.getByLabelText("Scene Fade In"), {
+      target: { value: "0" },
+    });
+    fireEvent.change(screen.getByLabelText("Scene Fade Out"), {
+      target: { value: "0.5" },
+    });
+    fireEvent.change(screen.getByLabelText("Scene Block Ref"), {
+      target: { value: createdBlock!.id },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Save Scene/i }));
+    await Promise.resolve();
+
+    expect(
+      useTaktStore.getState().showState.scenes.some((s) => s.name === "Boost Wash"),
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Undo$/i }));
+    await Promise.resolve();
+    expect(
+      useTaktStore.getState().showState.scenes.some((s) => s.name === "Boost Wash"),
+    ).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Redo$/i }));
+    await Promise.resolve();
+    const createdScene = useTaktStore
+      .getState()
+      .showState.scenes.find((s) => s.name === "Boost Wash");
+    expect(createdScene).toBeDefined();
+
+    // Trigger starter Cyberpunk Wave scene -> outputs DMX Ch1 = 255
+    fireEvent.click(screen.getByTestId("trigger-scene-sc_cyber_wave"));
+    await Promise.resolve();
+    expect(useTaktStore.getState().activeScenes).toHaveLength(1);
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
+
+    // Trigger Boost Wash in same "main" bank -> sc_cyber_wave enters release
+    fireEvent.click(screen.getByTestId(`trigger-scene-${createdScene!.id}`));
+    await Promise.resolve();
+    const activeAfter = useTaktStore.getState().activeScenes;
+    const cyberInst = activeAfter.find((s) => s.scene_id === "sc_cyber_wave");
+    const boostInst = activeAfter.find((s) => s.scene_id === createdScene!.id);
+    expect(cyberInst?.release_t_sec).not.toBeNull();
+    expect(boostInst?.release_t_sec).toBeNull();
+
+    // Release All Scenes
+    fireEvent.click(
+      screen.getByRole("button", { name: /Release All Scenes/i }),
+    );
+    await Promise.resolve();
+    expect(
+      useTaktStore
+        .getState()
+        .activeScenes.every((s) => s.release_t_sec !== null),
+    ).toBe(true);
+
+    expect(screen.getByTestId("scene-live-cell-preview")).toBeInTheDocument();
   });
 });
