@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+  "type": "object",
+  "required": ["name", "categories", "meta", "modes"],
+  "anyOf": [
+    { "required": ["availableChannels"] },
+    { "required": ["templateChannels"] }
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "name": {
+      "$ref": "definitions.json#/definitions/nonEmptyString"
+    },
+    "shortName": {
+      "$ref": "definitions.json#/definitions/nonEmptyString"
+    },
+    "categories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "definitions.json#/definitions/nonEmptyString"
+      }
+    },
+    "comment": {
+      "type": "string"
+    },
+    "meta": {
+      "type": "object",
+      "required": ["authors", "createDate", "lastModifyDate"],
+      "properties": {
+        "authors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "definitions.json#/definitions/nonEmptyString"
+          }
+        },
+        "createDate": {
+          "$ref": "definitions.json#/definitions/isoDateString"
+        },
+        "lastModifyDate": {
+          "$ref": "definitions.json#/definitions/isoDateString"
+        }
+      }
+    },
+    "links": {
+      "type": "object"
+    },
+    "physical": {
+      "type": "object"
+    },
+    "matrix": {
+      "$ref": "matrix.json#"
+    },
+    "wheels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["slots"],
+        "properties": {
+          "direction": {
+            "type": "string",
+            "enum": ["CW", "CCW"]
+          },
+          "slots": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "wheel-slot.json#"
+            }
+          }
+        }
+      }
+    },
+    "availableChannels": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "channel.json#"
+      }
+    },
+    "templateChannels": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "channel.json#"
+      }
+    },
+    "modes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "channels"],
+        "properties": {
+          "name": {
+            "$ref": "definitions.json#/definitions/nonEmptyString"
+          },
+          "shortName": {
+            "$ref": "definitions.json#/definitions/nonEmptyString"
+          },
+          "channels": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "oneOf": [
+                {
+                  "type": ["string", "null"]
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "insert",
+                    "repeatFor",
+                    "channelOrder",
+                    "templateChannels"
+                  ],
+                  "properties": {
+                    "insert": {
+                      "const": "matrixChannels"
+                    },
+                    "repeatFor": {
+                      "type": ["string", "array"]
+                    },
+                    "channelOrder": {
+                      "$ref": "definitions.json#/definitions/channelOrderEnum"
+                    },
+                    "templateChannels": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "$ref": "definitions.json#/definitions/nonEmptyString"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

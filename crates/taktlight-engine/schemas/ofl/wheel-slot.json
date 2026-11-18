@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/wheel-slot.json",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "Open",
+        "Closed",
+        "Color",
+        "Gobo",
+        "Prism",
+        "Frost",
+        "Iris",
+        "AnimationGoboStart",
+        "AnimationGoboEnd"
+      ]
+    },
+    "name": {
+      "$ref": "definitions.json#/definitions/nonEmptyString"
+    },
+    "colors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "definitions.json#/definitions/colorHexString"
+      }
+    }
+  }
+}

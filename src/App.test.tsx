@@ -58,4 +58,49 @@ describe("TaktLight Slice 1 Studio UI", () => {
       screen.queryByText("44 Hz Frame Timing & Jitter Histogram"),
     ).not.toBeInTheDocument();
   });
+
+  it("switches to Fixture Builder, inspects RLCV3, builds a custom fixture, and flags invalid JSON paths", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Fixture Builder/i }));
+    expect(screen.getByText("Local OFL Fixture Library")).toBeInTheDocument();
+    expect(screen.getByText("RLCV3 8-Segment RGBW Tube")).toBeInTheDocument();
+    expect(screen.getByText("RLCV4 16-Segment RGBW Tube")).toBeInTheDocument();
+
+    // Start new custom fixture draft, edit name, and save to user library
+    fireEvent.click(screen.getByRole("button", { name: /New Builder Draft/i }));
+    const nameInput = screen.getByLabelText("Fixture Name");
+    fireEvent.change(nameInput, { target: { value: "Studio Neon Bar" } });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Save to User Library/i }),
+    );
+    expect(
+      await screen.findByText("Studio Neon Bar"),
+    ).toBeInTheDocument();
+
+    // Switch to Raw JSON Editor and introduce invalid JSON / schema error
+    fireEvent.click(screen.getByRole("button", { name: /Raw JSON Editor/i }));
+    const editor = screen.getByLabelText("Raw OFL JSON Editor");
+    fireEvent.change(editor, {
+      target: {
+        value: JSON.stringify({
+          name: "",
+          categories: ["Color Changer"],
+          meta: {
+            authors: ["Test"],
+            createDate: "2026-11-18",
+            lastModifyDate: "2026-11-18",
+          },
+          availableChannels: {
+            Dimmer: { capability: { type: "Intensity" } },
+          },
+          modes: [{ name: "1ch", channels: ["Dimmer"] }],
+        }),
+      },
+    });
+
+    expect(await screen.findByText("SCHEMA INVALID")).toBeInTheDocument();
+    expect(await screen.findByText(/\/name/)).toBeInTheDocument();
+  });
 });

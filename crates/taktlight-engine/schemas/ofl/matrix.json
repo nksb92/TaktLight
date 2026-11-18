@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/matrix.json",
+  "type": "object",
+  "properties": {
+    "pixelCount": {
+      "$ref": "definitions.json#/definitions/dimensionsXYZ"
+    },
+    "pixelKeys": {
+      "type": "array",
+      "minItems": 1
+    },
+    "pixelGroups": {
+      "type": "object"
+    }
+  },
+  "anyOf": [
+    { "required": ["pixelCount"] },
+    { "required": ["pixelKeys"] }
+  ]
+}

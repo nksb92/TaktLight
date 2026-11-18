@@ -1,0 +1,81 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/definitions.json",
+  "definitions": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dmxValue": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "colorHexString": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$"
+    },
+    "frequencyHz": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?\\s*Hz$"
+    },
+    "dimensionsXYZ": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "isoDateString": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "dmxRange": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/dmxValue"
+      },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "colorEnum": {
+      "type": "string",
+      "enum": [
+        "Red",
+        "Green",
+        "Blue",
+        "Cyan",
+        "Magenta",
+        "Yellow",
+        "Amber",
+        "White",
+        "Warm White",
+        "Cold White",
+        "UV",
+        "Lime",
+        "Indigo"
+      ]
+    },
+    "shutterEffectEnum": {
+      "type": "string",
+      "enum": [
+        "Open",
+        "Closed",
+        "Strobe",
+        "Pulse",
+        "RampUp",
+        "RampDown",
+        "RampUpDown",
+        "Lightning",
+        "Spikes",
+        "Burst"
+      ]
+    },
+    "channelOrderEnum": {
+      "type": "string",
+      "enum": ["perPixel", "perChannel"]
+    }
+  }
+}

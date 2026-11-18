@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -12,6 +13,11 @@ use taktlight_engine::engine::runner::{
     spawn_engine_loop, EngineConfig, EngineRunnerHandle, EngineTelemetrySnapshot,
 };
 use taktlight_engine::frame::flow::FrameCreditGate;
+use taktlight_engine::ofl::expander::ExpandedFixtureMode;
+use taktlight_engine::ofl::library::{
+    validate_and_parse_ofl, FixtureDetail, FixtureLibrary, FixtureSummary, SaveFixtureError,
+};
+use taktlight_engine::ofl::validator::SchemaValidationIssue;
 use taktlight_engine::protocol::artnet::TrackedArtNetNode;
 use taktlight_engine::protocol::nic::{
     enumerate_ipv4_interfaces, AdapterSelection, NetworkInterfaceInfo,
@@ -43,6 +49,14 @@ pub struct EngineSnapshotDto {
     pub jitter_samples_us: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FixtureValidationResult {
+    pub valid: bool,
+    pub issues: Vec<SchemaValidationIssue>,
+    pub expanded_modes: Vec<ExpandedFixtureMode>,
+    pub pixel_count: u16,
+}
+
 pub struct AppState {
     pub plan: Arc<ArcSwap<RenderPlan>>,
     pub runtime: Arc<ArcSwap<RuntimeControl>>,
@@ -53,10 +67,33 @@ pub struct AppState {
     pub adapter_selection: Arc<RwLock<AdapterSelection>>,
     pub stream_generation: Arc<AtomicU64>,
     pub engine_handle: Mutex<Option<EngineRunnerHandle>>,
+    pub fixture_library: RwLock<FixtureLibrary>,
+}
+
+fn resolve_default_fixtures_dir() -> Option<PathBuf> {
+    let candidates = [PathBuf::from("fixtures"), PathBuf::from("../fixtures")];
+    for candidate in candidates {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    std::env::current_dir().ok().map(|d| d.join("fixtures"))
 }
 
 impl AppState {
     pub fn new(start_engine_thread: bool) -> Self {
+        let fixtures_dir = if start_engine_thread {
+            resolve_default_fixtures_dir()
+        } else {
+            None
+        };
+        Self::new_with_fixtures_dir(start_engine_thread, fixtures_dir)
+    }
+
+    pub fn new_with_fixtures_dir(
+        start_engine_thread: bool,
+        fixtures_dir: Option<PathBuf>,
+    ) -> Self {
         let plan = Arc::new(ArcSwap::from_pointee(RenderPlan::default_studio_plan()));
         let runtime = Arc::new(ArcSwap::from_pointee(RuntimeControl::new()));
         let credit_gate = FrameCreditGate::new(true);
@@ -66,6 +103,7 @@ impl AppState {
             ..Default::default()
         }));
         let adapter_selection = Arc::new(RwLock::new(AdapterSelection::Auto));
+        let fixture_library = RwLock::new(FixtureLibrary::load(fixtures_dir.as_deref()));
 
         let engine_handle = if start_engine_thread {
             Some(spawn_engine_loop(
@@ -90,6 +128,7 @@ impl AppState {
             adapter_selection,
             stream_generation: Arc::new(AtomicU64::new(0)),
             engine_handle: Mutex::new(engine_handle),
+            fixture_library,
         }
     }
 
@@ -134,6 +173,46 @@ impl AppState {
             jitter_stats: tel.jitter_stats,
             jitter_samples_us: tel.jitter_samples_us.clone(),
         }
+    }
+
+    pub fn validate_fixture(raw_json: &str) -> FixtureValidationResult {
+        match validate_and_parse_ofl(raw_json) {
+            Ok((_def, expanded_modes)) => {
+                let pixel_count = expanded_modes
+                    .iter()
+                    .map(|m| m.cells.len() as u16)
+                    .max()
+                    .unwrap_or(1);
+                FixtureValidationResult {
+                    valid: true,
+                    issues: Vec::new(),
+                    expanded_modes,
+                    pixel_count,
+                }
+            }
+            Err(issues) => FixtureValidationResult {
+                valid: false,
+                issues,
+                expanded_modes: Vec::new(),
+                pixel_count: 0,
+            },
+        }
+    }
+
+    pub fn save_fixture(
+        &self,
+        slug: &str,
+        raw_json: &str,
+    ) -> Result<FixtureDetail, Vec<SchemaValidationIssue>> {
+        let mut lib = self.fixture_library.write();
+        lib.save_user_fixture(slug, raw_json).map_err(|err| match err {
+            SaveFixtureError::Validation(issues) => issues,
+            other => vec![SchemaValidationIssue {
+                instance_path: "/".to_string(),
+                schema_path: "".to_string(),
+                message: other.to_string(),
+            }],
+        })
     }
 }
 
@@ -217,6 +296,40 @@ fn set_network_adapter(
     Ok(state.snapshot())
 }
 
+#[tauri::command]
+fn list_fixtures(state: State<'_, AppState>) -> Vec<FixtureSummary> {
+    state.fixture_library.read().list_summaries()
+}
+
+#[tauri::command]
+fn get_fixture_detail(state: State<'_, AppState>, id: String) -> Result<FixtureDetail, String> {
+    state
+        .fixture_library
+        .read()
+        .get_entry(&id)
+        .cloned()
+        .ok_or_else(|| format!("fixture '{id}' not found"))
+}
+
+#[tauri::command]
+fn validate_fixture_json(raw_json: String) -> FixtureValidationResult {
+    AppState::validate_fixture(&raw_json)
+}
+
+#[tauri::command]
+fn save_user_fixture(
+    state: State<'_, AppState>,
+    slug: String,
+    raw_json: String,
+) -> Result<FixtureDetail, Vec<SchemaValidationIssue>> {
+    state.save_fixture(&slug, &raw_json)
+}
+
+#[tauri::command]
+fn delete_user_fixture(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.fixture_library.write().delete_user_fixture(&id)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
@@ -232,6 +345,11 @@ pub fn run() {
             set_grand_master,
             get_engine_snapshot,
             set_network_adapter,
+            list_fixtures,
+            get_fixture_detail,
+            validate_fixture_json,
+            save_user_fixture,
+            delete_user_fixture,
         ])
         .build(tauri::generate_context!())
         .expect("error while building TaktLight application");
@@ -275,5 +393,48 @@ mod tests {
 
         state.update_runtime(|rt| rt.clear_parked(None));
         assert!(state.snapshot().parked_channels.is_empty());
+    }
+
+    #[test]
+    fn app_state_lists_validates_saves_and_deletes_ofl_fixtures() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "taktlight_tauri_ofl_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let state = AppState::new_with_fixtures_dir(false, Some(temp_dir.clone()));
+        let summaries = state.fixture_library.read().list_summaries();
+        assert_eq!(summaries.len(), 2);
+
+        let rlcv3 = state
+            .fixture_library
+            .read()
+            .get_entry("age/rlcv3_8_segment_tube.json")
+            .cloned()
+            .unwrap();
+        let validation = AppState::validate_fixture(&rlcv3.raw_json);
+        assert!(validation.valid);
+        assert_eq!(validation.pixel_count, 8);
+        assert_eq!(validation.expanded_modes[0].channel_count, 34);
+
+        let bad_validation = AppState::validate_fixture("{\"name\": \"\"}");
+        assert!(!bad_validation.valid);
+        assert!(!bad_validation.issues.is_empty());
+
+        let saved = state
+            .save_fixture("my_custom_tube", &rlcv3.raw_json)
+            .expect("valid user fixture saved");
+        assert_eq!(saved.summary.id, "user/my_custom_tube.json");
+
+        assert_eq!(state.fixture_library.read().list_summaries().len(), 3);
+        state
+            .fixture_library
+            .write()
+            .delete_user_fixture("user/my_custom_tube.json")
+            .unwrap();
+        assert_eq!(state.fixture_library.read().list_summaries().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
