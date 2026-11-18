@@ -13,6 +13,7 @@ use taktlight_engine::engine::runner::{
     spawn_engine_loop, EngineConfig, EngineRunnerHandle, EngineTelemetrySnapshot,
 };
 use taktlight_engine::frame::flow::FrameCreditGate;
+use taktlight_engine::mixer::traits::SmartControlLayer;
 use taktlight_engine::ofl::expander::ExpandedFixtureMode;
 use taktlight_engine::ofl::library::{
     validate_and_parse_ofl, FixtureDetail, FixtureLibrary, FixtureSummary, SaveFixtureError,
@@ -28,7 +29,10 @@ use taktlight_engine::show::patch::{
 };
 use taktlight_engine::show::spatial::GridPos;
 use taktlight_engine::show::undo::{ShowCommand, UndoHistory};
-use taktlight_engine::show::xml::{deserialize_show_xml, serialize_show_xml, ShowState};
+use taktlight_engine::show::xml::{
+    deserialize_show_xml, serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef,
+    ShowState,
+};
 use taktlight_engine::state::plan::{CompiledCell, RenderPlan, UniverseConfig};
 use taktlight_engine::state::runtime::RuntimeControl;
 use taktlight_engine::telemetry::jitter::JitterStats;
@@ -45,6 +49,7 @@ pub struct EngineSnapshotDto {
     pub grand_master: f32,
     pub blackout: bool,
     pub parked_channels: Vec<ParkedChannelDto>,
+    pub live_layers: Vec<SmartControlLayer>,
     pub universes: Vec<UniverseConfig>,
     pub interfaces: Vec<NetworkInterfaceInfo>,
     pub adapter_selection: AdapterSelection,
@@ -198,6 +203,7 @@ impl AppState {
             grand_master: rt.grand_master,
             blackout: rt.blackout,
             parked_channels,
+            live_layers: rt.live_layers.clone(),
             universes: plan.universes.clone(),
             interfaces: enumerate_ipv4_interfaces(),
             adapter_selection: selection,
@@ -479,6 +485,117 @@ impl AppState {
         self.execute_show_command(
             ShowCommand::ReplaceShowState { before, after },
             Some("Imported .takt.xml show".to_string()),
+            false,
+        )
+    }
+
+    pub fn upsert_color_palette(&self, palette: ColorPaletteDef) -> Result<ShowSnapshotDto, String> {
+        let before = self
+            .show_state
+            .read()
+            .color_palettes
+            .iter()
+            .find(|p| p.id == palette.id)
+            .cloned();
+        let label = palette.name.clone();
+        self.execute_show_command(
+            ShowCommand::UpsertColorPalette {
+                before,
+                after: palette,
+            },
+            Some(format!("Saved color palette {label}")),
+            false,
+        )
+    }
+
+    pub fn delete_color_palette(&self, id: &str) -> Result<ShowSnapshotDto, String> {
+        let removed = self
+            .show_state
+            .read()
+            .color_palettes
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| format!("color palette '{id}' not found"))?;
+        let label = removed.name.clone();
+        self.execute_show_command(
+            ShowCommand::DeleteColorPalette { removed },
+            Some(format!("Deleted color palette {label}")),
+            false,
+        )
+    }
+
+    pub fn upsert_dimmer_palette(
+        &self,
+        palette: DimmerPaletteDef,
+    ) -> Result<ShowSnapshotDto, String> {
+        let before = self
+            .show_state
+            .read()
+            .dimmer_palettes
+            .iter()
+            .find(|p| p.id == palette.id)
+            .cloned();
+        let label = palette.name.clone();
+        self.execute_show_command(
+            ShowCommand::UpsertDimmerPalette {
+                before,
+                after: palette,
+            },
+            Some(format!("Saved dimmer palette {label}")),
+            false,
+        )
+    }
+
+    pub fn delete_dimmer_palette(&self, id: &str) -> Result<ShowSnapshotDto, String> {
+        let removed = self
+            .show_state
+            .read()
+            .dimmer_palettes
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| format!("dimmer palette '{id}' not found"))?;
+        let label = removed.name.clone();
+        self.execute_show_command(
+            ShowCommand::DeleteDimmerPalette { removed },
+            Some(format!("Deleted dimmer palette {label}")),
+            false,
+        )
+    }
+
+    pub fn upsert_group(&self, group: FixtureGroupDef) -> Result<ShowSnapshotDto, String> {
+        let before = self
+            .show_state
+            .read()
+            .groups
+            .iter()
+            .find(|g| g.id == group.id)
+            .cloned();
+        let label = group.name.clone();
+        self.execute_show_command(
+            ShowCommand::UpsertGroup {
+                before,
+                after: group,
+            },
+            Some(format!("Saved group {label}")),
+            false,
+        )
+    }
+
+    pub fn delete_group(&self, id: &str) -> Result<ShowSnapshotDto, String> {
+        let removed = self
+            .show_state
+            .read()
+            .groups
+            .iter()
+            .find(|g| g.id == id)
+            .cloned()
+            .ok_or_else(|| format!("group '{id}' not found"))?;
+        let label = removed.name.clone();
+        self.execute_show_command(
+            ShowCommand::DeleteGroup { removed },
+            Some(format!("Deleted group {label}")),
             false,
         )
     }
@@ -767,6 +884,63 @@ fn import_show_xml_command(
     state.import_show_xml(&xml_str)
 }
 
+#[tauri::command]
+fn upsert_color_palette_command(
+    state: State<'_, AppState>,
+    palette: ColorPaletteDef,
+) -> Result<ShowSnapshotDto, String> {
+    state.upsert_color_palette(palette)
+}
+
+#[tauri::command]
+fn delete_color_palette_command(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.delete_color_palette(&id)
+}
+
+#[tauri::command]
+fn upsert_dimmer_palette_command(
+    state: State<'_, AppState>,
+    palette: DimmerPaletteDef,
+) -> Result<ShowSnapshotDto, String> {
+    state.upsert_dimmer_palette(palette)
+}
+
+#[tauri::command]
+fn delete_dimmer_palette_command(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.delete_dimmer_palette(&id)
+}
+
+#[tauri::command]
+fn upsert_group_command(
+    state: State<'_, AppState>,
+    group: FixtureGroupDef,
+) -> Result<ShowSnapshotDto, String> {
+    state.upsert_group(group)
+}
+
+#[tauri::command]
+fn delete_group_command(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.delete_group(&id)
+}
+
+#[tauri::command]
+fn set_live_layers_command(
+    state: State<'_, AppState>,
+    layers: Vec<SmartControlLayer>,
+) -> EngineSnapshotDto {
+    state.update_runtime(|rt| rt.set_live_layers(layers));
+    state.snapshot()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
@@ -799,6 +973,13 @@ pub fn run() {
             redo_command,
             export_show_xml_command,
             import_show_xml_command,
+            upsert_color_palette_command,
+            delete_color_palette_command,
+            upsert_dimmer_palette_command,
+            delete_dimmer_palette_command,
+            upsert_group_command,
+            delete_group_command,
+            set_live_layers_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building TaktLight application");
@@ -925,5 +1106,120 @@ mod tests {
         let redone = state.redo().unwrap();
         assert_eq!(redone.show.patch.len(), 1);
         assert_eq!(state.plan.load().cell_count, 8);
+    }
+
+    #[test]
+    fn app_state_manages_palettes_groups_and_live_layers() {
+        use taktlight_engine::engine::evaluator::{ClockInput, Engine, QuantizerState};
+        use taktlight_engine::mixer::traits::{MergeOp, SmartLayerTrait};
+        use taktlight_engine::show::spatial::OrderRule;
+
+        let state = AppState::new(false);
+        state
+            .patch_fixtures(
+                "age/rlcv3_8_segment_tube.json",
+                "34ch Pixel Mode",
+                "Tube 1",
+                1,
+                1,
+                1,
+                true,
+            )
+            .unwrap();
+
+        let color_snap = state
+            .upsert_color_palette(ColorPaletteDef {
+                id: "pal_white".into(),
+                name: "Studio White".into(),
+                hex_start: "#FFFFFF".into(),
+                hex_end: "#FFFFFF".into(),
+            })
+            .unwrap();
+        assert_eq!(color_snap.show.color_palettes.len(), 1);
+        assert_eq!(state.plan.load().color_palettes.len(), 1);
+
+        let dim_snap = state
+            .upsert_dimmer_palette(DimmerPaletteDef {
+                id: "dim_full".into(),
+                name: "Full".into(),
+                value_start: 1.0,
+                value_end: 1.0,
+            })
+            .unwrap();
+        assert_eq!(dim_snap.show.dimmer_palettes.len(), 1);
+
+        let grp_snap = state
+            .upsert_group(FixtureGroupDef {
+                id: "grp_all".into(),
+                name: "All Cells".into(),
+                order: OrderRule::Mirror,
+                targets: vec!["fx_001:0..7".into()],
+            })
+            .unwrap();
+        assert_eq!(grp_snap.show.groups.len(), 1);
+        assert_eq!(state.plan.load().groups[0].cells.len(), 8);
+
+        let rev_before_live = state.undo_history.lock().revision();
+        let plan_ptr_before_live = Arc::as_ptr(&state.plan.load());
+        state.update_runtime(|rt| {
+            rt.set_live_layers(vec![
+                SmartControlLayer {
+                    id: "live_dim".into(),
+                    name: "Live Dimmer".into(),
+                    enabled: true,
+                    priority: 1,
+                    trigger_order: 1,
+                    alpha: 1.0,
+                    target: "grp_all".into(),
+                    order_override: None,
+                    trait_spec: SmartLayerTrait::Dimmer {
+                        op: MergeOp::Htp,
+                        palette_ref: Some("dim_full".into()),
+                        value_start: 0.0,
+                        value_end: 0.0,
+                    },
+                },
+                SmartControlLayer {
+                    id: "live_col".into(),
+                    name: "Live Color".into(),
+                    enabled: true,
+                    priority: 1,
+                    trigger_order: 2,
+                    alpha: 1.0,
+                    target: "grp_all".into(),
+                    order_override: None,
+                    trait_spec: SmartLayerTrait::Color {
+                        op: MergeOp::Ltp,
+                        palette_ref: Some("pal_white".into()),
+                        hex_start: "#000000".into(),
+                        hex_end: "#000000".into(),
+                    },
+                },
+            ])
+        });
+        assert_eq!(state.undo_history.lock().revision(), rev_before_live);
+        assert_eq!(Arc::as_ptr(&state.plan.load()), plan_ptr_before_live);
+        assert_eq!(state.snapshot().live_layers.len(), 2);
+
+        let plan = state.plan.load();
+        let rt = state.runtime.load();
+        let mut q = QuantizerState::default();
+        let frame = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 0,
+            },
+            &rt,
+            &mut q,
+        );
+        // Master Dimmer untouched fallback = 255, Cell 1 White = 255
+        assert_eq!(frame.universes[0].dmx[0], 255);
+        assert_eq!(frame.universes[0].dmx[5], 255);
+
+        let deleted = state.delete_color_palette("pal_white").unwrap();
+        assert!(deleted.show.color_palettes.is_empty());
+        let undone_del = state.undo().unwrap();
+        assert_eq!(undone_del.show.color_palettes.len(), 1);
     }
 }
