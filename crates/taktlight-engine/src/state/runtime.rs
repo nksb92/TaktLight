@@ -30,6 +30,16 @@ pub struct RuntimeControl {
     pub tap_history_sec: Vec<f64>,
     #[serde(default)]
     pub next_scene_trigger_order: u64,
+    #[serde(default)]
+    pub active_timeline_id: Option<String>,
+    #[serde(default)]
+    pub timeline_playing: bool,
+    #[serde(default)]
+    pub timeline_playhead_sec: f64,
+    #[serde(default)]
+    pub timeline_start_anchor_t_sec: f64,
+    #[serde(default)]
+    pub latency_offset_ms: f64,
 }
 
 impl Default for RuntimeControl {
@@ -43,6 +53,11 @@ impl Default for RuntimeControl {
             active_scenes: Vec::new(),
             tap_history_sec: Vec::new(),
             next_scene_trigger_order: 1,
+            active_timeline_id: None,
+            timeline_playing: false,
+            timeline_playhead_sec: 0.0,
+            timeline_start_anchor_t_sec: 0.0,
+            latency_offset_ms: 0.0,
         }
     }
 }
@@ -188,6 +203,52 @@ impl RuntimeControl {
             }
         }
         self.beat_clock.bpm
+    }
+
+    pub fn set_timeline_transport(
+        &mut self,
+        timeline_id: Option<String>,
+        playing: bool,
+        playhead_sec: Option<f64>,
+        clock_t_now_sec: f64,
+    ) {
+        self.active_timeline_id = timeline_id.filter(|s| !s.trim().is_empty());
+        if self.active_timeline_id.is_none() {
+            self.timeline_playing = false;
+            self.timeline_playhead_sec = 0.0;
+            self.timeline_start_anchor_t_sec = clock_t_now_sec;
+            return;
+        }
+        if let Some(pos) = playhead_sec {
+            if !pos.is_nan() {
+                self.timeline_playhead_sec = pos.max(0.0);
+            }
+        }
+        self.timeline_playing = playing;
+        self.timeline_start_anchor_t_sec = clock_t_now_sec;
+    }
+
+    pub fn seek_timeline(&mut self, playhead_sec: f64, clock_t_now_sec: f64) {
+        if !playhead_sec.is_nan() {
+            self.timeline_playhead_sec = playhead_sec.max(0.0);
+            self.timeline_start_anchor_t_sec = clock_t_now_sec;
+        }
+    }
+
+    pub fn set_latency_offset_ms(&mut self, offset_ms: f64) {
+        if !offset_ms.is_nan() {
+            self.latency_offset_ms = offset_ms.clamp(-500.0, 500.0);
+        }
+    }
+
+    pub fn effective_timeline_playhead_sec(&self, clock_t_sec: f64) -> Option<f64> {
+        self.active_timeline_id.as_ref()?;
+        let base = if self.timeline_playing {
+            self.timeline_playhead_sec + (clock_t_sec - self.timeline_start_anchor_t_sec).max(0.0)
+        } else {
+            self.timeline_playhead_sec
+        };
+        Some((base + self.latency_offset_ms / 1000.0).max(0.0))
     }
 }
 

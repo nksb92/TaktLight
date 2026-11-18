@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod engine;
 pub mod frame;
 pub mod fx;

@@ -7,7 +7,7 @@ use crate::mixer::traits::SmartControlLayer;
 use crate::ofl::expander::{ChannelRole, ChannelTarget};
 use crate::show::patch::FixtureCalibration;
 use crate::show::spatial::OrderRule;
-use crate::show::xml::{FxBlockDef, SceneDef};
+use crate::show::xml::{FxBlockDef, SceneDef, TimelineDef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -114,6 +114,7 @@ pub struct RenderPlan {
     pub show_bpm: f32,
     pub fx_blocks: Vec<FxBlockDef>,
     pub scenes: Vec<SceneDef>,
+    pub timelines: Vec<TimelineDef>,
 }
 
 impl Default for RenderPlan {
@@ -157,6 +158,7 @@ impl RenderPlan {
             show_bpm: 120.0,
             fx_blocks: Vec::new(),
             scenes: Vec::new(),
+            timelines: Vec::new(),
         }
     }
 }

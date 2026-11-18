@@ -9,7 +9,7 @@ use crate::mixer::traits::{
     fold_layers_into_states, resolve_target_cells_and_fixtures, CellTraitDelta, CellTraitState,
     FixtureTraitDelta, FixtureTraitState, MergeOp,
 };
-use crate::show::xml::{FxBlockDef, FxElementDef, SceneDef};
+use crate::show::xml::{ClipDef, FxBlockDef, FxElementDef, SceneDef, TempoPointDef};
 use crate::state::plan::RenderPlan;
 use crate::state::runtime::RuntimeControl;
 
@@ -415,6 +415,72 @@ fn fold_fx_block_into_states(
     }
 }
 
+pub fn integrate_tempo_map_beats(
+    tempo_map: &[TempoPointDef],
+    default_bpm: f32,
+    t_start_sec: f64,
+    t_end_sec: f64,
+) -> f64 {
+    if t_end_sec <= t_start_sec {
+        return 0.0;
+    }
+    let fallback_bpm = (default_bpm.clamp(20.0, 300.0)) as f64;
+    if tempo_map.is_empty() {
+        return (t_end_sec - t_start_sec) * fallback_bpm / 60.0;
+    }
+
+    let mut points: Vec<&TempoPointDef> = tempo_map.iter().collect();
+    points.sort_by(|a, b| a.at_sec.total_cmp(&b.at_sec));
+
+    let bpm_at = |t: f64| -> f64 {
+        let mut active = fallback_bpm;
+        for pt in &points {
+            if pt.at_sec <= t {
+                active = (pt.bpm.clamp(20.0, 300.0)) as f64;
+            } else {
+                break;
+            }
+        }
+        active
+    };
+
+    let mut cur = t_start_sec;
+    let mut beats = 0.0f64;
+    for pt in &points {
+        if pt.at_sec > cur && pt.at_sec < t_end_sec {
+            beats += (pt.at_sec - cur) * bpm_at(cur) / 60.0;
+            cur = pt.at_sec;
+        }
+    }
+    if t_end_sec > cur {
+        beats += (t_end_sec - cur) * bpm_at(cur) / 60.0;
+    }
+    beats
+}
+
+pub fn clip_alpha_at(clip: &ClipDef, t_timeline_sec: f64) -> f32 {
+    if clip.duration_sec <= 0.0 {
+        return 0.0;
+    }
+    let clip_end = clip.start_sec + clip.duration_sec;
+    if t_timeline_sec < clip.start_sec || t_timeline_sec >= clip_end {
+        return 0.0;
+    }
+    let dt_in = (t_timeline_sec - clip.start_sec).max(0.0) as f32;
+    let dt_rem = (clip_end - t_timeline_sec).max(0.0) as f32;
+    let in_alpha = if clip.fade_in_sec <= 1e-6 {
+        1.0
+    } else {
+        (dt_in / clip.fade_in_sec).clamp(0.0, 1.0)
+    };
+    let out_alpha = if clip.fade_out_sec <= 1e-6 {
+        1.0
+    } else {
+        (dt_rem / clip.fade_out_sec).clamp(0.0, 1.0)
+    };
+    in_alpha.min(out_alpha)
+}
+
 pub fn evaluate_scenes_and_live_layers(
     plan: &RenderPlan,
     clock: &ClockInput,
@@ -449,7 +515,96 @@ pub fn evaluate_scenes_and_live_layers(
     let scene_map: HashMap<&str, &SceneDef> =
         plan.scenes.iter().map(|s| (s.id.as_str(), s)).collect();
 
-    // Sort active scenes bottom-to-top by (SceneDef.priority, ActiveSceneInstance.trigger_order)
+    // 1. Timeline layer (bottom of stack): tracks evaluated in document order (later track on top)
+    if let (Some(tl_id), Some(t_tl)) = (
+        runtime.active_timeline_id.as_deref(),
+        runtime.effective_timeline_playhead_sec(clock.t_sec),
+    ) {
+        if let Some(timeline) = plan.timelines.iter().find(|t| t.id == tl_id) {
+            for track in &timeline.tracks {
+                let track_target = track
+                    .target_group
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                for clip in &track.clips {
+                    let clip_alpha = clip_alpha_at(clip, t_tl);
+                    if clip_alpha <= 0.0 {
+                        continue;
+                    }
+                    let t_local = (t_tl - clip.start_sec).max(0.0);
+                    let b_local = integrate_tempo_map_beats(
+                        &timeline.tempo_map,
+                        plan.show_bpm,
+                        clip.start_sec,
+                        t_tl,
+                    );
+
+                    if let Some(ref block_ref) = clip.ref_block {
+                        let Some(block) = block_map.get(block_ref.as_str()).copied() else {
+                            continue;
+                        };
+                        let Some(target_group) = track_target.or_else(|| {
+                            block
+                                .target_group
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                        }) else {
+                            continue;
+                        };
+                        fold_fx_block_into_states(
+                            plan,
+                            block,
+                            target_group,
+                            clip_alpha,
+                            t_local,
+                            b_local,
+                            &fixture_index_by_id,
+                            &cell_to_fixture,
+                            &color_map,
+                            &dimmer_map,
+                            &mut fixture_states,
+                            &mut cell_states,
+                        );
+                    } else if !clip.inline_fx.is_empty() {
+                        let target_group = track_target.unwrap_or("all");
+                        let clip_beats = integrate_tempo_map_beats(
+                            &timeline.tempo_map,
+                            plan.show_bpm,
+                            clip.start_sec,
+                            clip.start_sec + clip.duration_sec,
+                        )
+                        .max(0.25) as f32;
+                        let inline_block = FxBlockDef {
+                            id: String::new(),
+                            name: String::new(),
+                            target_group: Some(target_group.to_string()),
+                            duration_beats: clip_beats,
+                            loop_block: true,
+                            elements: clip.inline_fx.clone(),
+                        };
+                        fold_fx_block_into_states(
+                            plan,
+                            &inline_block,
+                            target_group,
+                            clip_alpha,
+                            t_local,
+                            b_local,
+                            &fixture_index_by_id,
+                            &cell_to_fixture,
+                            &color_map,
+                            &dimmer_map,
+                            &mut fixture_states,
+                            &mut cell_states,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Live Scene layers on top of Timeline: sorted bottom-to-top by (SceneDef.priority, trigger_order)
     let mut active_with_def: Vec<(&ActiveSceneInstance, &SceneDef, f32)> = runtime
         .active_scenes
         .iter()
@@ -607,5 +762,39 @@ mod tests {
         assert!((rt.active_scenes[0].alpha_at(10.5) - 0.5).abs() < 1e-5);
         assert!((rt.active_scenes[0].alpha_at(11.5) - 0.25).abs() < 1e-5);
         assert!((rt.active_scenes[0].alpha_at(12.5) - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn tempo_map_integrates_piecewise_bpm_changes_and_clip_fades_are_exact() {
+        let tempo_map = vec![
+            TempoPointDef {
+                at_sec: 0.0,
+                bpm: 120.0,
+            },
+            TempoPointDef {
+                at_sec: 2.0,
+                bpm: 150.0,
+            },
+        ];
+
+        // 0..2s at 120 BPM = 4.0 beats; 2..4s at 150 BPM = 5.0 beats -> total 9.0 beats
+        let beats = integrate_tempo_map_beats(&tempo_map, 120.0, 0.0, 4.0);
+        assert!((beats - 9.0).abs() < 1e-9);
+
+        // Clip window [1.0, 5.0) with 1.0s fade-in and 1.0s fade-out
+        let clip = ClipDef {
+            ref_block: Some("blk_1".to_string()),
+            start_sec: 1.0,
+            duration_sec: 4.0,
+            fade_in_sec: 1.0,
+            fade_out_sec: 1.0,
+            inline_fx: Vec::new(),
+        };
+        assert_eq!(clip_alpha_at(&clip, 0.9), 0.0);
+        assert_eq!(clip_alpha_at(&clip, 1.0), 0.0);
+        assert!((clip_alpha_at(&clip, 1.5) - 0.5).abs() < 1e-5);
+        assert_eq!(clip_alpha_at(&clip, 2.5), 1.0);
+        assert!((clip_alpha_at(&clip, 4.5) - 0.5).abs() < 1e-5);
+        assert_eq!(clip_alpha_at(&clip, 5.0), 0.0);
     }
 }
