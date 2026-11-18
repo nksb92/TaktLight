@@ -1,7 +1,9 @@
 import { useEffect } from "react";
 import { DmxMonitor } from "./components/DmxMonitor";
 import { FixtureBuilder } from "./components/FixtureBuilder";
+import { FixtureGrid2D } from "./components/FixtureGrid2D";
 import { JitterHistogram } from "./components/JitterHistogram";
+import { PatchView } from "./components/PatchView";
 import { TopStatusBar } from "./components/TopStatusBar";
 import { useTaktStore } from "./store/useTaktStore";
 
@@ -21,14 +23,15 @@ export function App() {
     <div className="min-h-screen bg-void text-mist font-sans flex flex-col">
       <TopStatusBar />
       <main className="flex-1 p-4 flex flex-col gap-4 max-w-[1920px] w-full mx-auto">
-        {activeTab === "monitor" ? (
+        {activeTab === "monitor" && (
           <>
             {histogramOpen && <JitterHistogram />}
             <DmxMonitor />
           </>
-        ) : (
-          <FixtureBuilder />
         )}
+        {activeTab === "patch" && <PatchView />}
+        {activeTab === "grid" && <FixtureGrid2D />}
+        {activeTab === "fixtures" && <FixtureBuilder />}
       </main>
     </div>
   );

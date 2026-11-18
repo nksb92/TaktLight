@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -22,7 +22,14 @@ use taktlight_engine::protocol::artnet::TrackedArtNetNode;
 use taktlight_engine::protocol::nic::{
     enumerate_ipv4_interfaces, AdapterSelection, NetworkInterfaceInfo,
 };
-use taktlight_engine::state::plan::{RenderPlan, UniverseConfig};
+use taktlight_engine::show::compiler::compile_render_plan;
+use taktlight_engine::show::patch::{
+    auto_patch_batch, find_placement, validate_patch_no_collisions, FixtureCalibration,
+};
+use taktlight_engine::show::spatial::GridPos;
+use taktlight_engine::show::undo::{ShowCommand, UndoHistory};
+use taktlight_engine::show::xml::{deserialize_show_xml, serialize_show_xml, ShowState};
+use taktlight_engine::state::plan::{CompiledCell, RenderPlan, UniverseConfig};
 use taktlight_engine::state::runtime::RuntimeControl;
 use taktlight_engine::telemetry::jitter::JitterStats;
 
@@ -57,6 +64,18 @@ pub struct FixtureValidationResult {
     pub pixel_count: u16,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ShowSnapshotDto {
+    pub revision: u64,
+    pub show: ShowState,
+    pub compiled_cells: Vec<CompiledCell>,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub rollover_enabled: bool,
+    pub toast: Option<String>,
+    pub cross_protocol_warning: bool,
+}
+
 pub struct AppState {
     pub plan: Arc<ArcSwap<RenderPlan>>,
     pub runtime: Arc<ArcSwap<RuntimeControl>>,
@@ -68,6 +87,10 @@ pub struct AppState {
     pub stream_generation: Arc<AtomicU64>,
     pub engine_handle: Mutex<Option<EngineRunnerHandle>>,
     pub fixture_library: RwLock<FixtureLibrary>,
+    pub show_state: RwLock<ShowState>,
+    pub undo_history: Mutex<UndoHistory>,
+    pub rollover_enabled: AtomicBool,
+    next_fixture_seq: AtomicU64,
 }
 
 fn resolve_default_fixtures_dir() -> Option<PathBuf> {
@@ -94,7 +117,16 @@ impl AppState {
         start_engine_thread: bool,
         fixtures_dir: Option<PathBuf>,
     ) -> Self {
-        let plan = Arc::new(ArcSwap::from_pointee(RenderPlan::default_studio_plan()));
+        let fixture_library = RwLock::new(FixtureLibrary::load(fixtures_dir.as_deref()));
+        let show_state = RwLock::new(ShowState::default());
+        let undo_history = Mutex::new(UndoHistory::default());
+        let initial_plan = {
+            let show = show_state.read();
+            let lib = fixture_library.read();
+            compile_render_plan(1, &show, &lib).unwrap_or_else(|_| RenderPlan::default_studio_plan())
+        };
+
+        let plan = Arc::new(ArcSwap::from_pointee(initial_plan));
         let runtime = Arc::new(ArcSwap::from_pointee(RuntimeControl::new()));
         let credit_gate = FrameCreditGate::new(true);
         let (frame_tx, frame_rx) = watch::channel(Vec::new());
@@ -103,7 +135,6 @@ impl AppState {
             ..Default::default()
         }));
         let adapter_selection = Arc::new(RwLock::new(AdapterSelection::Auto));
-        let fixture_library = RwLock::new(FixtureLibrary::load(fixtures_dir.as_deref()));
 
         let engine_handle = if start_engine_thread {
             Some(spawn_engine_loop(
@@ -129,6 +160,10 @@ impl AppState {
             stream_generation: Arc::new(AtomicU64::new(0)),
             engine_handle: Mutex::new(engine_handle),
             fixture_library,
+            show_state,
+            undo_history,
+            rollover_enabled: AtomicBool::new(true),
+            next_fixture_seq: AtomicU64::new(1),
         }
     }
 
@@ -213,6 +248,239 @@ impl AppState {
                 message: other.to_string(),
             }],
         })
+    }
+
+    fn build_show_snapshot(
+        &self,
+        toast: Option<String>,
+        cross_protocol_warning: bool,
+    ) -> ShowSnapshotDto {
+        let show = self.show_state.read().clone();
+        let history = self.undo_history.lock();
+        let plan = self.plan.load();
+        ShowSnapshotDto {
+            revision: history.revision(),
+            show,
+            compiled_cells: plan.cells.clone(),
+            can_undo: history.can_undo(),
+            can_redo: history.can_redo(),
+            rollover_enabled: self.rollover_enabled.load(Ordering::Acquire),
+            toast,
+            cross_protocol_warning,
+        }
+    }
+
+    pub fn execute_show_command(
+        &self,
+        cmd: ShowCommand,
+        toast: Option<String>,
+        cross_protocol_warning: bool,
+    ) -> Result<ShowSnapshotDto, String> {
+        let mut show = self.show_state.write();
+        let mut history = self.undo_history.lock();
+        let revision = history
+            .execute(&mut show, cmd)
+            .map_err(|e| e.to_string())?;
+        let lib = self.fixture_library.read();
+        let compiled = compile_render_plan(revision, &show, &lib).map_err(|e| e.to_string())?;
+        self.plan.store(Arc::new(compiled));
+        drop(lib);
+        drop(history);
+        drop(show);
+        Ok(self.build_show_snapshot(toast, cross_protocol_warning))
+    }
+
+    pub fn patch_fixtures(
+        &self,
+        profile_id: &str,
+        mode_name: &str,
+        name_prefix: &str,
+        count: u16,
+        universe: u16,
+        address: u16,
+        rollover_split: bool,
+    ) -> Result<ShowSnapshotDto, String> {
+        let count = count.clamp(1, 64);
+        let channel_count = {
+            let lib = self.fixture_library.read();
+            let detail = lib
+                .get_entry(profile_id)
+                .ok_or_else(|| format!("profile '{profile_id}' not found"))?;
+            let mode = detail
+                .expanded_modes
+                .iter()
+                .find(|m| m.name == mode_name)
+                .ok_or_else(|| format!("mode '{mode_name}' not found"))?;
+            mode.channel_count as u16
+        };
+
+        let existing_show = self.show_state.read().clone();
+        let mut batch = Vec::with_capacity(count as usize);
+        let existing_count = existing_show.patch.len();
+        for idx in 0..count {
+            let seq = self.next_fixture_seq.fetch_add(1, Ordering::AcqRel);
+            let id = format!("fx_{seq:03}");
+            let name = if count == 1 {
+                name_prefix.trim().to_string()
+            } else {
+                format!("{} {}", name_prefix.trim(), idx + 1)
+            };
+            let grid_y = (0.15 + ((existing_count + (idx as usize)) % 6) as f32 * 0.14).min(0.88);
+            let grid_x = (0.25 + (((existing_count + (idx as usize)) / 6) % 3) as f32 * 0.25).min(0.85);
+            batch.push((
+                id,
+                profile_id.to_string(),
+                mode_name.to_string(),
+                name,
+                channel_count,
+                GridPos {
+                    x: grid_x,
+                    y: grid_y,
+                    rotation: 0.0,
+                    scale_x: 0.30,
+                    scale_y: 0.05,
+                },
+                FixtureCalibration::default(),
+            ));
+        }
+
+        let (added, auto_created, outcomes) = auto_patch_batch(
+            &existing_show.patch,
+            &existing_show.network_outputs.universes,
+            batch,
+            universe,
+            address,
+            rollover_split,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let cross_warning = outcomes.iter().any(|o| o.cross_protocol_warning);
+        let toast = if outcomes.len() == 1 {
+            Some(outcomes[0].toast_message.clone())
+        } else if let Some(first) = outcomes.first() {
+            Some(format!(
+                "Patched {} fixtures starting at U{}.{:03}",
+                outcomes.len(),
+                first.universe,
+                first.address
+            ))
+        } else {
+            None
+        };
+
+        self.execute_show_command(
+            ShowCommand::PatchFixtures {
+                added,
+                auto_created_universes: auto_created,
+            },
+            toast,
+            cross_warning,
+        )
+    }
+
+    pub fn move_fixture_patch(
+        &self,
+        fixture_id: &str,
+        universe: u16,
+        address: u16,
+        rollover_split: bool,
+    ) -> Result<ShowSnapshotDto, String> {
+        let show = self.show_state.read().clone();
+        let fx = show
+            .patch
+            .iter()
+            .find(|f| f.id == fixture_id)
+            .ok_or_else(|| format!("fixture '{fixture_id}' not found"))?;
+
+        let outcome = find_placement(
+            &show.patch,
+            &show.network_outputs.universes,
+            &fx.name,
+            universe,
+            address,
+            fx.channel_count,
+            rollover_split,
+            Some(fixture_id),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let before_universe = fx.universe;
+        let before_address = fx.address;
+        let toast = if outcome.moved_from_requested || outcome.was_split {
+            Some(outcome.toast_message)
+        } else {
+            Some(format!(
+                "{} moved to U{}.{:03}",
+                fx.name, outcome.universe, outcome.address
+            ))
+        };
+
+        self.execute_show_command(
+            ShowCommand::MoveFixturePatch {
+                fixture_id: fixture_id.to_string(),
+                before_universe,
+                before_address,
+                after_universe: outcome.universe,
+                after_address: outcome.address,
+                auto_created_universes: outcome.auto_create_universes,
+            },
+            toast,
+            outcome.cross_protocol_warning,
+        )
+    }
+
+    pub fn undo(&self) -> Result<ShowSnapshotDto, String> {
+        let mut show = self.show_state.write();
+        let mut history = self.undo_history.lock();
+        if let Some(revision) = history.undo(&mut show).map_err(|e| e.to_string())? {
+            let lib = self.fixture_library.read();
+            let compiled = compile_render_plan(revision, &show, &lib).map_err(|e| e.to_string())?;
+            self.plan.store(Arc::new(compiled));
+        }
+        drop(history);
+        drop(show);
+        Ok(self.build_show_snapshot(Some("Undid last change".to_string()), false))
+    }
+
+    pub fn redo(&self) -> Result<ShowSnapshotDto, String> {
+        let mut show = self.show_state.write();
+        let mut history = self.undo_history.lock();
+        if let Some(revision) = history.redo(&mut show).map_err(|e| e.to_string())? {
+            let lib = self.fixture_library.read();
+            let compiled = compile_render_plan(revision, &show, &lib).map_err(|e| e.to_string())?;
+            self.plan.store(Arc::new(compiled));
+        }
+        drop(history);
+        drop(show);
+        Ok(self.build_show_snapshot(Some("Redid change".to_string()), false))
+    }
+
+    pub fn import_show_xml(&self, xml_str: &str) -> Result<ShowSnapshotDto, String> {
+        let mut parsed = deserialize_show_xml(xml_str).map_err(|e| e.to_string())?;
+        {
+            let lib = self.fixture_library.read();
+            for fx in &mut parsed.patch {
+                let detail = lib.get_entry(&fx.profile).ok_or_else(|| {
+                    format!("fixture profile '{}' not found in OFL library", fx.profile)
+                })?;
+                let mode = detail
+                    .expanded_modes
+                    .iter()
+                    .find(|m| m.name == fx.mode)
+                    .ok_or_else(|| {
+                        format!("mode '{}' not found in profile '{}'", fx.mode, fx.profile)
+                    })?;
+                fx.channel_count = mode.channel_count as u16;
+            }
+        }
+        validate_patch_no_collisions(&parsed.patch).map_err(|e| e.to_string())?;
+        let before = Box::new(self.show_state.read().clone());
+        let after = Box::new(parsed);
+        self.execute_show_command(
+            ShowCommand::ReplaceShowState { before, after },
+            Some("Imported .takt.xml show".to_string()),
+            false,
+        )
     }
 }
 
@@ -330,6 +598,175 @@ fn delete_user_fixture(state: State<'_, AppState>, id: String) -> Result<(), Str
     state.fixture_library.write().delete_user_fixture(&id)
 }
 
+#[tauri::command]
+fn get_show_snapshot(state: State<'_, AppState>) -> ShowSnapshotDto {
+    state.build_show_snapshot(None, false)
+}
+
+#[tauri::command]
+fn patch_fixtures_command(
+    state: State<'_, AppState>,
+    profile_id: String,
+    mode_name: String,
+    name_prefix: String,
+    count: u16,
+    universe: u16,
+    address: u16,
+    rollover_split: bool,
+) -> Result<ShowSnapshotDto, String> {
+    state.patch_fixtures(
+        &profile_id,
+        &mode_name,
+        &name_prefix,
+        count,
+        universe,
+        address,
+        rollover_split,
+    )
+}
+
+#[tauri::command]
+fn move_fixture_patch_command(
+    state: State<'_, AppState>,
+    fixture_id: String,
+    universe: u16,
+    address: u16,
+    rollover_split: bool,
+) -> Result<ShowSnapshotDto, String> {
+    state.move_fixture_patch(&fixture_id, universe, address, rollover_split)
+}
+
+#[tauri::command]
+fn unpatch_fixture_command(
+    state: State<'_, AppState>,
+    fixture_id: String,
+) -> Result<ShowSnapshotDto, String> {
+    let removed = {
+        let show = state.show_state.read();
+        show.patch
+            .iter()
+            .find(|f| f.id == fixture_id)
+            .cloned()
+            .ok_or_else(|| format!("fixture '{fixture_id}' not found"))?
+    };
+    let name = removed.name.clone();
+    state.execute_show_command(
+        ShowCommand::UnpatchFixture { removed },
+        Some(format!("Removed {name} from patch")),
+        false,
+    )
+}
+
+#[tauri::command]
+fn update_fixture_grid_pos_command(
+    state: State<'_, AppState>,
+    fixture_id: String,
+    grid_pos: GridPos,
+    coalesce_key: Option<String>,
+) -> Result<ShowSnapshotDto, String> {
+    let before = {
+        let show = state.show_state.read();
+        show.patch
+            .iter()
+            .find(|f| f.id == fixture_id)
+            .map(|f| f.grid_pos)
+            .ok_or_else(|| format!("fixture '{fixture_id}' not found"))?
+    };
+    state.execute_show_command(
+        ShowCommand::UpdateFixtureGridPos {
+            fixture_id,
+            before,
+            after: grid_pos,
+            coalesce_key,
+        },
+        None,
+        false,
+    )
+}
+
+#[tauri::command]
+fn update_fixture_calibration_command(
+    state: State<'_, AppState>,
+    fixture_id: String,
+    calibration: FixtureCalibration,
+    coalesce_key: Option<String>,
+) -> Result<ShowSnapshotDto, String> {
+    let before = {
+        let show = state.show_state.read();
+        show.patch
+            .iter()
+            .find(|f| f.id == fixture_id)
+            .map(|f| f.calibration)
+            .ok_or_else(|| format!("fixture '{fixture_id}' not found"))?
+    };
+    state.execute_show_command(
+        ShowCommand::UpdateFixtureCalibration {
+            fixture_id,
+            before,
+            after: calibration,
+            coalesce_key,
+        },
+        None,
+        false,
+    )
+}
+
+#[tauri::command]
+fn set_rollover_enabled_command(state: State<'_, AppState>, enabled: bool) -> ShowSnapshotDto {
+    state.rollover_enabled.store(enabled, Ordering::Release);
+    state.build_show_snapshot(None, false)
+}
+
+#[tauri::command]
+fn mark_universe_reviewed_command(
+    state: State<'_, AppState>,
+    universe_id: u16,
+) -> Result<ShowSnapshotDto, String> {
+    let before = {
+        let show = state.show_state.read();
+        show.network_outputs
+            .universes
+            .iter()
+            .find(|u| u.id == universe_id)
+            .cloned()
+            .ok_or_else(|| format!("universe {universe_id} not found"))?
+    };
+    let mut after = before.clone();
+    after.review_output = false;
+    state.execute_show_command(
+        ShowCommand::ConfigureUniverse {
+            before: Some(before),
+            after,
+        },
+        None,
+        false,
+    )
+}
+
+#[tauri::command]
+fn undo_command(state: State<'_, AppState>) -> Result<ShowSnapshotDto, String> {
+    state.undo()
+}
+
+#[tauri::command]
+fn redo_command(state: State<'_, AppState>) -> Result<ShowSnapshotDto, String> {
+    state.redo()
+}
+
+#[tauri::command]
+fn export_show_xml_command(state: State<'_, AppState>) -> Result<String, String> {
+    let show = state.show_state.read();
+    serialize_show_xml(&show).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn import_show_xml_command(
+    state: State<'_, AppState>,
+    xml_str: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.import_show_xml(&xml_str)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
@@ -350,6 +787,18 @@ pub fn run() {
             validate_fixture_json,
             save_user_fixture,
             delete_user_fixture,
+            get_show_snapshot,
+            patch_fixtures_command,
+            move_fixture_patch_command,
+            unpatch_fixture_command,
+            update_fixture_grid_pos_command,
+            update_fixture_calibration_command,
+            set_rollover_enabled_command,
+            mark_universe_reviewed_command,
+            undo_command,
+            redo_command,
+            export_show_xml_command,
+            import_show_xml_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building TaktLight application");
@@ -370,13 +819,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_state_updates_runtime_controls_and_snapshot() {
+    fn app_state_updates_runtime_controls_without_pushing_undo_or_recompiling_plan() {
         let state = AppState::new(false);
+        let initial_plan_ptr = Arc::as_ptr(&state.plan.load());
+        let initial_rev = state.undo_history.lock().revision();
+
         state
             .update_runtime(|rt| rt.set_park(1, 12, Some(220)))
             .unwrap();
         state.update_runtime(|rt| rt.set_blackout(true));
         state.update_runtime(|rt| rt.set_grand_master(0.75));
+
+        assert_eq!(Arc::as_ptr(&state.plan.load()), initial_plan_ptr);
+        assert_eq!(state.undo_history.lock().revision(), initial_rev);
+        assert!(!state.undo_history.lock().can_undo());
 
         let snap = state.snapshot();
         assert!(snap.blackout);
@@ -436,5 +892,38 @@ mod tests {
         assert_eq!(state.fixture_library.read().list_summaries().len(), 2);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn app_state_patches_moves_undoes_and_recompiles_render_plan() {
+        let state = AppState::new(false);
+        let snap = state
+            .patch_fixtures(
+                "age/rlcv3_8_segment_tube.json",
+                "34ch Pixel Mode",
+                "Tube Left",
+                1,
+                1,
+                505,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(snap.show.patch.len(), 1);
+        assert_eq!(snap.compiled_cells.len(), 8);
+        assert!(snap.cross_protocol_warning);
+        assert_eq!(
+            snap.toast.as_deref(),
+            Some("Tube Left split: U1.505 to U1.512 + U2.001 to U2.026")
+        );
+        assert_eq!(state.plan.load().cell_count, 8);
+
+        let undone = state.undo().unwrap();
+        assert!(undone.show.patch.is_empty());
+        assert_eq!(state.plan.load().cell_count, 0);
+
+        let redone = state.redo().unwrap();
+        assert_eq!(redone.show.patch.len(), 1);
+        assert_eq!(state.plan.load().cell_count, 8);
     }
 }

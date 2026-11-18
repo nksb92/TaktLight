@@ -1,7 +1,9 @@
 import {
   Activity,
+  Cable,
   Cpu,
   Layers,
+  LayoutGrid,
   Lock,
   Monitor,
   Network,
@@ -88,6 +90,34 @@ export function TopStatusBar() {
           >
             <Monitor className="w-3.5 h-3.5" />
             <span>DMX Monitor</span>
+          </button>
+
+          <button
+            type="button"
+            aria-pressed={activeTab === "patch"}
+            onClick={() => setActiveTab("patch")}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded font-sans text-xs font-medium transition-colors ${
+              activeTab === "patch"
+                ? "bg-ember text-frost"
+                : "text-fog hover:text-mist"
+            }`}
+          >
+            <Cable className="w-3.5 h-3.5" />
+            <span>Patch View</span>
+          </button>
+
+          <button
+            type="button"
+            aria-pressed={activeTab === "grid"}
+            onClick={() => setActiveTab("grid")}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded font-sans text-xs font-medium transition-colors ${
+              activeTab === "grid"
+                ? "bg-ember text-frost"
+                : "text-fog hover:text-mist"
+            }`}
+          >
+            <LayoutGrid className="w-3.5 h-3.5" />
+            <span>2D Grid</span>
           </button>
 
           <button
