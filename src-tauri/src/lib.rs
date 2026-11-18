@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
@@ -13,6 +14,7 @@ use taktlight_engine::engine::runner::{
     spawn_engine_loop, EngineConfig, EngineRunnerHandle, EngineTelemetrySnapshot,
 };
 use taktlight_engine::frame::flow::FrameCreditGate;
+use taktlight_engine::fx::scene::ActiveSceneInstance;
 use taktlight_engine::mixer::traits::SmartControlLayer;
 use taktlight_engine::ofl::expander::ExpandedFixtureMode;
 use taktlight_engine::ofl::library::{
@@ -31,7 +33,7 @@ use taktlight_engine::show::spatial::GridPos;
 use taktlight_engine::show::undo::{ShowCommand, UndoHistory};
 use taktlight_engine::show::xml::{
     deserialize_show_xml, serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef,
-    ShowState,
+    FxBlockDef, SceneDef, ShowState,
 };
 use taktlight_engine::state::plan::{CompiledCell, RenderPlan, UniverseConfig};
 use taktlight_engine::state::runtime::RuntimeControl;
@@ -50,6 +52,8 @@ pub struct EngineSnapshotDto {
     pub blackout: bool,
     pub parked_channels: Vec<ParkedChannelDto>,
     pub live_layers: Vec<SmartControlLayer>,
+    pub active_scenes: Vec<ActiveSceneInstance>,
+    pub live_bpm: f32,
     pub universes: Vec<UniverseConfig>,
     pub interfaces: Vec<NetworkInterfaceInfo>,
     pub adapter_selection: AdapterSelection,
@@ -95,6 +99,7 @@ pub struct AppState {
     pub show_state: RwLock<ShowState>,
     pub undo_history: Mutex<UndoHistory>,
     pub rollover_enabled: AtomicBool,
+    pub app_epoch: Instant,
     next_fixture_seq: AtomicU64,
 }
 
@@ -168,6 +173,7 @@ impl AppState {
             show_state,
             undo_history,
             rollover_enabled: AtomicBool::new(true),
+            app_epoch: Instant::now(),
             next_fixture_seq: AtomicU64::new(1),
         }
     }
@@ -204,6 +210,8 @@ impl AppState {
             blackout: rt.blackout,
             parked_channels,
             live_layers: rt.live_layers.clone(),
+            active_scenes: rt.active_scenes.clone(),
+            live_bpm: rt.beat_clock.bpm,
             universes: plan.universes.clone(),
             interfaces: enumerate_ipv4_interfaces(),
             adapter_selection: selection,
@@ -599,6 +607,122 @@ impl AppState {
             false,
         )
     }
+
+    pub fn upsert_fx_block(&self, block: FxBlockDef) -> Result<ShowSnapshotDto, String> {
+        let before = self
+            .show_state
+            .read()
+            .fx_library
+            .iter()
+            .find(|b| b.id == block.id)
+            .cloned();
+        let label = block.name.clone();
+        self.execute_show_command(
+            ShowCommand::UpsertFxBlock {
+                before,
+                after: block,
+            },
+            Some(format!("Saved FX block {label}")),
+            false,
+        )
+    }
+
+    pub fn delete_fx_block(&self, id: &str) -> Result<ShowSnapshotDto, String> {
+        let removed = self
+            .show_state
+            .read()
+            .fx_library
+            .iter()
+            .find(|b| b.id == id)
+            .cloned()
+            .ok_or_else(|| format!("fx block '{id}' not found"))?;
+        let label = removed.name.clone();
+        self.execute_show_command(
+            ShowCommand::DeleteFxBlock { removed },
+            Some(format!("Deleted FX block {label}")),
+            false,
+        )
+    }
+
+    pub fn upsert_scene(&self, scene: SceneDef) -> Result<ShowSnapshotDto, String> {
+        let before = self
+            .show_state
+            .read()
+            .scenes
+            .iter()
+            .find(|s| s.id == scene.id)
+            .cloned();
+        let label = scene.name.clone();
+        self.execute_show_command(
+            ShowCommand::UpsertScene {
+                before,
+                after: scene,
+            },
+            Some(format!("Saved scene {label}")),
+            false,
+        )
+    }
+
+    pub fn delete_scene(&self, id: &str) -> Result<ShowSnapshotDto, String> {
+        let removed = self
+            .show_state
+            .read()
+            .scenes
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .ok_or_else(|| format!("scene '{id}' not found"))?;
+        let label = removed.name.clone();
+        self.execute_show_command(
+            ShowCommand::DeleteScene { removed },
+            Some(format!("Deleted scene {label}")),
+            false,
+        )
+    }
+
+    pub fn trigger_scene(
+        &self,
+        scene_id: &str,
+        t_sec: Option<f64>,
+    ) -> Result<EngineSnapshotDto, String> {
+        let scene = self
+            .show_state
+            .read()
+            .scenes
+            .iter()
+            .find(|s| s.id == scene_id)
+            .cloned()
+            .ok_or_else(|| format!("scene '{scene_id}' not found"))?;
+        let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
+        self.update_runtime(|rt| rt.trigger_scene(&scene, t_now));
+        Ok(self.snapshot())
+    }
+
+    pub fn release_scene(&self, scene_id: &str, t_sec: Option<f64>) -> EngineSnapshotDto {
+        let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
+        self.update_runtime(|rt| rt.release_scene(scene_id, t_now));
+        self.snapshot()
+    }
+
+    pub fn release_all_scenes(&self, t_sec: Option<f64>) -> EngineSnapshotDto {
+        let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
+        self.update_runtime(|rt| rt.release_all_scenes(t_now));
+        self.snapshot()
+    }
+
+    pub fn set_live_bpm(&self, bpm: f32, t_sec: Option<f64>) -> EngineSnapshotDto {
+        let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
+        self.update_runtime(|rt| rt.set_live_bpm(bpm, t_now));
+        self.snapshot()
+    }
+
+    pub fn tap_tempo(&self, t_sec: Option<f64>) -> EngineSnapshotDto {
+        let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
+        self.update_runtime(|rt| {
+            rt.tap_tempo(t_now);
+        });
+        self.snapshot()
+    }
 }
 
 #[tauri::command]
@@ -941,6 +1065,78 @@ fn set_live_layers_command(
     state.snapshot()
 }
 
+#[tauri::command]
+fn upsert_fx_block_command(
+    state: State<'_, AppState>,
+    block: FxBlockDef,
+) -> Result<ShowSnapshotDto, String> {
+    state.upsert_fx_block(block)
+}
+
+#[tauri::command]
+fn delete_fx_block_command(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.delete_fx_block(&id)
+}
+
+#[tauri::command]
+fn upsert_scene_command(
+    state: State<'_, AppState>,
+    scene: SceneDef,
+) -> Result<ShowSnapshotDto, String> {
+    state.upsert_scene(scene)
+}
+
+#[tauri::command]
+fn delete_scene_command(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.delete_scene(&id)
+}
+
+#[tauri::command]
+fn trigger_scene_command(
+    state: State<'_, AppState>,
+    scene_id: String,
+    t_sec: Option<f64>,
+) -> Result<EngineSnapshotDto, String> {
+    state.trigger_scene(&scene_id, t_sec)
+}
+
+#[tauri::command]
+fn release_scene_command(
+    state: State<'_, AppState>,
+    scene_id: String,
+    t_sec: Option<f64>,
+) -> EngineSnapshotDto {
+    state.release_scene(&scene_id, t_sec)
+}
+
+#[tauri::command]
+fn release_all_scenes_command(
+    state: State<'_, AppState>,
+    t_sec: Option<f64>,
+) -> EngineSnapshotDto {
+    state.release_all_scenes(t_sec)
+}
+
+#[tauri::command]
+fn set_live_bpm_command(
+    state: State<'_, AppState>,
+    bpm: f32,
+    t_sec: Option<f64>,
+) -> EngineSnapshotDto {
+    state.set_live_bpm(bpm, t_sec)
+}
+
+#[tauri::command]
+fn tap_tempo_command(state: State<'_, AppState>, t_sec: Option<f64>) -> EngineSnapshotDto {
+    state.tap_tempo(t_sec)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
@@ -980,6 +1176,15 @@ pub fn run() {
             upsert_group_command,
             delete_group_command,
             set_live_layers_command,
+            upsert_fx_block_command,
+            delete_fx_block_command,
+            upsert_scene_command,
+            delete_scene_command,
+            trigger_scene_command,
+            release_scene_command,
+            release_all_scenes_command,
+            set_live_bpm_command,
+            tap_tempo_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building TaktLight application");
@@ -1221,5 +1426,96 @@ mod tests {
         assert!(deleted.show.color_palettes.is_empty());
         let undone_del = state.undo().unwrap();
         assert_eq!(undone_del.show.color_palettes.len(), 1);
+    }
+
+    #[test]
+    fn app_state_triggers_scenes_with_bank_exclusivity_and_tap_tempo() {
+        use taktlight_engine::show::spatial::OrderRule;
+        use taktlight_engine::show::xml::FxElementDef;
+
+        let state = AppState::new(false);
+        state
+            .patch_fixtures(
+                "age/rlcv3_8_segment_tube.json",
+                "34ch Pixel Mode",
+                "Tube FX",
+                1,
+                1,
+                1,
+                true,
+            )
+            .unwrap();
+        state
+            .upsert_group(FixtureGroupDef {
+                id: "grp_fx".into(),
+                name: "FX Group".into(),
+                order: OrderRule::CenterOut,
+                targets: vec!["fx_001:0..7".into()],
+            })
+            .unwrap();
+        state
+            .upsert_fx_block(FxBlockDef {
+                id: "blk_wave".into(),
+                name: "Wave".into(),
+                target_group: Some("grp_fx".into()),
+                duration_beats: 4.0,
+                loop_block: true,
+                elements: vec![FxElementDef::Curve1D {
+                    trait_name: "dimmer".into(),
+                    op: "htp".into(),
+                    waveform: "sine".into(),
+                    amplitude: 1.0,
+                    offset: 0.0,
+                    rate_beats: Some(2.0),
+                    speed_hz: None,
+                    phase_spread_deg: 360.0,
+                    duty: None,
+                    palette_ref: None,
+                    order: None,
+                }],
+            })
+            .unwrap();
+
+        state
+            .upsert_scene(SceneDef {
+                id: "sc_1".into(),
+                name: "Scene 1".into(),
+                bank: Some("main".into()),
+                target_group: None,
+                priority: 10,
+                fade_in_sec: 0.0,
+                fade_out_sec: 1.0,
+                block_refs: vec!["blk_wave".into()],
+            })
+            .unwrap();
+        state
+            .upsert_scene(SceneDef {
+                id: "sc_2".into(),
+                name: "Scene 2".into(),
+                bank: Some("main".into()),
+                target_group: None,
+                priority: 10,
+                fade_in_sec: 0.0,
+                fade_out_sec: 1.0,
+                block_refs: vec!["blk_wave".into()],
+            })
+            .unwrap();
+
+        let s1 = state.trigger_scene("sc_1", Some(1.0)).unwrap();
+        assert_eq!(s1.active_scenes.len(), 1);
+
+        let s2 = state.trigger_scene("sc_2", Some(2.0)).unwrap();
+        assert_eq!(s2.active_scenes.len(), 2);
+        let releasing_1 = s2.active_scenes.iter().find(|s| s.scene_id == "sc_1").unwrap();
+        assert_eq!(releasing_1.release_t_sec, Some(2.0));
+
+        state.tap_tempo(Some(5.0));
+        let tapped = state.tap_tempo(Some(5.5));
+        assert!((tapped.live_bpm - 120.0).abs() < 1e-3);
+        let set_bpm_snap = state.set_live_bpm(140.0, Some(6.0));
+        assert!((set_bpm_snap.live_bpm - 140.0).abs() < 1e-3);
+
+        let rel_all = state.release_all_scenes(Some(7.0));
+        assert!(rel_all.active_scenes.iter().all(|s| s.release_t_sec.is_some()));
     }
 }

@@ -10,6 +10,7 @@ import {
   Palette,
   Radio,
   ShieldAlert,
+  Sparkles,
 } from "lucide-react";
 import { AdapterSelection, useTaktStore } from "../store/useTaktStore";
 
@@ -133,6 +134,20 @@ export function TopStatusBar() {
           >
             <Palette className="w-3.5 h-3.5" />
             <span>Palettes &amp; Controls</span>
+          </button>
+
+          <button
+            type="button"
+            aria-pressed={activeTab === "scenes"}
+            onClick={() => setActiveTab("scenes")}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded font-sans text-xs font-medium transition-colors ${
+              activeTab === "scenes"
+                ? "bg-ember text-frost"
+                : "text-fog hover:text-mist"
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>Scenes &amp; FX</span>
           </button>
 
           <button

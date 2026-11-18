@@ -4,9 +4,105 @@ import {
   expandTargetRange,
   type OrderRuleStr,
   type ShowStateDto,
+  transformCellUv,
   type WhiteMode,
 } from "./patchLogic";
 import type { UniverseConfig } from "../store/useTaktStore";
+
+export type Waveform1D = "sine" | "triangle" | "saw" | "square" | "pulse";
+export type Shader2DKind =
+  | "linear_sweep"
+  | "radial_wave"
+  | "pinwheel"
+  | "plasma";
+
+export type FxElementDef =
+  | {
+      kind: "static_trait";
+      trait: string;
+      op: MergeOp;
+      palette_ref: string | null;
+      value_start: number | null;
+      value_end: number | null;
+      order: OrderRuleStr | null;
+    }
+  | {
+      kind: "curve_1d";
+      trait: string;
+      op: MergeOp;
+      waveform: Waveform1D;
+      amplitude: number;
+      offset: number;
+      rate_beats: number | null;
+      speed_hz: number | null;
+      phase_spread_deg: number;
+      duty: number | null;
+      palette_ref: string | null;
+      order: OrderRuleStr | null;
+    }
+  | {
+      kind: "step_chase";
+      trait: string;
+      op: MergeOp;
+      step_beats: number | null;
+      speed_hz: number | null;
+      active_ratio: number | null;
+      fade: number;
+      amplitude: number;
+      palette_ref: string | null;
+      order: OrderRuleStr | null;
+    }
+  | {
+      kind: "spatial_shader_2d";
+      trait: string;
+      op: MergeOp;
+      shader: Shader2DKind;
+      palette_ref: string | null;
+      rate_beats: number | null;
+      speed_hz: number | null;
+      spatial_freq: number;
+      direction_deg: number;
+      center_x: number;
+      center_y: number;
+    };
+
+export interface FxBlockDef {
+  id: string;
+  name: string;
+  target_group: string | null;
+  duration_beats: number;
+  loop_block: boolean;
+  elements: FxElementDef[];
+}
+
+export interface SceneDef {
+  id: string;
+  name: string;
+  bank: string | null;
+  target_group: string | null;
+  priority: number;
+  fade_in_sec: number;
+  fade_out_sec: number;
+  block_refs: string[];
+}
+
+export interface BeatClockAnchor {
+  bpm: number;
+  t_anchor_sec: number;
+  beat_anchor: number;
+}
+
+export interface ActiveSceneInstance {
+  scene_id: string;
+  bank: string | null;
+  trigger_t_sec: number;
+  trigger_beat: number;
+  trigger_order: number;
+  fade_in_sec: number;
+  fade_out_sec: number;
+  release_t_sec: number | null;
+  release_start_alpha: number;
+}
 
 export interface ColorPaletteDef {
   id: string;
@@ -245,6 +341,185 @@ export function quantizeChannelValue(
   return Math.round(vg * 255);
 }
 
+function remEuclid(val: number, modulus: number): number {
+  return ((val % modulus) + modulus) % modulus;
+}
+
+export function evalUnipolarWaveform(
+  waveform: Waveform1D,
+  phi: number,
+  duty?: number | null,
+): number {
+  const p = remEuclid(phi, 1);
+  if (waveform === "sine") {
+    return clamp01(0.5 + 0.5 * Math.sin(Math.PI * 2 * p));
+  }
+  if (waveform === "triangle") {
+    return clamp01(1 - Math.abs(2 * p - 1));
+  }
+  if (waveform === "saw") return clamp01(p);
+  if (waveform === "square") return p < 0.5 ? 1 : 0;
+  const d = Math.max(0.01, Math.min(0.99, duty ?? 0.2));
+  return p < d ? 1 : 0;
+}
+
+export function evaluateCurve1DScalar(args: {
+  waveform: Waveform1D;
+  bBlock: number;
+  tLocal: number;
+  u: number;
+  rateBeats?: number | null;
+  speedHz?: number | null;
+  phaseSpreadDeg: number;
+  duty?: number | null;
+  amplitude: number;
+  offset: number;
+  isBipolarAddDimmer: boolean;
+}): number {
+  const {
+    waveform,
+    bBlock,
+    tLocal,
+    u,
+    rateBeats,
+    speedHz,
+    phaseSpreadDeg,
+    duty,
+    amplitude,
+    offset,
+    isBipolarAddDimmer,
+  } = args;
+  const basePhase =
+    speedHz && speedHz > 0
+      ? tLocal * speedHz
+      : bBlock / Math.max(1e-4, rateBeats ?? 1);
+  const phi = remEuclid(basePhase + (u * phaseSpreadDeg) / 360, 1);
+  const wUni = evalUnipolarWaveform(waveform, phi, duty);
+  const w = isBipolarAddDimmer ? 2 * wUni - 1 : wUni;
+  return offset + amplitude * w;
+}
+
+export function evaluateStepChaseScalar(args: {
+  bBlock: number;
+  tLocal: number;
+  u: number;
+  cellCount: number;
+  stepBeats?: number | null;
+  speedHz?: number | null;
+  activeRatio?: number | null;
+  fade: number;
+  amplitude: number;
+}): number {
+  const {
+    bBlock,
+    tLocal,
+    u,
+    cellCount,
+    stepBeats,
+    speedHz,
+    activeRatio,
+    fade,
+    amplitude,
+  } = args;
+  const basePhase =
+    speedHz && speedHz > 0
+      ? tLocal * speedHz
+      : bBlock / Math.max(1e-4, stepBeats ?? 1);
+  const phiChase = remEuclid(basePhase, 1);
+  const d = remEuclid(u - phiChase + 0.5, 1) - 0.5;
+  const absD = Math.abs(d);
+  const ratio = Math.max(
+    1e-4,
+    Math.min(1, activeRatio ?? 1 / Math.max(1, cellCount)),
+  );
+  const halfW = 0.5 * ratio;
+  const rampW = clamp01(fade) * halfW;
+  const flatHalf = halfW - rampW;
+  let window = 0;
+  if (absD <= flatHalf + 1e-6) window = 1;
+  else if (absD < halfW && rampW > 1e-6) window = clamp01((halfW - absD) / rampW);
+  return window * amplitude;
+}
+
+export function evaluateSpatialShader2D(args: {
+  shader: Shader2DKind;
+  canvasXy: [number, number];
+  bBlock: number;
+  tLocal: number;
+  rateBeats?: number | null;
+  speedHz?: number | null;
+  spatialFreq: number;
+  directionDeg: number;
+  centerX: number;
+  centerY: number;
+}): number {
+  const {
+    shader,
+    canvasXy,
+    bBlock,
+    tLocal,
+    rateBeats,
+    speedHz,
+    spatialFreq,
+    directionDeg,
+    centerX,
+    centerY,
+  } = args;
+  const basePhase =
+    speedHz && speedHz > 0
+      ? tLocal * speedHz
+      : bBlock / Math.max(1e-4, rateBeats ?? 1);
+  const phi = remEuclid(basePhase, 1);
+  const dx = canvasXy[0] - centerX;
+  const dy = canvasXy[1] - centerY;
+  const k = spatialFreq;
+  const theta = (directionDeg * Math.PI) / 180;
+
+  if (shader === "linear_sweep") {
+    return clamp01(remEuclid(k * (dx * Math.cos(theta) + dy * Math.sin(theta)) - phi, 1));
+  }
+  if (shader === "radial_wave") {
+    return clamp01(
+      0.5 + 0.5 * Math.sin(Math.PI * 2 * (k * Math.hypot(dx, dy) - phi)),
+    );
+  }
+  if (shader === "pinwheel") {
+    return clamp01(
+      remEuclid(
+        (Math.atan2(dy, dx) / (Math.PI * 2)) * Math.max(1, Math.round(k)) - phi,
+        1,
+      ),
+    );
+  }
+  return clamp01(
+    0.5 +
+      0.25 *
+        (Math.sin(Math.PI * 2 * (k * canvasXy[0] + phi)) +
+          Math.sin(Math.PI * 2 * (k * canvasXy[1] - phi))),
+  );
+}
+
+export function computeBeatAt(clock: BeatClockAnchor, tSec: number): number {
+  return clock.beat_anchor + (tSec - clock.t_anchor_sec) * (clock.bpm / 60);
+}
+
+export function computeSceneAlphaAt(
+  inst: ActiveSceneInstance,
+  tNowSec: number,
+): number {
+  if (tNowSec < inst.trigger_t_sec) return 0;
+  const dtIn = Math.max(0, tNowSec - inst.trigger_t_sec);
+  const inAlpha =
+    inst.fade_in_sec <= 1e-6 ? 1 : clamp01(dtIn / inst.fade_in_sec);
+  if (inst.release_t_sec !== null) {
+    const dtOut = Math.max(0, tNowSec - inst.release_t_sec);
+    const outFactor =
+      inst.fade_out_sec <= 1e-6 ? 0 : clamp01(1 - dtOut / inst.fade_out_sec);
+    return clamp01(inst.release_start_alpha * outFactor);
+  }
+  return inAlpha;
+}
+
 function resolveTarget(
   target: string,
   orderOverride: OrderRuleStr | null,
@@ -428,6 +703,8 @@ export function evaluateSimulationLayersToDmx(args: {
   show: ShowStateDto;
   fixtureDetailsCache: Record<string, FixtureDetail>;
   liveLayers: SmartControlLayer[];
+  activeScenes?: ActiveSceneInstance[];
+  beatClock?: BeatClockAnchor;
   universes: UniverseConfig[];
   grandMaster: number;
   blackout: boolean;
@@ -437,6 +714,8 @@ export function evaluateSimulationLayersToDmx(args: {
     show,
     fixtureDetailsCache,
     liveLayers,
+    activeScenes = [],
+    beatClock = { bpm: show.bpm || 120, t_anchor_sec: 0, beat_anchor: 0 },
     universes,
     grandMaster,
     blackout,
@@ -455,14 +734,21 @@ export function evaluateSimulationLayersToDmx(args: {
   const fixtureCellStarts: number[] = [];
   const fixtureCellCounts: number[] = [];
   const cellToFixture: number[] = [];
+  const cellCanvasXy: Array<[number, number]> = [];
 
   show.patch.forEach((inst, fxIdx) => {
     const detail = fixtureDetailsCache[inst.profile];
     const mode = detail?.expanded_modes.find((m) => m.name === inst.mode);
-    const count = mode?.cells.length ?? 1;
+    const cells = mode?.cells ?? [
+      { cell_index: 0, pixel_key: "1", grid_xyz: [0, 0, 0], local_uv: [0, 0] as [number, number] },
+    ];
+    const count = cells.length;
     fixtureCellStarts.push(totalCells);
     fixtureCellCounts.push(count);
-    for (let i = 0; i < count; i++) cellToFixture.push(fxIdx);
+    for (let i = 0; i < count; i++) {
+      cellToFixture.push(fxIdx);
+      cellCanvasXy.push(transformCellUv(inst.grid_pos, cells[i].local_uv));
+    }
     totalCells += count;
 
     // Seed defaults before evaluating active layers
@@ -484,7 +770,23 @@ export function evaluateSimulationLayersToDmx(args: {
         a.priority - b.priority || a.trigger_order - b.trigger_order,
     );
 
-  if (activeLayers.length === 0) {
+  const runningScenes = activeScenes
+    .map((inst) => ({
+      inst,
+      def: show.scenes.find((s) => s.id === inst.scene_id),
+      alpha: computeSceneAlphaAt(inst, tSec),
+    }))
+    .filter(
+      (item): item is { inst: ActiveSceneInstance; def: SceneDef; alpha: number } =>
+        Boolean(item.def) && item.alpha > 0,
+    )
+    .sort(
+      (a, b) =>
+        a.def.priority - b.def.priority ||
+        a.inst.trigger_order - b.inst.trigger_order,
+    );
+
+  if (activeLayers.length === 0 && runningScenes.length === 0) {
     return { dmxByUniverse, softwareStrobeClamped: false };
   }
 
@@ -498,6 +800,211 @@ export function evaluateSimulationLayersToDmx(args: {
     dimmer: 0,
     color: [0, 0, 0] as [number, number, number],
   }));
+
+  const sampleColorPal = (palId: string | null, w: number): [number, number, number] => {
+    const wc = clamp01(w);
+    const pal = palId
+      ? show.color_palettes.find((p) => p.id === palId)
+      : undefined;
+    return pal
+      ? sampleOklabGradientLinear(pal.hex_start, pal.hex_end, wc)
+      : [wc, wc, wc];
+  };
+
+  // Stage 1 + 2: Active Scenes -> FxBlocks
+  const bNow = computeBeatAt(beatClock, tSec);
+  for (const { inst, def, alpha } of runningScenes) {
+    const tLocal = Math.max(0, tSec - inst.trigger_t_sec);
+    const bLocal = Math.max(0, bNow - inst.trigger_beat);
+    for (const blockId of def.block_refs) {
+      const block = show.fx_library.find((b) => b.id === blockId);
+      if (!block) continue;
+      const targetGroup =
+        def.target_group?.trim() || block.target_group?.trim() || "";
+      if (!targetGroup) continue;
+      const dur = Math.max(1e-4, block.duration_beats);
+      const bBlock = block.loop_block ? remEuclid(bLocal, dur) : Math.min(dur, bLocal);
+
+      for (const elem of block.elements) {
+        const orderOverride = "order" in elem ? elem.order : null;
+        const { cells, fixtures } = resolveTarget(
+          targetGroup,
+          orderOverride,
+          show,
+          fixtureCellStarts,
+          fixtureCellCounts,
+          cellToFixture,
+          totalCells,
+        );
+
+        if (elem.kind === "static_trait") {
+          if (elem.trait === "master_dimmer") {
+            const val = elem.value_start ?? 1;
+            for (const fxIdx of fixtures) {
+              fxStates[fxIdx].masterDimmer = applyScalarMerge(
+                elem.op,
+                fxStates[fxIdx].masterDimmer,
+                val,
+                alpha,
+              );
+              fxStates[fxIdx].masterTouched = true;
+            }
+          } else if (elem.trait === "color") {
+            const v0 = elem.value_start ?? 0;
+            const v1 = elem.value_end ?? 1;
+            for (const [cellIdx, u] of cells) {
+              const rgb = sampleColorPal(elem.palette_ref, v0 + u * (v1 - v0));
+              cellStates[cellIdx].color = [
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+              ];
+              fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+            }
+          } else {
+            const pal = elem.palette_ref
+              ? show.dimmer_palettes.find((p) => p.id === elem.palette_ref)
+              : undefined;
+            const v0 = elem.value_start ?? 1;
+            const v1 = elem.value_end ?? v0;
+            for (const [cellIdx, u] of cells) {
+              const val = pal
+                ? clamp01(pal.value_start + u * (pal.value_end - pal.value_start))
+                : v0 + u * (v1 - v0);
+              cellStates[cellIdx].dimmer = applyScalarMerge(
+                elem.op,
+                cellStates[cellIdx].dimmer,
+                val,
+                alpha,
+              );
+              fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+            }
+          }
+        } else if (elem.kind === "curve_1d") {
+          if (elem.trait === "master_dimmer") {
+            const val = evaluateCurve1DScalar({
+              waveform: elem.waveform,
+              bBlock,
+              tLocal,
+              u: 0,
+              rateBeats: elem.rate_beats,
+              speedHz: elem.speed_hz,
+              phaseSpreadDeg: elem.phase_spread_deg,
+              duty: elem.duty,
+              amplitude: elem.amplitude,
+              offset: elem.offset,
+              isBipolarAddDimmer: elem.op === "add",
+            });
+            for (const fxIdx of fixtures) {
+              fxStates[fxIdx].masterDimmer = applyScalarMerge(
+                elem.op,
+                fxStates[fxIdx].masterDimmer,
+                val,
+                alpha,
+              );
+              fxStates[fxIdx].masterTouched = true;
+            }
+          } else {
+            const isColor = elem.trait === "color";
+            for (const [cellIdx, u] of cells) {
+              const scalar = evaluateCurve1DScalar({
+                waveform: elem.waveform,
+                bBlock,
+                tLocal,
+                u,
+                rateBeats: elem.rate_beats,
+                speedHz: elem.speed_hz,
+                phaseSpreadDeg: elem.phase_spread_deg,
+                duty: elem.duty,
+                amplitude: elem.amplitude,
+                offset: elem.offset,
+                isBipolarAddDimmer: !isColor && elem.op === "add",
+              });
+              if (isColor) {
+                const rgb = sampleColorPal(elem.palette_ref, scalar);
+                cellStates[cellIdx].color = [
+                  applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+                  applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+                  applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+                ];
+              } else {
+                cellStates[cellIdx].dimmer = applyScalarMerge(
+                  elem.op,
+                  cellStates[cellIdx].dimmer,
+                  scalar,
+                  alpha,
+                );
+              }
+              fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+            }
+          }
+        } else if (elem.kind === "step_chase") {
+          const isColor = elem.trait === "color";
+          for (const [cellIdx, u] of cells) {
+            const val = evaluateStepChaseScalar({
+              bBlock,
+              tLocal,
+              u,
+              cellCount: cells.length,
+              stepBeats: elem.step_beats,
+              speedHz: elem.speed_hz,
+              activeRatio: elem.active_ratio,
+              fade: elem.fade,
+              amplitude: elem.amplitude,
+            });
+            if (isColor) {
+              const rgb = sampleColorPal(elem.palette_ref, val);
+              cellStates[cellIdx].color = [
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+              ];
+            } else {
+              cellStates[cellIdx].dimmer = applyScalarMerge(
+                elem.op,
+                cellStates[cellIdx].dimmer,
+                val,
+                alpha,
+              );
+            }
+            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+          }
+        } else if (elem.kind === "spatial_shader_2d") {
+          const isColor = elem.trait === "color";
+          for (const [cellIdx] of cells) {
+            const s = evaluateSpatialShader2D({
+              shader: elem.shader,
+              canvasXy: cellCanvasXy[cellIdx] ?? [0.5, 0.5],
+              bBlock,
+              tLocal,
+              rateBeats: elem.rate_beats,
+              speedHz: elem.speed_hz,
+              spatialFreq: elem.spatial_freq,
+              directionDeg: elem.direction_deg,
+              centerX: elem.center_x,
+              centerY: elem.center_y,
+            });
+            if (isColor) {
+              const rgb = sampleColorPal(elem.palette_ref, s);
+              cellStates[cellIdx].color = [
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+              ];
+            } else {
+              cellStates[cellIdx].dimmer = applyScalarMerge(
+                elem.op,
+                cellStates[cellIdx].dimmer,
+                s,
+                alpha,
+              );
+            }
+            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+          }
+        }
+      }
+    }
+  }
 
   for (const layer of activeLayers) {
     const alpha = clamp01(layer.alpha);

@@ -50,6 +50,7 @@ pub enum FxElementDef {
         #[serde(default)]
         order: Option<OrderRule>,
     },
+    #[serde(rename = "curve_1d")]
     Curve1D {
         #[serde(rename = "trait")]
         trait_name: String,
@@ -90,6 +91,7 @@ pub enum FxElementDef {
         #[serde(default)]
         order: Option<OrderRule>,
     },
+    #[serde(rename = "spatial_shader_2d")]
     SpatialShader2D {
         #[serde(rename = "trait")]
         trait_name: String,
