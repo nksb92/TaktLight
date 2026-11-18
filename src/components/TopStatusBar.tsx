@@ -1,6 +1,7 @@
 import {
   Activity,
   Cable,
+  Clock,
   Cpu,
   Layers,
   LayoutGrid,
@@ -148,6 +149,20 @@ export function TopStatusBar() {
           >
             <Sparkles className="w-3.5 h-3.5" />
             <span>Scenes &amp; FX</span>
+          </button>
+
+          <button
+            type="button"
+            aria-pressed={activeTab === "timeline"}
+            onClick={() => setActiveTab("timeline")}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded font-sans text-xs font-medium transition-colors ${
+              activeTab === "timeline"
+                ? "bg-ember text-frost"
+                : "text-fog hover:text-mist"
+            }`}
+          >
+            <Clock className="w-3.5 h-3.5" />
+            <span>Timeline</span>
           </button>
 
           <button

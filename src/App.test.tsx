@@ -473,3 +473,132 @@ describe("TaktLight Slice 5 Scenes & FX Engine UI", () => {
     expect(screen.getByTestId("scene-live-cell-preview")).toBeInTheDocument();
   });
 });
+
+describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
+  beforeEach(() => {
+    useTaktStore.getState().resetForTest();
+  });
+
+  it("analyzes audio transients, updates tempo/latency, snaps clips with Undo/Redo, and outputs live DMX", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube Stage",
+        1,
+        1,
+        1,
+      );
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Timeline$/i }));
+
+    // Run audio analysis and inspect waveform/transient lane
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Analyze Audio/i }));
+      await Promise.resolve();
+    });
+
+    const analysis =
+      useTaktStore.getState().audioAnalysisByTimeline["tl_cyber_intro"];
+    expect(analysis).toBeDefined();
+    expect(analysis.transients.length).toBeGreaterThan(2);
+    expect(screen.getByTestId("timeline-waveform-lane")).toBeInTheDocument();
+
+    // Update signed latency offset and grid offset
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Latency Offset Ms"), {
+        target: { value: "-10" },
+      });
+      fireEvent.change(screen.getByLabelText("Grid Offset Sec"), {
+        target: { value: "0.12" },
+      });
+      fireEvent.change(screen.getByLabelText("Timeline Tempo BPM"), {
+        target: { value: "120" },
+      });
+      await Promise.resolve();
+    });
+    expect(useTaktStore.getState().latencyOffsetMs).toBe(-10);
+
+    // Add a Track and verify Undo / Redo
+    fireEvent.change(screen.getByLabelText("New Track Name"), {
+      target: { value: "Strobe Accent" },
+    });
+    fireEvent.change(screen.getByLabelText("New Track Target"), {
+      target: { value: "all" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Add Track/i }));
+      await Promise.resolve();
+    });
+
+    const getAccentTrack = () =>
+      useTaktStore
+        .getState()
+        .showState.timelines.find((t) => t.id === "tl_cyber_intro")
+        ?.tracks.find((tr) => tr.name === "Strobe Accent");
+    expect(getAccentTrack()).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Undo$/i }));
+      await Promise.resolve();
+    });
+    expect(getAccentTrack()).toBeUndefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Redo$/i }));
+      await Promise.resolve();
+    });
+    const accentTrack = getAccentTrack()!;
+    expect(accentTrack).toBeDefined();
+
+    // Magnetic Snap is enabled: adding near 1.12s snaps to transient/grid ~1.12s
+    const snapCheckbox = screen.getByLabelText(
+      "Magnetic Snap",
+    ) as HTMLInputElement;
+    expect(snapCheckbox.checked).toBe(true);
+
+    fireEvent.change(screen.getByLabelText("Clip Track"), {
+      target: { value: accentTrack.id },
+    });
+    fireEvent.change(screen.getByLabelText("Clip Block Ref"), {
+      target: { value: "blk_cyber_wave" },
+    });
+    fireEvent.change(screen.getByLabelText("Clip Start Sec"), {
+      target: { value: "1.17" },
+    });
+    fireEvent.change(screen.getByLabelText("Clip Duration Sec"), {
+      target: { value: "4.0" },
+    });
+    fireEvent.change(screen.getByLabelText("Clip Fade In Sec"), {
+      target: { value: "0" },
+    });
+    fireEvent.change(screen.getByLabelText("Clip Fade Out Sec"), {
+      target: { value: "0.5" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Add Clip/i }));
+      await Promise.resolve();
+    });
+
+    const addedClip = getAccentTrack()!.clips[0];
+    expect(addedClip).toBeDefined();
+    expect(addedClip.start_sec).not.toBe(1.17);
+    expect(addedClip.start_sec).toBeCloseTo(1.12, 2);
+
+    // Play / seek timeline -> outputs quantized DMX
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Timeline Playhead Sec"), {
+        target: { value: "2.0" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Play Timeline/i }));
+      await Promise.resolve();
+    });
+
+    expect(useTaktStore.getState().timelinePlaying).toBe(true);
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
+    expect(screen.getByTestId("timeline-live-cell-preview")).toBeInTheDocument();
+  });
+});

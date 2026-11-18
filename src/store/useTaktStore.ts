@@ -17,7 +17,11 @@ import {
 } from "../lib/oflBuilder";
 import {
   type ActiveSceneInstance,
+  analyzeSyntheticTimelineAudio,
+  type AudioAnalysisResult,
+  type AudioTrackDef,
   type BeatClockAnchor,
+  type ClipDef,
   ColorPaletteDef,
   computeBeatAt,
   computeSceneAlphaAt,
@@ -29,6 +33,9 @@ import {
   type SceneDef,
   type Shader2DKind,
   SmartControlLayer,
+  type TempoPointDef,
+  type TimelineDef,
+  type TrackDef,
   type Waveform1D,
 } from "../lib/mixerLogic";
 import {
@@ -52,6 +59,7 @@ export type WorkspaceTab =
   | "grid"
   | "palettes"
   | "scenes"
+  | "timeline"
   | "fixtures";
 
 export type ArtNetOutputMode =
@@ -135,6 +143,10 @@ export interface EngineSnapshotDto {
   live_layers: SmartControlLayer[];
   active_scenes: ActiveSceneInstance[];
   live_bpm: number;
+  active_timeline_id: string | null;
+  timeline_playing: boolean;
+  timeline_playhead_sec: number;
+  latency_offset_ms: number;
   universes: UniverseConfig[];
   interfaces: NetworkInterfaceInfo[];
   adapter_selection: AdapterSelection;
@@ -282,6 +294,39 @@ function createInitialShowState(): ShowStateDto {
         block_refs: ["blk_cyber_wave"],
       },
     ],
+    timelines: [
+      {
+        id: "tl_cyber_intro",
+        name: "Cyber Intro",
+        duration_sec: 16.0,
+        grid_offset_sec: 0.0,
+        tempo_map: [{ at_sec: 0.0, bpm: 120.0 }],
+        audio_track: {
+          file: "audio/cyber_intro.wav",
+          abs_fallback: null,
+          sha256: null,
+          offset_sec: 0.0,
+          transient_sensitivity: 0.65,
+        },
+        tracks: [
+          {
+            id: "trk_1",
+            name: "Tube Wave",
+            target_group: "all",
+            clips: [
+              {
+                ref_block: "blk_cyber_wave",
+                start_sec: 0.0,
+                duration_sec: 8.0,
+                fade_in_sec: 0.0,
+                fade_out_sec: 0.5,
+                inline_fx: [],
+              },
+            ],
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -363,6 +408,12 @@ function createInitialState() {
     liveLayers: [] as SmartControlLayer[],
     activeScenes: [] as ActiveSceneInstance[],
     liveBpm: 120,
+    activeTimelineId: null as string | null,
+    timelinePlaying: false,
+    timelinePlayheadSec: 0,
+    latencyOffsetMs: 0,
+    _simTimelineAnchorTSec: 0,
+    audioAnalysisByTimeline: {} as Record<string, AudioAnalysisResult>,
     compiledCells: [] as CompiledCell[],
     cellPreviewRgbd: new Uint8Array(0),
     canUndo: false,
@@ -389,6 +440,11 @@ function synthesizeSimulationBuffer(state: {
   liveLayers: SmartControlLayer[];
   activeScenes: ActiveSceneInstance[];
   _simBeatClock: BeatClockAnchor;
+  activeTimelineId: string | null;
+  timelinePlaying: boolean;
+  timelinePlayheadSec: number;
+  _simTimelineAnchorTSec: number;
+  latencyOffsetMs: number;
   telemetry: TelemetrySummary;
   jitterSamplesUs: number[];
   showState: ShowStateDto;
@@ -401,6 +457,13 @@ function synthesizeSimulationBuffer(state: {
     liveLayers: state.liveLayers,
     activeScenes: state.activeScenes,
     beatClock: state._simBeatClock,
+    timelineState: {
+      activeTimelineId: state.activeTimelineId,
+      playing: state.timelinePlaying,
+      playheadSec: state.timelinePlayheadSec,
+      startAnchorTSec: state._simTimelineAnchorTSec,
+      latencyOffsetMs: state.latencyOffsetMs,
+    },
     universes: state.universes,
     grandMaster: state.grandMaster,
     blackout: state.blackout,
@@ -571,31 +634,43 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
     })
     .join("\n");
 
+  const serializeFxElementsXml = (
+    elements: FxElementDef[],
+    indent: string,
+    escFn: (s: string) => string,
+  ): string =>
+    elements
+      .map((el) => {
+        if (el.kind === "static_trait") {
+          const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
+          const vs = el.value_start !== null ? ` value_start="${el.value_start}"` : "";
+          const ve = el.value_end !== null ? ` value_end="${el.value_end}"` : "";
+          const ord = el.order ? ` order="${escFn(el.order)}"` : "";
+          return `${indent}<StaticTrait trait="${escFn(el.trait)}" op="${escFn(el.op)}"${pr}${vs}${ve}${ord} />`;
+        }
+        if (el.kind === "curve_1d") {
+          const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
+          const sh = el.speed_hz !== null ? ` speed_hz="${el.speed_hz}"` : "";
+          const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
+          const ord = el.order ? ` order="${escFn(el.order)}"` : "";
+          return `${indent}<Curve1D trait="${escFn(el.trait)}" op="${escFn(el.op)}" waveform="${escFn(el.waveform)}" amplitude="${el.amplitude}" offset="${el.offset}"${rb}${sh} phase_spread_deg="${el.phase_spread_deg}"${pr}${ord} />`;
+        }
+        if (el.kind === "step_chase") {
+          const sb = el.step_beats !== null ? ` step_beats="${el.step_beats}"` : "";
+          const ar = el.active_ratio !== null ? ` active_ratio="${el.active_ratio}"` : "";
+          const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
+          const ord = el.order ? ` order="${escFn(el.order)}"` : "";
+          return `${indent}<StepChase trait="${escFn(el.trait)}" op="${escFn(el.op)}"${sb}${ar} fade="${el.fade}" amplitude="${el.amplitude}"${pr}${ord} />`;
+        }
+        const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
+        const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
+        return `${indent}<SpatialShader2D trait="${escFn(el.trait)}" op="${escFn(el.op)}" shader="${escFn(el.shader)}"${pr}${rb} spatial_freq="${el.spatial_freq}" direction_deg="${el.direction_deg}" center_x="${el.center_x}" center_y="${el.center_y}" />`;
+      })
+      .join("\n");
+
   const fxLines = show.fx_library
     .map((b) => {
-      const elemLines = b.elements
-        .map((el) => {
-          if (el.kind === "static_trait") {
-            const pr = el.palette_ref ? ` palette_ref="${esc(el.palette_ref)}"` : "";
-            const ord = el.order ? ` order="${esc(el.order)}"` : "";
-            return `      <StaticTrait trait="${esc(el.trait)}" op="${esc(el.op)}"${pr}${ord} />`;
-          }
-          if (el.kind === "curve_1d") {
-            const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
-            const sh = el.speed_hz !== null ? ` speed_hz="${el.speed_hz}"` : "";
-            const pr = el.palette_ref ? ` palette_ref="${esc(el.palette_ref)}"` : "";
-            return `      <Curve1D trait="${esc(el.trait)}" op="${esc(el.op)}" waveform="${esc(el.waveform)}" amplitude="${el.amplitude}" offset="${el.offset}"${rb}${sh} phase_spread_deg="${el.phase_spread_deg}"${pr} />`;
-          }
-          if (el.kind === "step_chase") {
-            const sb = el.step_beats !== null ? ` step_beats="${el.step_beats}"` : "";
-            const ar = el.active_ratio !== null ? ` active_ratio="${el.active_ratio}"` : "";
-            return `      <StepChase trait="${esc(el.trait)}" op="${esc(el.op)}"${sb}${ar} fade="${el.fade}" amplitude="${el.amplitude}" />`;
-          }
-          const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
-          const pr = el.palette_ref ? ` palette_ref="${esc(el.palette_ref)}"` : "";
-          return `      <SpatialShader2D trait="${esc(el.trait)}" op="${esc(el.op)}" shader="${esc(el.shader)}"${pr}${rb} spatial_freq="${el.spatial_freq}" direction_deg="${el.direction_deg}" center_x="${el.center_x}" center_y="${el.center_y}" />`;
-        })
-        .join("\n");
+      const elemLines = serializeFxElementsXml(b.elements, "      ", esc);
       const tg = b.target_group ? ` target_group="${esc(b.target_group)}"` : "";
       return `    <FxBlock id="${esc(b.id)}" name="${esc(b.name)}"${tg} duration_beats="${b.duration_beats}" loop="${b.loop_block}">\n${elemLines}\n    </FxBlock>`;
     })
@@ -609,6 +684,34 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
         .map((r) => `      <BlockRef ref="${esc(r)}" />`)
         .join("\n");
       return `    <Scene id="${esc(sc.id)}" name="${esc(sc.name)}"${bStr}${tg} priority="${sc.priority}" fade_in_sec="${sc.fade_in_sec}" fade_out_sec="${sc.fade_out_sec}">\n${refs}\n    </Scene>`;
+    })
+    .join("\n");
+
+  const timelineLines = show.timelines
+    .map((tl) => {
+      const tempoLines = tl.tempo_map
+        .map((pt) => `        <Tempo at_sec="${pt.at_sec}" bpm="${pt.bpm}" />`)
+        .join("\n");
+      const audioLine = tl.audio_track
+        ? `      <AudioTrack file="${esc(tl.audio_track.file)}"${tl.audio_track.abs_fallback ? ` abs_fallback="${esc(tl.audio_track.abs_fallback)}"` : ""}${tl.audio_track.sha256 ? ` sha256="${esc(tl.audio_track.sha256)}"` : ""} offset_sec="${tl.audio_track.offset_sec}" transient_sensitivity="${tl.audio_track.transient_sensitivity}" />\n`
+        : "";
+      const trackLines = tl.tracks
+        .map((trk) => {
+          const tg = trk.target_group ? ` target_group="${esc(trk.target_group)}"` : "";
+          const clipLines = trk.clips
+            .map((clip) => {
+              const rb = clip.ref_block ? ` ref_block="${esc(clip.ref_block)}"` : "";
+              if (clip.inline_fx.length === 0) {
+                return `        <Clip${rb} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}" />`;
+              }
+              const inlineXml = serializeFxElementsXml(clip.inline_fx, "          ", esc);
+              return `        <Clip${rb} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}">\n${inlineXml}\n        </Clip>`;
+            })
+            .join("\n");
+          return `      <Track id="${esc(trk.id)}" name="${esc(trk.name)}"${tg}>\n${clipLines}\n      </Track>`;
+        })
+        .join("\n");
+      return `    <Timeline id="${esc(tl.id)}" name="${esc(tl.name)}" duration_sec="${tl.duration_sec}" grid_offset_sec="${tl.grid_offset_sec}">\n      <TempoMap>\n${tempoLines}\n      </TempoMap>\n${audioLine}${trackLines}\n    </Timeline>`;
     })
     .join("\n");
 
@@ -632,6 +735,9 @@ ${fxLines}
   <Scenes>
 ${sceneLines}
   </Scenes>
+  <Timelines>
+${timelineLines}
+  </Timelines>
 </TaktLightShow>
 `;
 }
@@ -760,10 +866,9 @@ function parseShowXmlLocally(
     });
   });
 
-  const fx_library: FxBlockDef[] = [];
-  root.querySelectorAll("FxLibrary > FxBlock").forEach((el) => {
+  const parseFxElementsXml = (parentEl: Element): FxElementDef[] => {
     const elements: FxElementDef[] = [];
-    Array.from(el.children).forEach((child) => {
+    Array.from(parentEl.children).forEach((child) => {
       const tag = child.tagName;
       const trait = child.getAttribute("trait") ?? "dimmer";
       const op = (child.getAttribute("op") as MergeOp) ?? "htp";
@@ -843,13 +948,18 @@ function parseShowXmlLocally(
         });
       }
     });
+    return elements;
+  };
+
+  const fx_library: FxBlockDef[] = [];
+  root.querySelectorAll("FxLibrary > FxBlock").forEach((el) => {
     fx_library.push({
       id: el.getAttribute("id") ?? `blk_${fx_library.length + 1}`,
       name: el.getAttribute("name") ?? "FX Block",
       target_group: el.getAttribute("target_group"),
       duration_beats: Number(el.getAttribute("duration_beats") ?? 4),
       loop_block: el.getAttribute("loop") !== "false",
-      elements,
+      elements: parseFxElementsXml(el),
     });
   });
 
@@ -872,6 +982,60 @@ function parseShowXmlLocally(
     });
   });
 
+  const timelines: TimelineDef[] = [];
+  root.querySelectorAll("Timelines > Timeline").forEach((el) => {
+    const tempo_map: TempoPointDef[] = [];
+    el.querySelectorAll("TempoMap > Tempo").forEach((tEl) => {
+      tempo_map.push({
+        at_sec: Number(tEl.getAttribute("at_sec") ?? 0),
+        bpm: Number(tEl.getAttribute("bpm") ?? bpm),
+      });
+    });
+    const audioEl = el.querySelector(":scope > AudioTrack");
+    const audio_track: AudioTrackDef | null = audioEl
+      ? {
+          file: audioEl.getAttribute("file") ?? "",
+          abs_fallback: audioEl.getAttribute("abs_fallback"),
+          sha256: audioEl.getAttribute("sha256"),
+          offset_sec: Number(audioEl.getAttribute("offset_sec") ?? 0),
+          transient_sensitivity: Number(
+            audioEl.getAttribute("transient_sensitivity") ?? 0.65,
+          ),
+        }
+      : null;
+
+    const tracks: TrackDef[] = [];
+    el.querySelectorAll(":scope > Track").forEach((trkEl) => {
+      const clips: ClipDef[] = [];
+      trkEl.querySelectorAll(":scope > Clip").forEach((cEl) => {
+        clips.push({
+          ref_block: cEl.getAttribute("ref_block"),
+          start_sec: Number(cEl.getAttribute("start_sec") ?? 0),
+          duration_sec: Number(cEl.getAttribute("duration_sec") ?? 1),
+          fade_in_sec: Number(cEl.getAttribute("fade_in_sec") ?? 0),
+          fade_out_sec: Number(cEl.getAttribute("fade_out_sec") ?? 0),
+          inline_fx: parseFxElementsXml(cEl),
+        });
+      });
+      tracks.push({
+        id: trkEl.getAttribute("id") ?? `trk_${tracks.length + 1}`,
+        name: trkEl.getAttribute("name") ?? "Track",
+        target_group: trkEl.getAttribute("target_group"),
+        clips,
+      });
+    });
+
+    timelines.push({
+      id: el.getAttribute("id") ?? `tl_${timelines.length + 1}`,
+      name: el.getAttribute("name") ?? "Timeline",
+      duration_sec: Number(el.getAttribute("duration_sec") ?? 30),
+      grid_offset_sec: Number(el.getAttribute("grid_offset_sec") ?? 0),
+      tempo_map,
+      audio_track,
+      tracks,
+    });
+  });
+
   return {
     version,
     name,
@@ -891,6 +1055,7 @@ function parseShowXmlLocally(
     groups,
     fx_library,
     scenes,
+    timelines,
   };
 }
 
@@ -922,6 +1087,12 @@ export interface TaktStoreState {
   liveLayers: SmartControlLayer[];
   activeScenes: ActiveSceneInstance[];
   liveBpm: number;
+  activeTimelineId: string | null;
+  timelinePlaying: boolean;
+  timelinePlayheadSec: number;
+  latencyOffsetMs: number;
+  _simTimelineAnchorTSec: number;
+  audioAnalysisByTimeline: Record<string, AudioAnalysisResult>;
   compiledCells: CompiledCell[];
   cellPreviewRgbd: Uint8Array;
   canUndo: boolean;
@@ -1015,6 +1186,22 @@ export interface TaktStoreState {
   releaseAllScenes: (tSec?: number) => Promise<void>;
   setLiveBpm: (bpm: number, tSec?: number) => Promise<void>;
   tapTempo: (tSec?: number) => Promise<void>;
+  upsertTimeline: (timeline: TimelineDef, coalesceKey?: string) => Promise<void>;
+  deleteTimeline: (id: string) => Promise<void>;
+  setTimelineTransport: (
+    timelineId: string | null,
+    playing: boolean,
+    playheadSec?: number,
+    tSec?: number,
+  ) => Promise<void>;
+  setLatencyOffsetMs: (offsetMs: number) => Promise<void>;
+  analyzeTimelineAudio: (
+    timelineId: string,
+    wavPath?: string,
+    bpmHint?: number,
+    durationSec?: number,
+    sensitivity?: number,
+  ) => Promise<AudioAnalysisResult>;
   selectFixtureInstance: (id: string | null) => void;
   setFocusedPatchUniverse: (universeId: number) => void;
   dismissToast: () => void;
@@ -1069,6 +1256,22 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         liveLayers: snapshot.live_layers ?? state.liveLayers,
         activeScenes: snapshot.active_scenes ?? state.activeScenes,
         liveBpm: snapshot.live_bpm ?? state.liveBpm,
+        activeTimelineId:
+          snapshot.active_timeline_id !== undefined
+            ? snapshot.active_timeline_id
+            : state.activeTimelineId,
+        timelinePlaying:
+          snapshot.timeline_playing !== undefined
+            ? snapshot.timeline_playing
+            : state.timelinePlaying,
+        timelinePlayheadSec:
+          snapshot.timeline_playhead_sec !== undefined
+            ? snapshot.timeline_playhead_sec
+            : state.timelinePlayheadSec,
+        latencyOffsetMs:
+          snapshot.latency_offset_ms !== undefined
+            ? snapshot.latency_offset_ms
+            : state.latencyOffsetMs,
         universes: snapshot.universes,
         dmxByUniverse: nextDmx,
         interfaces: snapshot.interfaces,
@@ -2280,6 +2483,154 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   },
 
   selectFixtureInstance: (id) => set({ selectedFixtureInstanceId: id }),
+
+  upsertTimeline: async (timeline, coalesceKey) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<ShowSnapshotDto>("upsert_timeline_command", {
+        timeline,
+        coalesceKey: coalesceKey ?? null,
+      });
+      get().applyShowSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const exists = prevShow.timelines.some((t) => t.id === timeline.id);
+    const nextTimelines = exists
+      ? prevShow.timelines.map((t) => (t.id === timeline.id ? timeline : t))
+      : [...prevShow.timelines, timeline];
+    const nextShow: ShowStateDto = { ...prevShow, timelines: nextTimelines };
+    const top = state._simUndo[state._simUndo.length - 1];
+    const nextUndo =
+      coalesceKey && top && top.coalesceKey === coalesceKey
+        ? state._simUndo
+        : [...state._simUndo, { show: prevShow, coalesceKey: coalesceKey ?? null }];
+    set({
+      showState: nextShow,
+      _simUndo: nextUndo,
+      _simRedo: [],
+      canUndo: nextUndo.length > 0,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  deleteTimeline: async (id) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<ShowSnapshotDto>("delete_timeline_command", {
+        id,
+      });
+      get().applyShowSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const nextTimelines = prevShow.timelines.filter((t) => t.id !== id);
+    const nextUndo = [...state._simUndo, { show: prevShow, coalesceKey: null }];
+    set({
+      showState: { ...prevShow, timelines: nextTimelines },
+      activeTimelineId: state.activeTimelineId === id ? null : state.activeTimelineId,
+      timelinePlaying: state.activeTimelineId === id ? false : state.timelinePlaying,
+      _simUndo: nextUndo,
+      _simRedo: [],
+      canUndo: nextUndo.length > 0,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  setTimelineTransport: async (timelineId, playing, playheadSec, tSec) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>(
+        "set_timeline_transport_command",
+        {
+          timelineId,
+          playing,
+          playheadSec: playheadSec ?? null,
+          tSec: tSec ?? null,
+        },
+      );
+      get().applyEngineSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const tNow = tSec ?? state.telemetry.tSec;
+    const normId = timelineId && timelineId.trim() ? timelineId.trim() : null;
+    if (!normId) {
+      set({
+        activeTimelineId: null,
+        timelinePlaying: false,
+        timelinePlayheadSec: 0,
+        _simTimelineAnchorTSec: tNow,
+      });
+    } else {
+      const nextHead =
+        playheadSec !== undefined && !Number.isNaN(playheadSec)
+          ? Math.max(0, playheadSec)
+          : state.timelinePlayheadSec;
+      set({
+        activeTimelineId: normId,
+        timelinePlaying: playing,
+        timelinePlayheadSec: nextHead,
+        _simTimelineAnchorTSec: tNow,
+      });
+    }
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  setLatencyOffsetMs: async (offsetMs) => {
+    const clamped = Number.isNaN(offsetMs)
+      ? 0
+      : Math.max(-500, Math.min(500, offsetMs));
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>(
+        "set_latency_offset_ms_command",
+        { offsetMs: clamped },
+      );
+      get().applyEngineSnapshot(snap);
+      return;
+    }
+    set({ latencyOffsetMs: clamped });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  analyzeTimelineAudio: async (
+    timelineId,
+    wavPath,
+    bpmHint,
+    durationSec,
+    sensitivity,
+  ) => {
+    const tl = get().showState.timelines.find((t) => t.id === timelineId);
+    const sens = Math.max(
+      0,
+      Math.min(1, sensitivity ?? tl?.audio_track?.transient_sensitivity ?? 0.65),
+    );
+    const bpm = bpmHint ?? tl?.tempo_map[0]?.bpm ?? get().showState.bpm ?? 120;
+    const dur = durationSec ?? tl?.duration_sec ?? 16;
+
+    const result = isTauriEnvironment()
+      ? await invoke<AudioAnalysisResult>("analyze_audio_command", {
+          wavPath: wavPath ?? null,
+          syntheticBpm: bpm,
+          syntheticDurationSec: dur,
+          transientSensitivity: sens,
+        })
+      : analyzeSyntheticTimelineAudio({
+          bpm,
+          durationSec: dur,
+          gridOffsetSec: tl?.grid_offset_sec ?? 0.12,
+          sensitivity: sens,
+        });
+
+    set((state) => ({
+      audioAnalysisByTimeline: {
+        ...state.audioAnalysisByTimeline,
+        [timelineId]: result,
+      },
+    }));
+    return result;
+  },
 
   setFocusedPatchUniverse: (universeId) =>
     set({ focusedPatchUniverse: Math.max(1, universeId) }),

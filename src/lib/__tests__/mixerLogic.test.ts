@@ -1,15 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  analyzeSyntheticTimelineAudio,
   applyScalarMerge,
+  computeBeatGridMarkers,
+  computeClipAlphaAt,
   evaluateCurve1DScalar,
   evaluateSpatialShader2D,
   evaluateStepChaseScalar,
   evalUnipolarWaveform,
   extractRgbw,
+  integrateTempoMapBeats,
   linearRgbToOklab,
   quantizeChannelValue,
   sampleOklabGradientHex,
   sampleOklabGradientLinear,
+  snapTimeSecToMarkers,
   srgbHexToLinearRgb,
 } from "../mixerLogic";
 
@@ -96,5 +101,48 @@ describe("mixerLogic", () => {
     });
     expect(radial).toBeGreaterThanOrEqual(0);
     expect(radial).toBeLessThanOrEqual(1);
+  });
+
+  it("integrates piecewise TempoMap beats, clip fade envelopes, beat-grid, and magnetic snap", () => {
+    const tempoMap = [
+      { at_sec: 0, bpm: 120 },
+      { at_sec: 2, bpm: 150 },
+    ];
+    expect(integrateTempoMapBeats(tempoMap, 120, 0, 4)).toBeCloseTo(9.0, 6);
+
+    const clip = {
+      start_sec: 1.0,
+      duration_sec: 4.0,
+      fade_in_sec: 1.0,
+      fade_out_sec: 1.0,
+    };
+    expect(computeClipAlphaAt(clip, 0.9)).toBe(0);
+    expect(computeClipAlphaAt(clip, 1.5)).toBeCloseTo(0.5, 5);
+    expect(computeClipAlphaAt(clip, 2.5)).toBe(1);
+    expect(computeClipAlphaAt(clip, 4.5)).toBeCloseTo(0.5, 5);
+    expect(computeClipAlphaAt(clip, 5.0)).toBe(0);
+
+    const grid = computeBeatGridMarkers({
+      durationSec: 2.0,
+      gridOffsetSec: 0.1,
+      tempoMap: [{ at_sec: 0, bpm: 120 }],
+      defaultBpm: 120,
+    });
+    expect(grid[0]).toBeCloseTo(0.1, 4);
+    expect(grid[1]).toBeCloseTo(0.6, 4);
+
+    const analysis = analyzeSyntheticTimelineAudio({
+      bpm: 128,
+      durationSec: 8,
+      gridOffsetSec: 0.12,
+      sensitivity: 0.65,
+    });
+    expect(analysis.transients.length).toBeGreaterThan(4);
+    const snapped = snapTimeSecToMarkers(
+      analysis.transients[1].time_sec + 0.04,
+      analysis.transients.map((t) => t.time_sec),
+      0.15,
+    );
+    expect(snapped).toBeCloseTo(analysis.transients[1].time_sec, 4);
   });
 });

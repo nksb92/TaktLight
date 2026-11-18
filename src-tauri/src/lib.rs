@@ -10,6 +10,10 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Manager, RunEvent, State};
 use tokio::sync::watch;
 
+use taktlight_engine::audio::{
+    analyze_streaming_chunks, analyze_wav_bytes_streaming, compute_sha256_hex,
+    generate_synthetic_drum_track_chunks, AudioAnalysisCache, AudioAnalysisResult,
+};
 use taktlight_engine::engine::runner::{
     spawn_engine_loop, EngineConfig, EngineRunnerHandle, EngineTelemetrySnapshot,
 };
@@ -33,7 +37,7 @@ use taktlight_engine::show::spatial::GridPos;
 use taktlight_engine::show::undo::{ShowCommand, UndoHistory};
 use taktlight_engine::show::xml::{
     deserialize_show_xml, serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef,
-    FxBlockDef, SceneDef, ShowState,
+    FxBlockDef, SceneDef, ShowState, TimelineDef,
 };
 use taktlight_engine::state::plan::{CompiledCell, RenderPlan, UniverseConfig};
 use taktlight_engine::state::runtime::RuntimeControl;
@@ -54,6 +58,10 @@ pub struct EngineSnapshotDto {
     pub live_layers: Vec<SmartControlLayer>,
     pub active_scenes: Vec<ActiveSceneInstance>,
     pub live_bpm: f32,
+    pub active_timeline_id: Option<String>,
+    pub timeline_playing: bool,
+    pub timeline_playhead_sec: f64,
+    pub latency_offset_ms: f64,
     pub universes: Vec<UniverseConfig>,
     pub interfaces: Vec<NetworkInterfaceInfo>,
     pub adapter_selection: AdapterSelection,
@@ -100,6 +108,7 @@ pub struct AppState {
     pub undo_history: Mutex<UndoHistory>,
     pub rollover_enabled: AtomicBool,
     pub app_epoch: Instant,
+    pub audio_cache: Mutex<AudioAnalysisCache>,
     next_fixture_seq: AtomicU64,
 }
 
@@ -174,6 +183,7 @@ impl AppState {
             undo_history,
             rollover_enabled: AtomicBool::new(true),
             app_epoch: Instant::now(),
+            audio_cache: Mutex::new(AudioAnalysisCache::new()),
             next_fixture_seq: AtomicU64::new(1),
         }
     }
@@ -212,6 +222,12 @@ impl AppState {
             live_layers: rt.live_layers.clone(),
             active_scenes: rt.active_scenes.clone(),
             live_bpm: rt.beat_clock.bpm,
+            active_timeline_id: rt.active_timeline_id.clone(),
+            timeline_playing: rt.timeline_playing,
+            timeline_playhead_sec: rt
+                .effective_timeline_playhead_sec(self.app_epoch.elapsed().as_secs_f64())
+                .unwrap_or(rt.timeline_playhead_sec),
+            latency_offset_ms: rt.latency_offset_ms,
             universes: plan.universes.clone(),
             interfaces: enumerate_ipv4_interfaces(),
             adapter_selection: selection,
@@ -723,6 +739,96 @@ impl AppState {
         });
         self.snapshot()
     }
+
+    pub fn upsert_timeline(
+        &self,
+        timeline: TimelineDef,
+        coalesce_key: Option<String>,
+    ) -> Result<ShowSnapshotDto, String> {
+        let before = self
+            .show_state
+            .read()
+            .timelines
+            .iter()
+            .find(|t| t.id == timeline.id)
+            .cloned();
+        let label = timeline.name.clone();
+        self.execute_show_command(
+            ShowCommand::UpsertTimeline {
+                before,
+                after: timeline,
+                coalesce_key,
+            },
+            Some(format!("Saved timeline {label}")),
+            false,
+        )
+    }
+
+    pub fn delete_timeline(&self, id: &str) -> Result<ShowSnapshotDto, String> {
+        let removed = self
+            .show_state
+            .read()
+            .timelines
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .ok_or_else(|| format!("timeline '{id}' not found"))?;
+        let label = removed.name.clone();
+        self.execute_show_command(
+            ShowCommand::DeleteTimeline { removed },
+            Some(format!("Deleted timeline {label}")),
+            false,
+        )
+    }
+
+    pub fn set_timeline_transport(
+        &self,
+        timeline_id: Option<String>,
+        playing: bool,
+        playhead_sec: Option<f64>,
+        t_sec: Option<f64>,
+    ) -> EngineSnapshotDto {
+        let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
+        self.update_runtime(|rt| rt.set_timeline_transport(timeline_id, playing, playhead_sec, t_now));
+        self.snapshot()
+    }
+
+    pub fn set_latency_offset_ms(&self, offset_ms: f64) -> EngineSnapshotDto {
+        self.update_runtime(|rt| rt.set_latency_offset_ms(offset_ms));
+        self.snapshot()
+    }
+
+    pub fn analyze_audio(
+        &self,
+        wav_path: Option<String>,
+        synthetic_bpm: Option<f32>,
+        synthetic_duration_sec: Option<f64>,
+        transient_sensitivity: f32,
+    ) -> Result<AudioAnalysisResult, String> {
+        let sens = transient_sensitivity.clamp(0.0, 1.0);
+        if let Some(path_str) = wav_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let bytes = std::fs::read(path_str)
+                .map_err(|e| format!("failed to read audio file '{path_str}': {e}"))?;
+            let sha = compute_sha256_hex(&bytes);
+            if let Some(hit) = self.audio_cache.lock().get(&sha, sens) {
+                return Ok(hit);
+            }
+            let res = analyze_wav_bytes_streaming(&bytes, sens)?;
+            self.audio_cache.lock().insert(sens, res.clone());
+            return Ok(res);
+        }
+
+        let bpm = synthetic_bpm.unwrap_or(120.0).clamp(60.0, 180.0);
+        let dur = synthetic_duration_sec.unwrap_or(16.0).clamp(2.0, 120.0);
+        let sha_key = compute_sha256_hex(format!("synthetic:{bpm:.2}:{dur:.2}").as_bytes());
+        if let Some(hit) = self.audio_cache.lock().get(&sha_key, sens) {
+            return Ok(hit);
+        }
+        let chunks = generate_synthetic_drum_track_chunks(44_100, bpm, dur, 0.120);
+        let res = analyze_streaming_chunks(44_100, 1, sha_key, sens, chunks);
+        self.audio_cache.lock().insert(sens, res.clone());
+        Ok(res)
+    }
 }
 
 #[tauri::command]
@@ -1137,6 +1243,58 @@ fn tap_tempo_command(state: State<'_, AppState>, t_sec: Option<f64>) -> EngineSn
     state.tap_tempo(t_sec)
 }
 
+#[tauri::command]
+fn upsert_timeline_command(
+    state: State<'_, AppState>,
+    timeline: TimelineDef,
+    coalesce_key: Option<String>,
+) -> Result<ShowSnapshotDto, String> {
+    state.upsert_timeline(timeline, coalesce_key)
+}
+
+#[tauri::command]
+fn delete_timeline_command(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.delete_timeline(&id)
+}
+
+#[tauri::command]
+fn set_timeline_transport_command(
+    state: State<'_, AppState>,
+    timeline_id: Option<String>,
+    playing: bool,
+    playhead_sec: Option<f64>,
+    t_sec: Option<f64>,
+) -> EngineSnapshotDto {
+    state.set_timeline_transport(timeline_id, playing, playhead_sec, t_sec)
+}
+
+#[tauri::command]
+fn set_latency_offset_ms_command(
+    state: State<'_, AppState>,
+    offset_ms: f64,
+) -> EngineSnapshotDto {
+    state.set_latency_offset_ms(offset_ms)
+}
+
+#[tauri::command]
+fn analyze_audio_command(
+    state: State<'_, AppState>,
+    wav_path: Option<String>,
+    synthetic_bpm: Option<f32>,
+    synthetic_duration_sec: Option<f64>,
+    transient_sensitivity: f32,
+) -> Result<AudioAnalysisResult, String> {
+    state.analyze_audio(
+        wav_path,
+        synthetic_bpm,
+        synthetic_duration_sec,
+        transient_sensitivity,
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
@@ -1185,6 +1343,11 @@ pub fn run() {
             release_all_scenes_command,
             set_live_bpm_command,
             tap_tempo_command,
+            upsert_timeline_command,
+            delete_timeline_command,
+            set_timeline_transport_command,
+            set_latency_offset_ms_command,
+            analyze_audio_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building TaktLight application");
@@ -1517,5 +1680,68 @@ mod tests {
 
         let rel_all = state.release_all_scenes(Some(7.0));
         assert!(rel_all.active_scenes.iter().all(|s| s.release_t_sec.is_some()));
+    }
+
+    #[test]
+    fn app_state_manages_timelines_transport_and_audio_analysis() {
+        use taktlight_engine::show::xml::{ClipDef, FxElementDef, TempoPointDef, TrackDef};
+
+        let state = AppState::new(false);
+        state
+            .upsert_timeline(
+                TimelineDef {
+                    id: "tl_test".into(),
+                    name: "Test Show".into(),
+                    duration_sec: 16.0,
+                    grid_offset_sec: 0.12,
+                    tempo_map: vec![TempoPointDef {
+                        at_sec: 0.0,
+                        bpm: 128.0,
+                    }],
+                    audio_track: None,
+                    tracks: vec![TrackDef {
+                        id: "trk_1".into(),
+                        name: "Track 1".into(),
+                        target_group: Some("all".into()),
+                        clips: vec![ClipDef {
+                            ref_block: None,
+                            start_sec: 0.5,
+                            duration_sec: 4.0,
+                            fade_in_sec: 0.25,
+                            fade_out_sec: 0.25,
+                            inline_fx: vec![FxElementDef::StaticTrait {
+                                trait_name: "dimmer".into(),
+                                op: "htp".into(),
+                                palette_ref: None,
+                                value_start: Some(1.0),
+                                value_end: Some(1.0),
+                                order: None,
+                            }],
+                        }],
+                    }],
+                },
+                None,
+            )
+            .unwrap();
+
+        let snap = state.set_timeline_transport(Some("tl_test".into()), true, Some(1.0), Some(10.0));
+        assert_eq!(snap.active_timeline_id.as_deref(), Some("tl_test"));
+        assert!(snap.timeline_playing);
+
+        let lat = state.set_latency_offset_ms(-12.5);
+        assert!((lat.latency_offset_ms - (-12.5)).abs() < 1e-6);
+
+        let a1 = state
+            .analyze_audio(None, Some(128.0), Some(8.0), 0.65)
+            .unwrap();
+        assert!((a1.estimated_bpm - 128.0).abs() <= 1.5);
+        let a2 = state
+            .analyze_audio(None, Some(128.0), Some(8.0), 0.65)
+            .unwrap();
+        assert_eq!(a1, a2);
+        assert_eq!(state.audio_cache.lock().cache_hits, 1);
+
+        state.undo().unwrap();
+        assert!(state.show_state.read().timelines.is_empty());
     }
 }
