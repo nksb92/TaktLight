@@ -2,7 +2,7 @@
 
 **TaktLight** (*Takt* = musical beat and deterministic clock cycle) is a 100% offline-capable, Ethernet-native DMX512 lighting control and show design application built with **Tauri v2 (Rust + React/TypeScript)**.
 
-Designed as a streamlined, modern studio show designer inspired by the **Daslight 5** workflow, TaktLight strips out legacy USB-DMX hardware drivers and heavy 3D stage visualizers to focus on what matters for Ethernet lighting rigs: a deterministic **44 Hz Rust real-time engine**, **Art-Net v4** and **sACN (ANSI E1.31)** output, native **Open Fixture Library (OFL) `.json`** support, a **2D spatial fixture grid**, a normalized **float Trait-Space Mixer**, procedural **1D/2D FX blocks**, and audio-synced **Super Scene** timelines with offline transient detection.
+Designed as a streamlined, modern studio show designer inspired by the **Daslight 5** workflow, TaktLight strips out legacy USB-DMX hardware drivers and heavy 3D stage visualizers to focus on what matters for Ethernet lighting rigs: a deterministic **44 Hz Rust real-time engine**, **Art-Net v4** and **sACN (ANSI E1.31)** output, native **Open Fixture Library (OFL) `.json`** support, a **2D spatial fixture grid**, a normalized **float Trait-Space Mixer**, procedural **1D/2D FX blocks**, and audio-synced **Timelines** with offline transient detection.
 
 ---
 
@@ -30,8 +30,8 @@ Designed as a streamlined, modern studio show designer inspired by the **Dasligh
   * **1D Curve Oscillators:** `Sine`, `Triangle`, `Saw`, `Square`, and `Pulse` generators with phase spread (`0° to 360°`).
   * **2D Spatial Matrix Shaders:** `Linear Sweep`, `Radial Wave`, `Plasma`, and `Pinwheel` effects sampled directly at each cell's $(X, Y)$ canvas position.
   * **Dual Timing Modes:** Driven by either absolute time (`Hz` / `Seconds`) or musical tempo (`BPM` / `Beats`).
-* **Super Scene Timeline & Offline Transient Detection (Phase 2 Expansion):**
-  * DAW-style multi-track timeline synchronized to `.wav`, `.mp3`, and `.flac` audio playback with visual waveforms and draggable `FxBlock` clips.
+* **Multi-Track Timelines & Offline Transient Detection (Phase 2 Expansion):**
+  * DAW-style multi-track Timeline synchronized to `.wav`, `.mp3`, and `.flac` audio playback with visual waveforms and draggable `FxBlock` clips.
   * **Offline Spectral-Flux Transient Detection (`rustfft`):** Automatically extracts kick drum (`40–140 Hz`) and snare (`1.5–8 kHz`) onset markers in `<150 ms` offline so FX blocks snap directly to musical hits.
 * **Moving-Light Expansion & Stage Calibration (Phase 3 Future Roadmap):**
   * Deferred from v1 to keep initial development focused on LED/pixel/color fixtures; when added in Phase 3, includes 16-bit `Pan/Tilt` traits, XY Pad, Lissajous motion curves, and **Per-Fixture Physical Stage Calibration (`<StageBounds>` invert/swap/min-max bounding box)**.
