@@ -16,19 +16,27 @@ import {
   validateAndExpandOflLocally,
 } from "../lib/oflBuilder";
 import {
+  ColorPaletteDef,
+  DimmerPaletteDef,
+  evaluateSimulationLayersToDmx,
+  SmartControlLayer,
+} from "../lib/mixerLogic";
+import {
   CompiledCell,
   defaultCalibration,
   FixtureCalibration,
+  FixtureGroupDef,
   FixtureInstance,
   getFixtureFootprint,
   GridPos,
+  OrderRuleStr,
   previewPlacement,
   ShowStateDto,
   transformCellUv,
 } from "../lib/patchLogic";
 
 export type DisplayFormat = "DEC" | "HEX" | "PCT";
-export type WorkspaceTab = "monitor" | "patch" | "grid" | "fixtures";
+export type WorkspaceTab = "monitor" | "patch" | "grid" | "palettes" | "fixtures";
 
 export type ArtNetOutputMode =
   | { mode: "broadcast" }
@@ -108,6 +116,7 @@ export interface EngineSnapshotDto {
   grand_master: number;
   blackout: boolean;
   parked_channels: ParkedChannelDto[];
+  live_layers: SmartControlLayer[];
   universes: UniverseConfig[];
   interfaces: NetworkInterfaceInfo[];
   adapter_selection: AdapterSelection;
@@ -190,6 +199,28 @@ function createInitialShowState(): ShowStateDto {
       artsync: true,
       universes: DEFAULT_UNIVERSES,
     },
+    color_palettes: [
+      {
+        id: "pal_cyber",
+        name: "Cyberpunk Dual",
+        hex_start: "#FF5500",
+        hex_end: "#2255AA",
+      },
+      {
+        id: "pal_warm",
+        name: "Warm Tungsten",
+        hex_start: "#FFAA44",
+        hex_end: "#FF8822",
+      },
+    ],
+    dimmer_palettes: [
+      {
+        id: "dim_full",
+        name: "Full Intensity",
+        value_start: 1.0,
+        value_end: 1.0,
+      },
+    ],
     patch: [],
     groups: [],
   };
@@ -270,6 +301,7 @@ function createInitialState() {
     selectedFixtureId: shipped[0]?.summary.id ?? null,
 
     showState: createInitialShowState(),
+    liveLayers: [] as SmartControlLayer[],
     compiledCells: [] as CompiledCell[],
     cellPreviewRgbd: new Uint8Array(0),
     canUndo: false,
@@ -288,14 +320,27 @@ function createInitialState() {
 function synthesizeSimulationBuffer(state: {
   universes: UniverseConfig[];
   parkedChannels: Record<string, number>;
+  grandMaster: number;
+  blackout: boolean;
+  liveLayers: SmartControlLayer[];
   telemetry: TelemetrySummary;
   jitterSamplesUs: number[];
   showState: ShowStateDto;
   compiledCells: CompiledCell[];
   fixtureDetailsCache: Record<string, FixtureDetail>;
 }): ArrayBuffer {
-  const universeBuffers = state.universes.map((uni) => {
-    const dmx = new Uint8Array(DMX_UNIVERSE_CHANNELS);
+  const simOut = evaluateSimulationLayersToDmx({
+    show: state.showState,
+    fixtureDetailsCache: state.fixtureDetailsCache,
+    liveLayers: state.liveLayers,
+    universes: state.universes,
+    grandMaster: state.grandMaster,
+    blackout: state.blackout,
+    tSec: state.telemetry.tSec,
+  });
+
+  const universeBuffers = state.universes.map((uni, idx) => {
+    const dmx = simOut.dmxByUniverse[idx] ?? new Uint8Array(DMX_UNIVERSE_CHANNELS);
     for (const [key, val] of Object.entries(state.parkedChannels)) {
       const [uStr, chStr] = key.split(":");
       const uId = Number(uStr);
@@ -429,6 +474,17 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
     })
     .join("\n");
 
+  const paletteLines = [
+    ...show.color_palettes.map(
+      (p) =>
+        `    <ColorPalette id="${esc(p.id)}" name="${esc(p.name)}" hex_start="${esc(p.hex_start)}" hex_end="${esc(p.hex_end)}" />`,
+    ),
+    ...show.dimmer_palettes.map(
+      (d) =>
+        `    <DimmerPalette id="${esc(d.id)}" name="${esc(d.name)}" value_start="${d.value_start}" value_end="${d.value_end}" />`,
+    ),
+  ].join("\n");
+
   const patchLines = show.patch
     .map(
       (fx) => `    <FixtureInstance id="${esc(fx.id)}" profile="${esc(fx.profile)}" mode="${esc(fx.mode)}" name="${esc(fx.name)}" universe="${fx.universe}" address="${fx.address}" channel_count="${fx.channel_count}">
@@ -438,14 +494,29 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
     )
     .join("\n");
 
+  const groupLines = show.groups
+    .map((g) => {
+      const targetLines = g.targets
+        .map((t) => `      <Target ref="${esc(t)}" />`)
+        .join("\n");
+      return `    <Group id="${esc(g.id)}" name="${esc(g.name)}" order="${esc(g.order)}">\n${targetLines}\n    </Group>`;
+    })
+    .join("\n");
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <TaktLightShow version="1.0" name="${esc(show.name)}" bpm="${show.bpm}">
   <NetworkOutputs frame_rate_hz="${show.network_outputs.frame_rate_hz}" adapter="${esc(show.network_outputs.adapter)}" offline_fallback="${show.network_outputs.offline_fallback}" artsync="${show.network_outputs.artsync}">
 ${uniLines}
   </NetworkOutputs>
+  <Palettes>
+${paletteLines}
+  </Palettes>
   <Patch>
 ${patchLines}
   </Patch>
+  <Groups>
+${groupLines}
+  </Groups>
 </TaktLightShow>
 `;
 }
@@ -539,6 +610,41 @@ function parseShowXmlLocally(
     });
   });
 
+  const color_palettes: ColorPaletteDef[] = [];
+  root.querySelectorAll("Palettes > ColorPalette").forEach((el) => {
+    color_palettes.push({
+      id: el.getAttribute("id") ?? `pal_${color_palettes.length + 1}`,
+      name: el.getAttribute("name") ?? "Color Palette",
+      hex_start: el.getAttribute("hex_start") ?? "#FF5500",
+      hex_end: el.getAttribute("hex_end") ?? "#2255AA",
+    });
+  });
+
+  const dimmer_palettes: DimmerPaletteDef[] = [];
+  root.querySelectorAll("Palettes > DimmerPalette").forEach((el) => {
+    dimmer_palettes.push({
+      id: el.getAttribute("id") ?? `dim_${dimmer_palettes.length + 1}`,
+      name: el.getAttribute("name") ?? "Dimmer Palette",
+      value_start: Number(el.getAttribute("value_start") ?? 1),
+      value_end: Number(el.getAttribute("value_end") ?? 1),
+    });
+  });
+
+  const groups: FixtureGroupDef[] = [];
+  root.querySelectorAll("Groups > Group").forEach((el) => {
+    const targets: string[] = [];
+    el.querySelectorAll("Target").forEach((tEl) => {
+      const ref = tEl.getAttribute("ref");
+      if (ref) targets.push(ref);
+    });
+    groups.push({
+      id: el.getAttribute("id") ?? `grp_${groups.length + 1}`,
+      name: el.getAttribute("name") ?? "Group",
+      order: (el.getAttribute("order") as OrderRuleStr) ?? "linear",
+      targets,
+    });
+  });
+
   return {
     version,
     name,
@@ -552,8 +658,10 @@ function parseShowXmlLocally(
       artsync: true,
       universes: universes.length > 0 ? universes : DEFAULT_UNIVERSES,
     },
+    color_palettes,
+    dimmer_palettes,
     patch,
-    groups: [],
+    groups,
   };
 }
 
@@ -582,6 +690,7 @@ export interface TaktStoreState {
   selectedFixtureId: string | null;
 
   showState: ShowStateDto;
+  liveLayers: SmartControlLayer[];
   compiledCells: CompiledCell[];
   cellPreviewRgbd: Uint8Array;
   canUndo: boolean;
@@ -656,6 +765,13 @@ export interface TaktStoreState {
   redoShow: () => Promise<void>;
   exportShowXml: () => Promise<string>;
   importShowXml: (xmlStr: string) => Promise<void>;
+  upsertColorPalette: (palette: ColorPaletteDef) => Promise<void>;
+  deleteColorPalette: (id: string) => Promise<void>;
+  upsertDimmerPalette: (palette: DimmerPaletteDef) => Promise<void>;
+  deleteDimmerPalette: (id: string) => Promise<void>;
+  upsertGroup: (group: FixtureGroupDef) => Promise<void>;
+  deleteGroup: (id: string) => Promise<void>;
+  setLiveLayers: (layers: SmartControlLayer[]) => Promise<void>;
   selectFixtureInstance: (id: string | null) => void;
   setFocusedPatchUniverse: (universeId: number) => void;
   dismissToast: () => void;
@@ -707,6 +823,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         grandMaster: snapshot.grand_master,
         blackout: snapshot.blackout,
         parkedChannels: parked,
+        liveLayers: snapshot.live_layers ?? state.liveLayers,
         universes: snapshot.universes,
         dmxByUniverse: nextDmx,
         interfaces: snapshot.interfaces,
@@ -1484,6 +1601,169 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       canRedo: false,
     });
     get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  upsertColorPalette: async (palette) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>(
+        "upsert_color_palette_command",
+        { palette },
+      );
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const exists = prevShow.color_palettes.some((p) => p.id === palette.id);
+    const nextPalettes = exists
+      ? prevShow.color_palettes.map((p) => (p.id === palette.id ? palette : p))
+      : [...prevShow.color_palettes, palette];
+    set({
+      showState: { ...prevShow, color_palettes: nextPalettes },
+      patchToast: `Saved color palette ${palette.name}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  deleteColorPalette: async (id) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>(
+        "delete_color_palette_command",
+        { id },
+      );
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    set({
+      showState: {
+        ...prevShow,
+        color_palettes: prevShow.color_palettes.filter((p) => p.id !== id),
+      },
+      patchToast: `Deleted color palette ${id}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  upsertDimmerPalette: async (palette) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>(
+        "upsert_dimmer_palette_command",
+        { palette },
+      );
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const exists = prevShow.dimmer_palettes.some((p) => p.id === palette.id);
+    const nextPalettes = exists
+      ? prevShow.dimmer_palettes.map((p) => (p.id === palette.id ? palette : p))
+      : [...prevShow.dimmer_palettes, palette];
+    set({
+      showState: { ...prevShow, dimmer_palettes: nextPalettes },
+      patchToast: `Saved dimmer palette ${palette.name}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  deleteDimmerPalette: async (id) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>(
+        "delete_dimmer_palette_command",
+        { id },
+      );
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    set({
+      showState: {
+        ...prevShow,
+        dimmer_palettes: prevShow.dimmer_palettes.filter((p) => p.id !== id),
+      },
+      patchToast: `Deleted dimmer palette ${id}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  upsertGroup: async (group) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>("upsert_group_command", {
+        group,
+      });
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    const exists = prevShow.groups.some((g) => g.id === group.id);
+    const nextGroups = exists
+      ? prevShow.groups.map((g) => (g.id === group.id ? group : g))
+      : [...prevShow.groups, group];
+    set({
+      showState: { ...prevShow, groups: nextGroups },
+      patchToast: `Saved group ${group.name}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  deleteGroup: async (id) => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>("delete_group_command", {
+        id,
+      });
+      get().applyShowSnapshot(snapshot);
+      return;
+    }
+    const state = get();
+    const prevShow = structuredClone(state.showState);
+    set({
+      showState: {
+        ...prevShow,
+        groups: prevShow.groups.filter((g) => g.id !== id),
+      },
+      patchToast: `Deleted group ${id}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  setLiveLayers: async (layers) => {
+    set({ liveLayers: layers });
+    if (isTauriEnvironment()) {
+      const snap = await invoke<EngineSnapshotDto>("set_live_layers_command", {
+        layers,
+      });
+      get().applyEngineSnapshot(snap);
+    } else {
+      get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    }
   },
 
   selectFixtureInstance: (id) => set({ selectedFixtureInstanceId: id }),

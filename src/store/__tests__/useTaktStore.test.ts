@@ -153,4 +153,84 @@ describe("useTaktStore", () => {
     await useTaktStore.getState().importShowXml(xml);
     expect(useTaktStore.getState().showState.patch).toHaveLength(1);
   });
+
+  it("manages referenceable palettes, groups, and live layers with quantized DMX + XML round-trip", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube Live",
+        1,
+        1,
+        1,
+      );
+
+    await useTaktStore.getState().upsertColorPalette({
+      id: "pal_pure_white",
+      name: "Pure White",
+      hex_start: "#FFFFFF",
+      hex_end: "#FFFFFF",
+    });
+    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(3);
+
+    await useTaktStore.getState().undoShow();
+    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(2);
+    await useTaktStore.getState().redoShow();
+    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(3);
+
+    await useTaktStore.getState().upsertGroup({
+      id: "grp_tube",
+      name: "Tube Group",
+      order: "mirror",
+      targets: ["fx_001:0..7"],
+    });
+
+    await useTaktStore.getState().setLiveLayers([
+      {
+        id: "l_dim",
+        name: "Dim",
+        enabled: true,
+        priority: 1,
+        trigger_order: 1,
+        alpha: 1,
+        target: "grp_tube",
+        order_override: null,
+        trait_spec: {
+          trait_kind: "dimmer",
+          op: "htp",
+          palette_ref: "dim_full",
+          value_start: 1,
+          value_end: 1,
+        },
+      },
+      {
+        id: "l_col",
+        name: "Col",
+        enabled: true,
+        priority: 1,
+        trigger_order: 2,
+        alpha: 1,
+        target: "grp_tube",
+        order_override: null,
+        trait_spec: {
+          trait_kind: "color",
+          op: "ltp",
+          palette_ref: "pal_pure_white",
+          hex_start: "#000000",
+          hex_end: "#000000",
+        },
+      },
+    ]);
+
+    const state = useTaktStore.getState();
+    // Ch 1 = Master Dimmer (255 untouched fallback), Ch 6 = Pixel 1 White (255 in replace mode)
+    expect(state.dmxByUniverse[1][0]).toBe(255);
+    expect(state.dmxByUniverse[1][5]).toBe(255);
+    expect(state.cellPreviewRgbd[0]).toBe(255);
+
+    const xml = await state.exportShowXml();
+    expect(xml).toContain('id="pal_pure_white"');
+    expect(xml).toContain('id="grp_tube"');
+  });
 });

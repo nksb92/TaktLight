@@ -1,4 +1,5 @@
 import type { UniverseConfig } from "../store/useTaktStore";
+import type { ColorPaletteDef, DimmerPaletteDef } from "./mixerLogic";
 
 export type WhiteMode = "replace" | "add" | "off";
 export type OrderRuleStr =
@@ -65,6 +66,8 @@ export interface ShowStateDto {
     artsync: boolean;
     universes: UniverseConfig[];
   };
+  color_palettes: ColorPaletteDef[];
+  dimmer_palettes: DimmerPaletteDef[];
   patch: FixtureInstance[];
   groups: FixtureGroupDef[];
 }

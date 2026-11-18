@@ -1,3 +1,6 @@
+use crate::mixer::quantizer::quantize_fixture_to_dmx;
+pub use crate::mixer::quantizer::QuantizerState;
+use crate::mixer::traits::evaluate_layer_stack;
 use crate::ofl::expander::{ChannelRole, ChannelTarget};
 use crate::ofl::model::OflColor;
 use crate::state::plan::RenderPlan;
@@ -7,11 +10,6 @@ use crate::state::runtime::RuntimeControl;
 pub struct ClockInput {
     pub t_sec: f64,
     pub frame_index: u64,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct QuantizerState {
-    pub prev_t_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +35,7 @@ impl Engine {
         runtime: &RuntimeControl,
         quantizer_state: &mut QuantizerState,
     ) -> EvaluatedFrame {
-        quantizer_state.prev_t_sec = Some(clock.t_sec);
+        quantizer_state.prepare_for_time(clock.t_sec);
 
         let master_scale = if runtime.blackout {
             0.0
@@ -58,17 +56,53 @@ impl Engine {
                 }
             }
 
-            // Stage 4 Step 7: Session-only Channel Park overrides everything including Blackout
-            for (&(parked_uni, parked_ch), &parked_val) in &runtime.parked_channels {
-                if parked_uni == uni_cfg.id && (1..=512).contains(&parked_ch) {
-                    dmx[(parked_ch - 1) as usize] = parked_val;
-                }
-            }
-
             universes.push(EvaluatedUniverse {
                 universe_id: uni_cfg.id,
                 dmx,
             });
+        }
+
+        // Stages 1 to 4: Layer Stack -> Trait-Space Mixer -> Hardware Quantizer
+        if !plan.fixtures.is_empty()
+            && (!plan.static_layers.is_empty() || !runtime.live_layers.is_empty())
+        {
+            let combined_layers: Vec<_> = plan
+                .static_layers
+                .iter()
+                .cloned()
+                .chain(runtime.live_layers.iter().cloned())
+                .collect();
+            let (fx_states, cell_states) =
+                evaluate_layer_stack(plan, &combined_layers, runtime.grand_master, runtime.blackout);
+
+            for (fx_idx, fixture) in plan.fixtures.iter().enumerate() {
+                quantize_fixture_to_dmx(
+                    fx_idx,
+                    fixture,
+                    &fx_states[fx_idx],
+                    &cell_states,
+                    clock.t_sec,
+                    quantizer_state,
+                    |slot, val| {
+                        if let Some(u_idx) = slot.universe_index {
+                            if let Some(u) = universes.get_mut(u_idx) {
+                                if (1..=512).contains(&slot.dmx_address) {
+                                    u.dmx[(slot.dmx_address - 1) as usize] = val;
+                                }
+                            }
+                        }
+                    },
+                );
+            }
+        }
+
+        // Stage 4 Step 7: Session-only Channel Park overrides everything including Blackout
+        for (idx, uni_cfg) in plan.universes.iter().enumerate() {
+            for (&(parked_uni, parked_ch), &parked_val) in &runtime.parked_channels {
+                if parked_uni == uni_cfg.id && (1..=512).contains(&parked_ch) {
+                    universes[idx].dmx[(parked_ch - 1) as usize] = parked_val;
+                }
+            }
         }
 
         // Compute cell preview RGBD bytes from live DMX output (supports Channel Park visualization on 2D grid!)
@@ -171,6 +205,8 @@ impl Engine {
             }
         }
 
+        quantizer_state.commit_time(clock.t_sec);
+
         EvaluatedFrame {
             revision: plan.revision,
             t_sec: clock.t_sec,
@@ -211,5 +247,104 @@ mod tests {
         assert_eq!(frame_bo.universes[0].dmx[0], 0);
         assert_eq!(frame_bo.universes[0].dmx[1], 255);
         assert_eq!(frame_bo.universes[1].dmx[4], 0);
+    }
+
+    #[test]
+    fn evaluates_live_layers_with_palettes_rgbw_deadzone_and_park_override() {
+        use crate::mixer::traits::{MergeOp, SmartControlLayer, SmartLayerTrait};
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance, WhiteMode};
+        use crate::show::spatial::GridPos;
+        use crate::show::xml::{ColorPaletteDef, DimmerPaletteDef, ShowState};
+
+        let library = FixtureLibrary::load(None);
+        let mut show = ShowState::default();
+        show.color_palettes.push(ColorPaletteDef {
+            id: "pal_white".into(),
+            name: "Pure White".into(),
+            hex_start: "#FFFFFF".into(),
+            hex_end: "#FFFFFF".into(),
+        });
+        show.dimmer_palettes.push(DimmerPaletteDef {
+            id: "dim_full".into(),
+            name: "Full".into(),
+            value_start: 1.0,
+            value_end: 1.0,
+        });
+        show.patch.push(FixtureInstance {
+            id: "fx_tube".into(),
+            profile: "age/rlcv3_8_segment_tube.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Tube 1".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos::default(),
+            calibration: FixtureCalibration {
+                gamma: 2.2,
+                min_dimmer_dmx: 10,
+                max_dimmer_dmx: 255,
+                white_mode: WhiteMode::Replace,
+                white_gain: 1.0,
+            },
+        });
+
+        let plan = compile_render_plan(1, &show, &library).unwrap();
+        let mut runtime = RuntimeControl::new();
+        runtime.set_live_layers(vec![
+            SmartControlLayer {
+                id: "l_dim".into(),
+                name: "Full Dimmer".into(),
+                enabled: true,
+                priority: 1,
+                trigger_order: 1,
+                alpha: 1.0,
+                target: "all".into(),
+                order_override: None,
+                trait_spec: SmartLayerTrait::Dimmer {
+                    op: MergeOp::Htp,
+                    palette_ref: Some("dim_full".into()),
+                    value_start: 0.0,
+                    value_end: 0.0,
+                },
+            },
+            SmartControlLayer {
+                id: "l_col".into(),
+                name: "White Palette".into(),
+                enabled: true,
+                priority: 1,
+                trigger_order: 2,
+                alpha: 1.0,
+                target: "fx_tube".into(),
+                order_override: None,
+                trait_spec: SmartLayerTrait::Color {
+                    op: MergeOp::Ltp,
+                    palette_ref: Some("pal_white".into()),
+                    hex_start: "#000000".into(),
+                    hex_end: "#000000".into(),
+                },
+            },
+        ]);
+
+        let clock = ClockInput {
+            t_sec: 0.0,
+            frame_index: 1,
+        };
+        let mut q = QuantizerState::default();
+        let frame = Engine::evaluate_frame(&plan, &clock, &runtime, &mut q);
+
+        // Ch1 = Master Dimmer (fallback 1.0 -> 255), Ch2 = Strobe Open (default 0)
+        // Cell 1 RGBW (Ch3..Ch6): pure white with WhiteMode::Replace -> R=0, G=0, B=0, W=255
+        assert_eq!(frame.universes[0].dmx[0], 255);
+        assert_eq!(frame.universes[0].dmx[2], 0);
+        assert_eq!(frame.universes[0].dmx[3], 0);
+        assert_eq!(frame.universes[0].dmx[4], 0);
+        assert_eq!(frame.universes[0].dmx[5], 255);
+
+        // Park override still overrides Ch3
+        runtime.set_park(1, 3, Some(123)).unwrap();
+        let parked = Engine::evaluate_frame(&plan, &clock, &runtime, &mut q);
+        assert_eq!(parked.universes[0].dmx[2], 123);
     }
 }

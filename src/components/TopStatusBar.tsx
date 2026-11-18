@@ -7,6 +7,7 @@ import {
   Lock,
   Monitor,
   Network,
+  Palette,
   Radio,
   ShieldAlert,
 } from "lucide-react";
@@ -118,6 +119,20 @@ export function TopStatusBar() {
           >
             <LayoutGrid className="w-3.5 h-3.5" />
             <span>2D Grid</span>
+          </button>
+
+          <button
+            type="button"
+            aria-pressed={activeTab === "palettes"}
+            onClick={() => setActiveTab("palettes")}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded font-sans text-xs font-medium transition-colors ${
+              activeTab === "palettes"
+                ? "bg-ember text-frost"
+                : "text-fog hover:text-mist"
+            }`}
+          >
+            <Palette className="w-3.5 h-3.5" />
+            <span>Palettes &amp; Controls</span>
           </button>
 
           <button

@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::mixer::traits::SmartControlLayer;
+
 #[derive(Debug, Error)]
 pub enum StateError {
     #[error("invalid universe id {0}: expected >= 1")]
@@ -16,6 +18,8 @@ pub struct RuntimeControl {
     pub grand_master: f32,
     pub blackout: bool,
     pub parked_channels: BTreeMap<(u16, u16), u8>,
+    #[serde(default)]
+    pub live_layers: Vec<SmartControlLayer>,
 }
 
 impl Default for RuntimeControl {
@@ -24,6 +28,7 @@ impl Default for RuntimeControl {
             grand_master: 1.0,
             blackout: false,
             parked_channels: BTreeMap::new(),
+            live_layers: Vec::new(),
         }
     }
 }
@@ -73,6 +78,10 @@ impl RuntimeControl {
             return;
         }
         self.grand_master = value.clamp(0.0, 1.0);
+    }
+
+    pub fn set_live_layers(&mut self, layers: Vec<SmartControlLayer>) {
+        self.live_layers = layers;
     }
 }
 

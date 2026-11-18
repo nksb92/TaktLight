@@ -575,6 +575,7 @@ mod tests {
             fixtures: Vec::new(),
             cells: Vec::new(),
             groups: Vec::new(),
+            ..RenderPlan::default()
         };
         let f2 = Engine::evaluate_frame(
             &artnet_only,

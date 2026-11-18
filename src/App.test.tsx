@@ -1,6 +1,10 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import App from "./App";
+import {
+  buildOflFixtureJson,
+  createDefaultBuilderDraft,
+} from "./lib/oflBuilder";
 import { useTaktStore } from "./store/useTaktStore";
 
 describe("TaktLight Slice 1 Studio UI", () => {
@@ -214,5 +218,134 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
     expect(preview).toHaveTextContent("Cell 7");
     expect(preview).toHaveTextContent("Cell 0");
     expect(preview).toHaveTextContent("u=1.00");
+  });
+});
+
+describe("TaktLight Slice 4 Palettes & Smart Controls UI", () => {
+  beforeEach(() => {
+    useTaktStore.getState().resetForTest();
+  });
+
+  it("creates referenceable palettes with Undo/Redo, stacks live layers, and quantizes RGBW DMX output", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube Stage",
+        1,
+        1,
+        1,
+      );
+
+    render(<App />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Palettes & Controls/i }),
+    );
+
+    // Create Color Palette (#FFFFFF .. #FFFFFF)
+    fireEvent.change(screen.getByLabelText("Color Palette Name"), {
+      target: { value: "Studio Pure White" },
+    });
+    fireEvent.change(screen.getByLabelText("Color Start Hex"), {
+      target: { value: "#FFFFFF" },
+    });
+    fireEvent.change(screen.getByLabelText("Color End Hex"), {
+      target: { value: "#FFFFFF" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: /Save Color Palette/i }),
+    );
+    expect(screen.getByText("Studio Pure White")).toBeInTheDocument();
+
+    // Create Dimmer Palette (0.5 .. 0.5) and verify Undo / Redo
+    fireEvent.change(screen.getByLabelText("Dimmer Palette Name"), {
+      target: { value: "Half Intensity" },
+    });
+    fireEvent.change(screen.getByLabelText("Dimmer Start Value"), {
+      target: { value: "0.5" },
+    });
+    fireEvent.change(screen.getByLabelText("Dimmer End Value"), {
+      target: { value: "0.5" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: /Save Dimmer Palette/i }),
+    );
+    expect(screen.getByText("Half Intensity")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Undo$/i }));
+    expect(screen.queryByText("Half Intensity")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Redo$/i }));
+    expect(screen.getByText("Half Intensity")).toBeInTheDocument();
+
+    const createdColorPal = useTaktStore
+      .getState()
+      .showState.color_palettes.find((p) => p.name === "Studio Pure White")!;
+    const createdDimPal = useTaktStore
+      .getState()
+      .showState.dimmer_palettes.find((p) => p.name === "Half Intensity")!;
+
+    // Stack Dimmer HTP layer + Color LTP layer
+    fireEvent.click(screen.getByRole("button", { name: /Add Dimmer Layer/i }));
+    fireEvent.change(screen.getByLabelText("Layer 1 Palette"), {
+      target: { value: createdDimPal.id },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Add Color Layer/i }));
+    fireEvent.change(screen.getByLabelText("Layer 2 Palette"), {
+      target: { value: createdColorPal.id },
+    });
+    fireEvent.change(screen.getByLabelText("Layer 2 Order"), {
+      target: { value: "mirror" },
+    });
+
+    const dmx = useTaktStore.getState().dmxByUniverse[1];
+    // Master Dimmer Ch1 falls back to 255; Cell 1 White Ch6 receives quantized RGBW Replace White > 0
+    expect(dmx[0]).toBe(255);
+    expect(dmx[2]).toBe(0);
+    expect(dmx[5]).toBeGreaterThan(0);
+    expect(useTaktStore.getState().cellPreviewRgbd[0]).toBeGreaterThan(0);
+    expect(screen.getByTestId("live-cell-preview")).toBeInTheDocument();
+  });
+
+  it("flags software strobe cap warning when requesting > 11 Hz on a fixture without hardware ShutterStrobe", async () => {
+    const draft = createDefaultBuilderDraft();
+    draft.name = "Basic RGB Par";
+    draft.shortName = "RGBPar";
+    draft.includeStrobe = false;
+    draft.isMatrix = false;
+    draft.colorMode = "rgb";
+    draft.modeName = "4ch Par";
+    const res = await useTaktStore
+      .getState()
+      .saveUserFixture("Basic RGB Par", buildOflFixtureJson(draft));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    await useTaktStore
+      .getState()
+      .patchFixtures(res.detail.summary.id, "4ch Par", "Par 1", 1, 1, 1);
+
+    render(<App />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Palettes & Controls/i }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: /Add Shutter Layer/i }),
+    );
+
+    fireEvent.change(screen.getByLabelText("Layer 1 Shutter Mode"), {
+      target: { value: "strobe_hz" },
+    });
+    fireEvent.change(screen.getByLabelText("Layer 1 Strobe Hz"), {
+      target: { value: "16" },
+    });
+
+    expect(
+      screen.getByText(/SOFTWARE STROBE CAPPED AT 11 HZ/i),
+    ).toBeInTheDocument();
   });
 });
