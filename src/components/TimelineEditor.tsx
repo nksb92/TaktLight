@@ -351,19 +351,14 @@ export function TimelineEditor() {
     currentTimeline?.audio_track?.transient_sensitivity ?? 0.65;
 
   return (
-    <div className="flex flex-col gap-4 p-4">
+    <div className="flex flex-col gap-4">
       {/* Header Transport & Clock Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-slate border border-steel rounded-panel px-4 py-3">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
           <AudioWaveform className="w-4 h-4 text-plum" />
-          <div>
-            <h2 className="font-sans text-sm font-semibold text-frost">
-              Multi Track Audio Timeline
-            </h2>
-            <p className="font-mono text-xs text-fog">
-              Interpolated Audio Clock | Spectral Flux Transients | Beat Grid Snap
-            </p>
-          </div>
+          <h2 className="font-sans text-sm font-semibold text-frost">
+            Multi Track Audio Timeline
+          </h2>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -621,7 +616,7 @@ export function TimelineEditor() {
 
               {currentTimeline.tracks.length === 0 ? (
                 <div className="bg-pitch border border-steel rounded p-3 font-mono text-xs text-fog">
-                  No tracks yet. Add a track on the right to schedule FX clips.
+                  No tracks defined.
                 </div>
               ) : (
                 <div className="flex flex-col gap-2">

@@ -239,9 +239,8 @@ export function DmxMonitor() {
           <div className="h-[2px] w-10 bg-ember mt-1.5 mb-3" />
 
           {selectedChannel === null ? (
-            <p className="font-sans text-xs text-fog leading-relaxed">
-              Click any channel cell in the 512 channel grid to inspect its live
-              byte value or apply a session only Channel Park override.
+            <p className="font-mono text-xs text-fog">
+              Select a channel cell.
             </p>
           ) : (
             <div className="flex flex-col gap-3">

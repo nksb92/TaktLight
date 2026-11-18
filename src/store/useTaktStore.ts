@@ -56,6 +56,7 @@ export type DisplayFormat = "DEC" | "HEX" | "PCT";
 export type WorkspaceTab =
   | "monitor"
   | "patch"
+  | "studio"
   | "grid"
   | "palettes"
   | "scenes"

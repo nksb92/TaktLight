@@ -1,11 +1,10 @@
 import { useEffect } from "react";
+import { BottomNavBar } from "./components/BottomNavBar";
 import { DmxMonitor } from "./components/DmxMonitor";
 import { FixtureBuilder } from "./components/FixtureBuilder";
-import { FixtureGrid2D } from "./components/FixtureGrid2D";
 import { JitterHistogram } from "./components/JitterHistogram";
-import { PalettesAndControls } from "./components/PalettesAndControls";
 import { PatchView } from "./components/PatchView";
-import { SceneAndFxManager } from "./components/SceneAndFxManager";
+import { StudioWorkspace } from "./components/StudioWorkspace";
 import { TimelineEditor } from "./components/TimelineEditor";
 import { TopStatusBar } from "./components/TopStatusBar";
 import { useTaktStore } from "./store/useTaktStore";
@@ -22,6 +21,12 @@ export function App() {
     };
   }, [initEngineConnection]);
 
+  const isStudio =
+    activeTab === "studio" ||
+    activeTab === "grid" ||
+    activeTab === "palettes" ||
+    activeTab === "scenes";
+
   return (
     <div className="min-h-screen bg-void text-mist font-sans flex flex-col">
       <TopStatusBar />
@@ -33,12 +38,11 @@ export function App() {
           </>
         )}
         {activeTab === "patch" && <PatchView />}
-        {activeTab === "grid" && <FixtureGrid2D />}
-        {activeTab === "palettes" && <PalettesAndControls />}
-        {activeTab === "scenes" && <SceneAndFxManager />}
+        {isStudio && <StudioWorkspace />}
         {activeTab === "timeline" && <TimelineEditor />}
         {activeTab === "fixtures" && <FixtureBuilder />}
       </main>
+      <BottomNavBar />
     </div>
   );
 }

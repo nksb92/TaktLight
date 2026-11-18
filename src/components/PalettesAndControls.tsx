@@ -38,7 +38,11 @@ function slugId(prefix: string, name: string, existingIds: string[]): string {
 
 const OKLAB_STOPS = [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1];
 
-export function PalettesAndControls() {
+export function PalettesAndControls({
+  hideUndoRedo = false,
+}: {
+  hideUndoRedo?: boolean;
+}) {
   const showState = useTaktStore((s) => s.showState);
   const liveLayers = useTaktStore((s) => s.liveLayers);
   const compiledCells = useTaktStore((s) => s.compiledCells);
@@ -244,26 +248,28 @@ export function PalettesAndControls() {
             </span>
           )}
         </div>
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            disabled={!canUndo}
-            onClick={() => void undoShow()}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-ember disabled:opacity-40"
-          >
-            <Undo2 className="w-3.5 h-3.5" />
-            <span>Undo</span>
-          </button>
-          <button
-            type="button"
-            disabled={!canRedo}
-            onClick={() => void redoShow()}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-ember disabled:opacity-40"
-          >
-            <Redo2 className="w-3.5 h-3.5" />
-            <span>Redo</span>
-          </button>
-        </div>
+        {!hideUndoRedo && (
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              disabled={!canUndo}
+              onClick={() => void undoShow()}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-ember disabled:opacity-40"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+              <span>Undo</span>
+            </button>
+            <button
+              type="button"
+              disabled={!canRedo}
+              onClick={() => void redoShow()}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-ember disabled:opacity-40"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+              <span>Redo</span>
+            </button>
+          </div>
+        )}
       </section>
 
       {/* Palettes & Groups Row */}
@@ -654,7 +660,7 @@ export function PalettesAndControls() {
 
         {liveLayers.length === 0 ? (
           <p className="font-mono text-xs text-fog">
-            Add a live layer above to test trait mixing (HTP, LTP, Add, Scale), OKLAB palette gradients, and hardware quantization.
+            No active layers.
           </p>
         ) : (
           <div className="flex flex-col gap-2">
@@ -1033,9 +1039,6 @@ export function PalettesAndControls() {
           <h3 className="font-sans text-sm font-semibold text-frost">
             Live Evaluated Cell Output ({compiledCells.length} cells)
           </h3>
-          <span className="font-mono text-[11px] text-fog">
-            Linear light mix + OKLAB palette + Gamma quantization
-          </span>
         </div>
 
         <div
@@ -1044,7 +1047,7 @@ export function PalettesAndControls() {
         >
           {compiledCells.length === 0 ? (
             <span className="font-mono text-xs text-fog">
-              Patch fixtures to preview evaluated cells here and on the 2D Grid.
+              No patched cells.
             </span>
           ) : (
             compiledCells.map((cell, idx) => {

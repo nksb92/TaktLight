@@ -1,4 +1,4 @@
-import { Undo2, Redo2 } from "lucide-react";
+import { Redo2, RotateCw, Undo2 } from "lucide-react";
 import { type PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   computeOrderU,
@@ -10,8 +10,13 @@ import { useTaktStore } from "../store/useTaktStore";
 
 const CANVAS_WIDTH = 720;
 const CANVAS_HEIGHT = 420;
+const ROTATION_HANDLE_NORM_RADIUS = 0.065;
 
-export function FixtureGrid2D() {
+export function FixtureGrid2D({
+  hideUndoRedo = false,
+}: {
+  hideUndoRedo?: boolean;
+}) {
   const showState = useTaktStore((s) => s.showState);
   const compiledCells = useTaktStore((s) => s.compiledCells);
   const cellPreviewRgbd = useTaktStore((s) => s.cellPreviewRgbd);
@@ -28,7 +33,10 @@ export function FixtureGrid2D() {
   const redoShow = useTaktStore((s) => s.redoShow);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragState, setDragState] = useState<{
+    fixtureId: string;
+    mode: "move" | "rotate";
+  } | null>(null);
 
   const selectedFixture = useMemo(
     () =>
@@ -130,7 +138,7 @@ export function FixtureGrid2D() {
       ctx.stroke();
     });
 
-    // Draw fixture anchor markers and labels
+    // Draw fixture anchor markers, rotation handle, and labels
     for (const fx of showState.patch) {
       const fxX = fx.grid_pos.x * w;
       const fxY = fx.grid_pos.y * h;
@@ -140,6 +148,23 @@ export function FixtureGrid2D() {
       ctx.beginPath();
       ctx.arc(fxX, fxY, 3, 0, Math.PI * 2);
       ctx.fill();
+
+      if (isSelected) {
+        const rad = (fx.grid_pos.rotation * Math.PI) / 180;
+        const hx = fxX + Math.cos(rad) * (ROTATION_HANDLE_NORM_RADIUS * w);
+        const hy = fxY + Math.sin(rad) * (ROTATION_HANDLE_NORM_RADIUS * h);
+        ctx.strokeStyle = "#FF5500";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(fxX, fxY);
+        ctx.lineTo(hx, hy);
+        ctx.stroke();
+
+        ctx.fillStyle = "#FF5500";
+        ctx.beginPath();
+        ctx.arc(hx, hy, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
 
       ctx.font = "11px monospace";
       ctx.fillStyle = isSelected ? "#FF6B2B" : "#94A3B8";
@@ -159,6 +184,22 @@ export function FixtureGrid2D() {
 
   const handlePointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
     const pos = toNormalizedCanvasPos(e);
+
+    if (selectedFixture) {
+      const rad = (selectedFixture.grid_pos.rotation * Math.PI) / 180;
+      const hx =
+        selectedFixture.grid_pos.x +
+        Math.cos(rad) * ROTATION_HANDLE_NORM_RADIUS;
+      const hy =
+        selectedFixture.grid_pos.y +
+        Math.sin(rad) * ROTATION_HANDLE_NORM_RADIUS;
+      if (Math.hypot(hx - pos.x, hy - pos.y) < 0.05) {
+        setDragState({ fixtureId: selectedFixture.id, mode: "rotate" });
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        return;
+      }
+    }
+
     let closestId: string | null = null;
     let bestDist = 0.12;
 
@@ -184,25 +225,37 @@ export function FixtureGrid2D() {
 
     if (closestId) {
       selectFixtureInstance(closestId);
-      setDraggingId(closestId);
+      setDragState({ fixtureId: closestId, mode: "move" });
       e.currentTarget.setPointerCapture?.(e.pointerId);
     }
   };
 
   const handlePointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
-    if (!draggingId) return;
-    const fx = showState.patch.find((f) => f.id === draggingId);
+    if (!dragState) return;
+    const fx = showState.patch.find((f) => f.id === dragState.fixtureId);
     if (!fx) return;
     const pos = toNormalizedCanvasPos(e);
-    void updateFixtureGridPos(
-      fx.id,
-      { ...fx.grid_pos, x: pos.x, y: pos.y },
-      `grid_${fx.id}`,
-    );
+    if (dragState.mode === "rotate") {
+      const rawDeg =
+        (Math.atan2(pos.y - fx.grid_pos.y, pos.x - fx.grid_pos.x) * 180) /
+        Math.PI;
+      const normalizedDeg = Math.round(((rawDeg % 360) + 360) % 360);
+      void updateFixtureGridPos(
+        fx.id,
+        { ...fx.grid_pos, rotation: normalizedDeg },
+        `grid_${fx.id}`,
+      );
+    } else {
+      void updateFixtureGridPos(
+        fx.id,
+        { ...fx.grid_pos, x: pos.x, y: pos.y },
+        `grid_${fx.id}`,
+      );
+    }
   };
 
   const handlePointerUp = () => {
-    setDraggingId(null);
+    setDragState(null);
   };
 
   const updateGridField = (patch: Partial<GridPos>) => {
@@ -245,34 +298,31 @@ export function FixtureGrid2D() {
       {/* Left 2 Columns: Interactive 2D Normalized Layout Canvas */}
       <section className="xl:col-span-2 bg-slate border border-steel rounded-panel p-3 flex flex-col gap-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h2 className="font-sans text-sm font-semibold text-frost">
-              2D Spatial Fixture Canvas
-            </h2>
-            <p className="font-mono text-[11px] text-fog">
-              Normalized stage coordinates [0.0..1.0]. Drag fixtures on canvas or tune transform values.
-            </p>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              disabled={!canUndo}
-              onClick={() => void undoShow()}
-              className="flex items-center gap-1 px-2.5 py-1 rounded bg-ink border border-steel text-xs text-mist hover:border-ember disabled:opacity-40"
-            >
-              <Undo2 className="w-3.5 h-3.5" />
-              <span>Undo</span>
-            </button>
-            <button
-              type="button"
-              disabled={!canRedo}
-              onClick={() => void redoShow()}
-              className="flex items-center gap-1 px-2.5 py-1 rounded bg-ink border border-steel text-xs text-mist hover:border-ember disabled:opacity-40"
-            >
-              <Redo2 className="w-3.5 h-3.5" />
-              <span>Redo</span>
-            </button>
-          </div>
+          <h2 className="font-sans text-sm font-semibold text-frost">
+            2D Spatial Fixture Canvas
+          </h2>
+          {!hideUndoRedo && (
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                disabled={!canUndo}
+                onClick={() => void undoShow()}
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-ink border border-steel text-xs text-mist hover:border-ember disabled:opacity-40"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                <span>Undo</span>
+              </button>
+              <button
+                type="button"
+                disabled={!canRedo}
+                onClick={() => void redoShow()}
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-ink border border-steel text-xs text-mist hover:border-ember disabled:opacity-40"
+              >
+                <Redo2 className="w-3.5 h-3.5" />
+                <span>Redo</span>
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="bg-void border border-steel rounded overflow-hidden flex items-center justify-center p-2">
@@ -292,7 +342,7 @@ export function FixtureGrid2D() {
         <div className="flex flex-wrap items-center gap-1.5">
           {showState.patch.length === 0 ? (
             <span className="font-mono text-xs text-fog">
-              No fixtures patched yet. Add fixtures in Patch View first.
+              No patched fixtures.
             </span>
           ) : (
             showState.patch.map((fx) => {
@@ -333,7 +383,7 @@ export function FixtureGrid2D() {
 
           {!selectedFixture ? (
             <p className="font-mono text-xs text-fog">
-              Select a patched fixture to edit GridPos coordinates.
+              Select a fixture.
             </p>
           ) : (
             <div className="grid grid-cols-2 gap-2.5">
@@ -385,26 +435,60 @@ export function FixtureGrid2D() {
                 />
               </div>
 
-              <div className="flex flex-col gap-1">
-                <label
-                  htmlFor="grid-rotation"
-                  className="text-[11px] font-mono uppercase text-fog"
-                >
-                  Grid Rotation (deg)
-                </label>
-                <input
-                  id="grid-rotation"
-                  aria-label="Grid Rotation"
-                  type="number"
-                  min={0}
-                  max={360}
-                  step={1}
-                  value={selectedFixture.grid_pos.rotation}
-                  onChange={(e) =>
-                    updateGridField({ rotation: Number(e.target.value) || 0 })
-                  }
-                  className="bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost focus:outline-none focus:border-ember"
-                />
+              <div className="flex flex-col gap-1 col-span-2">
+                <div className="flex items-center justify-between">
+                  <label
+                    htmlFor="grid-rotation"
+                    className="text-[11px] font-mono uppercase text-fog"
+                  >
+                    Grid Rotation (deg)
+                  </label>
+                  <button
+                    type="button"
+                    aria-label="Rotate 90 Degrees"
+                    onClick={() =>
+                      updateGridField({
+                        rotation:
+                          (((selectedFixture.grid_pos.rotation + 90) % 360) +
+                            360) %
+                          360,
+                      })
+                    }
+                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-ink border border-steel text-[11px] font-mono text-mist hover:border-ember"
+                  >
+                    <RotateCw className="w-3 h-3 text-ember" />
+                    <span>+90°</span>
+                  </button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="grid-rotation"
+                    aria-label="Grid Rotation"
+                    type="number"
+                    min={0}
+                    max={360}
+                    step={1}
+                    value={selectedFixture.grid_pos.rotation}
+                    onChange={(e) =>
+                      updateGridField({ rotation: Number(e.target.value) || 0 })
+                    }
+                    className="w-20 bg-ink border border-steel rounded px-2 py-1 text-xs font-mono text-frost focus:outline-none focus:border-ember"
+                  />
+                  <input
+                    aria-label="Grid Rotation Slider"
+                    type="range"
+                    min={0}
+                    max={359}
+                    step={1}
+                    value={
+                      (((selectedFixture.grid_pos.rotation % 360) + 360) % 360)
+                    }
+                    onChange={(e) =>
+                      updateGridField({ rotation: Number(e.target.value) || 0 })
+                    }
+                    className="flex-1 accent-ember cursor-pointer"
+                  />
+                </div>
               </div>
 
               <div className="flex flex-col gap-1">

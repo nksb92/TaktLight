@@ -118,7 +118,11 @@ function buildElementFromForm(params: {
   }
 }
 
-export function SceneAndFxManager() {
+export function SceneAndFxManager({
+  hideUndoRedo = false,
+}: {
+  hideUndoRedo?: boolean;
+}) {
   const showState = useTaktStore((s) => s.showState);
   const activeScenes = useTaktStore((s) => s.activeScenes);
   const liveBpm = useTaktStore((s) => s.liveBpm);
@@ -273,19 +277,14 @@ export function SceneAndFxManager() {
   };
 
   return (
-    <div className="flex flex-col gap-4 p-4">
+    <div className="flex flex-col gap-4">
       {/* Header Tempo & Transport Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-slate border border-steel rounded-panel px-4 py-3">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
           <Sparkles className="w-4 h-4 text-ember" />
-          <div>
-            <h2 className="font-sans text-sm font-semibold text-frost">
-              Scenes &amp; Procedural FX Engine
-            </h2>
-            <p className="font-mono text-xs text-fog">
-              1D Curves, Step Chases, 2D Spatial Shaders, and Bank Exclusive Playback
-            </p>
-          </div>
+          <h2 className="font-sans text-sm font-semibold text-frost">
+            Scenes &amp; Procedural FX Engine
+          </h2>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -326,25 +325,29 @@ export function SceneAndFxManager() {
             <span>Release All Scenes</span>
           </button>
 
-          <button
-            type="button"
-            disabled={!canUndo}
-            onClick={() => void undoShow()}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded border border-steel bg-ink font-mono text-xs text-mist disabled:opacity-40"
-          >
-            <Undo2 className="w-3.5 h-3.5" />
-            <span>Undo</span>
-          </button>
+          {!hideUndoRedo && (
+            <>
+              <button
+                type="button"
+                disabled={!canUndo}
+                onClick={() => void undoShow()}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded border border-steel bg-ink font-mono text-xs text-mist disabled:opacity-40"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                <span>Undo</span>
+              </button>
 
-          <button
-            type="button"
-            disabled={!canRedo}
-            onClick={() => void redoShow()}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded border border-steel bg-ink font-mono text-xs text-mist disabled:opacity-40"
-          >
-            <Redo2 className="w-3.5 h-3.5" />
-            <span>Redo</span>
-          </button>
+              <button
+                type="button"
+                disabled={!canRedo}
+                onClick={() => void redoShow()}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded border border-steel bg-ink font-mono text-xs text-mist disabled:opacity-40"
+              >
+                <Redo2 className="w-3.5 h-3.5" />
+                <span>Redo</span>
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -361,7 +364,7 @@ export function SceneAndFxManager() {
 
         {showState.scenes.length === 0 ? (
           <div className="bg-pitch border border-steel rounded p-4 font-mono text-xs text-fog">
-            No scenes defined yet. Create an FX Block and bind it to a Scene below.
+            No scenes defined.
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">

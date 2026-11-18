@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import App from "./App";
 import {
@@ -66,7 +66,7 @@ describe("TaktLight Slice 1 Studio UI", () => {
   it("switches to Fixture Builder, inspects RLCV3, builds a custom fixture, and flags invalid JSON paths", async () => {
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Fixture Builder/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Fixtures$/i }));
     expect(screen.getByText("Local OFL Fixture Library")).toBeInTheDocument();
     expect(screen.getByText("RLCV3 8-Segment RGBW Tube")).toBeInTheDocument();
     expect(screen.getByText("RLCV4 16-Segment RGBW Tube")).toBeInTheDocument();
@@ -117,22 +117,19 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
   it("supports dual-universe patching, rollover split toast + Undo/Redo, calibration, and .takt.xml export", async () => {
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Patch View/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Patch$/i }));
 
     expect(screen.getByTestId("patch-universe-1")).toBeInTheDocument();
     expect(screen.getByTestId("patch-universe-2")).toBeInTheDocument();
     expect(screen.getAllByText(/512 free \| largest block 512/)).toHaveLength(2);
 
-    const rolloverBtn = screen.getByRole("button", { name: /Rollover: ON/i });
-    fireEvent.click(rolloverBtn);
-    expect(
-      screen.getByRole("button", { name: /Rollover: OFF/i }),
-    ).toBeInTheDocument();
+    const rolloverSwitch = screen.getByRole("switch", { name: /Rollover/i });
+    expect(rolloverSwitch).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(rolloverSwitch);
+    expect(rolloverSwitch).toHaveAttribute("aria-checked", "false");
 
     fireEvent.keyDown(window, { key: "r" });
-    expect(
-      screen.getByRole("button", { name: /Rollover: ON/i }),
-    ).toBeInTheDocument();
+    expect(rolloverSwitch).toHaveAttribute("aria-checked", "true");
 
     fireEvent.change(screen.getByLabelText("Name Prefix"), {
       target: { value: "Tube Left" },
@@ -147,7 +144,15 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
         "Tube Left split: U1.505 to U1.512 + U2.001 to U2.026",
       ),
     ).toBeInTheDocument();
+    // Rollover active: no red cross-protocol warning shown
+    expect(screen.queryByText(/CROSS PROTOCOL SPLIT/i)).not.toBeInTheDocument();
+
+    // Switching Rollover OFF exposes the cross-protocol warning
+    fireEvent.click(rolloverSwitch);
     expect(screen.getByText(/CROSS PROTOCOL SPLIT/i)).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "r" });
+    expect(screen.queryByText(/CROSS PROTOCOL SPLIT/i)).not.toBeInTheDocument();
 
     const toastUndo = screen.getByTestId("toast-undo-button");
     fireEvent.click(toastUndo);
@@ -191,7 +196,7 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: /2D Grid/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
 
     expect(screen.getByTestId("fixture-grid-canvas")).toBeInTheDocument();
     expect(screen.getByText("Tube A")).toBeInTheDocument();
@@ -206,6 +211,13 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
     const pos = useTaktStore.getState().showState.patch[0].grid_pos;
     expect(pos.x).toBeCloseTo(0.35);
     expect(pos.rotation).toBeCloseTo(45);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Rotate 90 Degrees/i }),
+    );
+    expect(
+      useTaktStore.getState().showState.patch[0].grid_pos.rotation,
+    ).toBeCloseTo(135);
 
     fireEvent.change(screen.getByLabelText("Order Rule"), {
       target: { value: "center_out" },
@@ -240,9 +252,7 @@ describe("TaktLight Slice 4 Palettes & Smart Controls UI", () => {
 
     render(<App />);
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /Palettes & Controls/i }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
 
     // Create Color Palette (#FFFFFF .. #FFFFFF)
     fireEvent.change(screen.getByLabelText("Color Palette Name"), {
@@ -330,9 +340,7 @@ describe("TaktLight Slice 4 Palettes & Smart Controls UI", () => {
 
     render(<App />);
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /Palettes & Controls/i }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
     fireEvent.click(
       screen.getByRole("button", { name: /Add Shutter Layer/i }),
     );
@@ -369,7 +377,7 @@ describe("TaktLight Slice 5 Scenes & FX Engine UI", () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Scenes & FX/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
 
     // Tempo controls
     fireEvent.change(screen.getByLabelText("Live BPM"), {
@@ -600,5 +608,32 @@ describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
     expect(useTaktStore.getState().timelinePlaying).toBe(true);
     expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
     expect(screen.getByTestId("timeline-live-cell-preview")).toBeInTheDocument();
+  });
+});
+
+describe("TaktLight Slice 7 UI Consolidation & Centered Bottom Navigation", () => {
+  beforeEach(() => {
+    useTaktStore.getState().resetForTest();
+  });
+
+  it("moves workspace tabs to centered bottom dock and hosts consolidated Studio workspace", () => {
+    render(<App />);
+
+    const header = screen.getByRole("banner");
+    expect(within(header).queryByRole("navigation")).not.toBeInTheDocument();
+
+    const dock = screen.getByTestId("bottom-nav-dock");
+    const nav = within(dock).getByRole("navigation", { name: /Workspace Views/i });
+
+    expect(within(nav).getByRole("button", { name: /^Patch$/i })).toBeInTheDocument();
+    expect(within(nav).getByRole("button", { name: /Studio \/ 2D Grid/i })).toBeInTheDocument();
+    expect(within(nav).getByRole("button", { name: /^Timeline$/i })).toBeInTheDocument();
+    expect(within(nav).getByRole("button", { name: /^Fixtures$/i })).toBeInTheDocument();
+    expect(within(nav).getByRole("button", { name: /^Monitor$/i })).toBeInTheDocument();
+
+    fireEvent.click(within(nav).getByRole("button", { name: /Studio \/ 2D Grid/i }));
+    expect(screen.getByTestId("fixture-grid-canvas")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /^Undo$/i })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: /^Redo$/i })).toHaveLength(1);
   });
 });

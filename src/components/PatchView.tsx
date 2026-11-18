@@ -382,16 +382,24 @@ export function PatchView() {
 
           <button
             type="button"
-            aria-pressed={rolloverEnabled}
+            role="switch"
+            aria-checked={rolloverEnabled}
             onClick={() => void setRolloverEnabled(!rolloverEnabled)}
             title="Toggle universe spillover split mode (Shortcut: R)"
-            className={`px-3 py-1.5 rounded-md border font-mono text-xs font-semibold transition-colors ${
-              rolloverEnabled
-                ? "bg-ember border-ember text-frost"
-                : "bg-ink border-steel text-fog hover:text-mist"
-            }`}
+            className="flex items-center gap-2 px-2.5 py-1 rounded-md border border-steel bg-ink font-mono text-xs font-semibold text-mist hover:border-ember transition-colors"
           >
-            {rolloverEnabled ? "Rollover: ON" : "Rollover: OFF"}
+            <span
+              className={`relative inline-flex w-8 h-4 rounded-full transition-colors ${
+                rolloverEnabled ? "bg-ember" : "bg-slate-dark border border-steel"
+              }`}
+            >
+              <span
+                className={`inline-block w-3 h-3 rounded-full bg-frost transition-transform mt-0.5 ${
+                  rolloverEnabled ? "translate-x-4" : "translate-x-0.5"
+                }`}
+              />
+            </span>
+            <span>{rolloverEnabled ? "Rollover: ON" : "Rollover: OFF"}</span>
           </button>
 
           <div className="flex items-center gap-1.5">
@@ -455,14 +463,20 @@ export function PatchView() {
         </div>
       )}
 
-      {/* Placement Toast & Cross-Protocol Warning */}
-      {(patchToast || crossProtocolWarning || movingFixture) && (
+      {/* Placement Toast & Conditional Cross Protocol Warning */}
+      {(patchToast ||
+        (!rolloverEnabled &&
+          (crossProtocolWarning ||
+            showState.patch.some((inst) => getFixtureFootprint(inst).tail !== null))) ||
+        movingFixture) && (
         <div className="bg-slate-dark border border-steel rounded-panel px-3 py-2 flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2.5 text-xs">
             {patchToast && (
               <span className="font-mono text-frost">{patchToast}</span>
             )}
-            {crossProtocolWarning && (
+            {!rolloverEnabled &&
+              (crossProtocolWarning ||
+                showState.patch.some((inst) => getFixtureFootprint(inst).tail !== null)) && (
               <span className="px-2 py-0.5 rounded bg-signal/20 border border-signal text-signal font-mono font-semibold flex items-center gap-1">
                 <AlertTriangle className="w-3.5 h-3.5" />
                 <span>CROSS PROTOCOL SPLIT</span>
@@ -736,8 +750,9 @@ export function PatchView() {
                     if (isSelected) {
                       cellBg = "bg-ember text-frost font-semibold";
                     } else if (owner.isSplit) {
-                      cellBg =
-                        "bg-plum/30 border border-dashed border-ember text-frost";
+                      cellBg = rolloverEnabled
+                        ? "bg-cobalt/25 border border-dashed border-cobalt/80 text-mist"
+                        : "bg-signal/30 border border-signal text-frost";
                     } else {
                       cellBg = "bg-cobalt/25 border border-cobalt/60 text-mist";
                     }
@@ -839,7 +854,13 @@ export function PatchView() {
                             {formatFootprintLabel(fx)}
                           </span>
                           {fp.tail && (
-                            <span className="px-1.5 py-0.5 rounded border border-dashed border-ember bg-ember/15 font-mono text-[10px] text-ember">
+                            <span
+                              className={`px-1.5 py-0.5 rounded border font-mono text-[10px] ${
+                                rolloverEnabled
+                                  ? "border-steel bg-ink text-fog"
+                                  : "border-signal bg-signal/20 text-signal"
+                              }`}
+                            >
                               U{fp.head.universe} to U{fp.tail.universe} split
                             </span>
                           )}
@@ -901,7 +922,7 @@ export function PatchView() {
 
           {!selectedFixture ? (
             <p className="text-xs font-mono text-fog">
-              Patch and select a fixture to adjust gamma, dimmer bounds, and white channel calibration.
+              Select a fixture above.
             </p>
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
@@ -1054,7 +1075,7 @@ export function PatchView() {
             </pre>
           ) : (
             <p className="text-xs font-mono text-fog">
-              Click Export .takt.xml to generate and preview the current show file.
+              No XML snapshot exported.
             </p>
           )}
         </div>
