@@ -11,7 +11,7 @@ use super::patch::{
 use super::spatial::GridPos;
 use super::xml::{
     serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef, FxBlockDef, SceneDef,
-    ShowState,
+    ShowState, TimelineDef,
 };
 use super::ShowError;
 
@@ -87,6 +87,14 @@ pub enum ShowCommand {
     DeleteScene {
         removed: SceneDef,
     },
+    UpsertTimeline {
+        before: Option<TimelineDef>,
+        after: TimelineDef,
+        coalesce_key: Option<String>,
+    },
+    DeleteTimeline {
+        removed: TimelineDef,
+    },
     ReplaceShowState {
         before: Box<ShowState>,
         after: Box<ShowState>,
@@ -97,7 +105,8 @@ impl ShowCommand {
     pub fn coalesce_key(&self) -> Option<&str> {
         match self {
             Self::UpdateFixtureGridPos { coalesce_key, .. }
-            | Self::UpdateFixtureCalibration { coalesce_key, .. } => coalesce_key.as_deref(),
+            | Self::UpdateFixtureCalibration { coalesce_key, .. }
+            | Self::UpsertTimeline { coalesce_key, .. } => coalesce_key.as_deref(),
             _ => None,
         }
     }
@@ -141,6 +150,13 @@ impl ShowCommand {
                     ..
                 },
             ) if *id1 == id2 => {
+                *a1 = a2;
+                true
+            }
+            (
+                Self::UpsertTimeline { after: a1, .. },
+                Self::UpsertTimeline { after: a2, .. },
+            ) if a1.id == a2.id => {
                 *a1 = a2;
                 true
             }
@@ -298,6 +314,18 @@ impl ShowCommand {
                 state.scenes.retain(|s| s.id != removed.id);
                 Ok(())
             }
+            Self::UpsertTimeline { after, .. } => {
+                if let Some(existing) = state.timelines.iter_mut().find(|t| t.id == after.id) {
+                    *existing = after.clone();
+                } else {
+                    state.timelines.push(after.clone());
+                }
+                Ok(())
+            }
+            Self::DeleteTimeline { removed } => {
+                state.timelines.retain(|t| t.id != removed.id);
+                Ok(())
+            }
             Self::ReplaceShowState { after, .. } => {
                 *state = (**after).clone();
                 Ok(())
@@ -452,6 +480,20 @@ impl ShowCommand {
             }
             Self::DeleteScene { removed } => {
                 state.scenes.push(removed.clone());
+                Ok(())
+            }
+            Self::UpsertTimeline { before, after, .. } => {
+                if let Some(prev) = before {
+                    if let Some(existing) = state.timelines.iter_mut().find(|t| t.id == prev.id) {
+                        *existing = prev.clone();
+                    }
+                } else {
+                    state.timelines.retain(|t| t.id != after.id);
+                }
+                Ok(())
+            }
+            Self::DeleteTimeline { removed } => {
+                state.timelines.push(removed.clone());
                 Ok(())
             }
             Self::ReplaceShowState { before, .. } => {

@@ -62,9 +62,10 @@ impl Engine {
             });
         }
 
-        // Stages 1 to 4: Scenes + Layer Stack -> Trait-Space Mixer -> Hardware Quantizer
+        // Stages 1 to 4: Timeline + Scenes + Layer Stack -> Trait-Space Mixer -> Hardware Quantizer
         if !plan.fixtures.is_empty()
-            && (!runtime.active_scenes.is_empty()
+            && ((runtime.active_timeline_id.is_some() && !plan.timelines.is_empty())
+                || !runtime.active_scenes.is_empty()
                 || !plan.static_layers.is_empty()
                 || !runtime.live_layers.is_empty())
         {
@@ -536,5 +537,211 @@ mod tests {
         ];
         assert_eq!(&f50.universes[0].dmx[0..34], &GOLDEN_F50);
         assert_eq!(&f100.universes[0].dmx[0..34], &GOLDEN_F100);
+    }
+
+    #[test]
+    fn evaluates_multi_track_timeline_with_clip_fades_and_scene_busking_overlay() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::GridPos;
+        use crate::show::xml::{
+            ClipDef, ColorPaletteDef, FxBlockDef, FxElementDef, SceneDef, ShowState, TempoPointDef,
+            TimelineDef, TrackDef,
+        };
+
+        let lib = FixtureLibrary::load(None);
+        let mut show = ShowState::default();
+        show.color_palettes.push(ColorPaletteDef {
+            id: "pal_orange".into(),
+            name: "Orange".into(),
+            hex_start: "#FF5500".into(),
+            hex_end: "#FF5500".into(),
+        });
+        show.color_palettes.push(ColorPaletteDef {
+            id: "pal_blue".into(),
+            name: "Blue".into(),
+            hex_start: "#0044FF".into(),
+            hex_end: "#0044FF".into(),
+        });
+        show.patch.push(FixtureInstance {
+            id: "fx_201".into(),
+            profile: "age/rlcv3_8_segment_tube.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Tube".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos {
+                x: 0.5,
+                y: 0.5,
+                rotation: 0.0,
+                scale_x: 0.4,
+                scale_y: 0.04,
+            },
+            calibration: FixtureCalibration::default(),
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_orange".into(),
+            name: "Orange".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            loop_block: true,
+            elements: vec![
+                FxElementDef::StaticTrait {
+                    trait_name: "dimmer".into(),
+                    op: "htp".into(),
+                    palette_ref: None,
+                    value_start: Some(1.0),
+                    value_end: Some(1.0),
+                    order: None,
+                },
+                FxElementDef::StaticTrait {
+                    trait_name: "color".into(),
+                    op: "ltp".into(),
+                    palette_ref: Some("pal_orange".into()),
+                    value_start: Some(0.0),
+                    value_end: Some(1.0),
+                    order: None,
+                },
+            ],
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_blue".into(),
+            name: "Blue Busk".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            loop_block: true,
+            elements: vec![
+                FxElementDef::StaticTrait {
+                    trait_name: "dimmer".into(),
+                    op: "htp".into(),
+                    palette_ref: None,
+                    value_start: Some(1.0),
+                    value_end: Some(1.0),
+                    order: None,
+                },
+                FxElementDef::StaticTrait {
+                    trait_name: "color".into(),
+                    op: "ltp".into(),
+                    palette_ref: Some("pal_blue".into()),
+                    value_start: Some(0.0),
+                    value_end: Some(1.0),
+                    order: None,
+                },
+            ],
+        });
+        show.scenes.push(SceneDef {
+            id: "sc_blue".into(),
+            name: "Blue".into(),
+            bank: Some("busk".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.5,
+            block_refs: vec!["blk_blue".into()],
+        });
+        show.timelines.push(TimelineDef {
+            id: "tl_main".into(),
+            name: "Main Timeline".into(),
+            duration_sec: 30.0,
+            grid_offset_sec: 0.0,
+            tempo_map: vec![TempoPointDef {
+                at_sec: 0.0,
+                bpm: 120.0,
+            }],
+            audio_track: None,
+            tracks: vec![
+                TrackDef {
+                    id: "trk_1".into(),
+                    name: "Base Orange".into(),
+                    target_group: Some("all".into()),
+                    clips: vec![ClipDef {
+                        ref_block: Some("blk_orange".into()),
+                        start_sec: 1.0,
+                        duration_sec: 4.0,
+                        fade_in_sec: 0.0,
+                        fade_out_sec: 0.0,
+                        inline_fx: Vec::new(),
+                    }],
+                },
+                TrackDef {
+                    id: "trk_2".into(),
+                    name: "Upper White Inline".into(),
+                    target_group: Some("all".into()),
+                    clips: vec![ClipDef {
+                        ref_block: None,
+                        start_sec: 2.0,
+                        duration_sec: 2.0,
+                        fade_in_sec: 0.0,
+                        fade_out_sec: 0.0,
+                        inline_fx: vec![
+                            FxElementDef::StaticTrait {
+                                trait_name: "dimmer".into(),
+                                op: "htp".into(),
+                                palette_ref: None,
+                                value_start: Some(1.0),
+                                value_end: Some(1.0),
+                                order: None,
+                            },
+                            FxElementDef::StaticTrait {
+                                trait_name: "color".into(),
+                                op: "ltp".into(),
+                                palette_ref: Some("pal_blue".into()),
+                                value_start: Some(0.0),
+                                value_end: Some(1.0),
+                                order: None,
+                            },
+                        ],
+                    }],
+                },
+            ],
+        });
+
+        let plan = compile_render_plan(2, &show, &lib).unwrap();
+        let mut rt = RuntimeControl::new();
+        rt.set_timeline_transport(Some("tl_main".into()), false, Some(1.5), 0.0);
+        let mut q = QuantizerState::default();
+
+        // At t_tl = 1.5s: only track 1 Orange clip is active (Ch3 Red high, Ch5 Blue = 0)
+        let f_track1 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 1,
+            },
+            &rt,
+            &mut q,
+        );
+        assert!(f_track1.universes[0].dmx[2] > 200);
+        assert_eq!(f_track1.universes[0].dmx[4], 0);
+
+        // At t_tl = 2.5s: track 2 sits on top of track 1 (LTP Blue overrides Orange)
+        rt.seek_timeline(2.5, 0.0);
+        let f_track2 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 2,
+            },
+            &rt,
+            &mut q,
+        );
+        assert!(f_track2.universes[0].dmx[4] > 200);
+        assert_eq!(f_track2.universes[0].dmx[2], 0);
+
+        // Trigger a live busk scene on top of Track 1 at t_tl = 1.5s -> Scene overrides Timeline!
+        rt.seek_timeline(1.5, 10.0);
+        rt.trigger_scene(&show.scenes[0], 10.0);
+        let f_busk = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 10.0,
+                frame_index: 3,
+            },
+            &rt,
+            &mut q,
+        );
+        assert!(f_busk.universes[0].dmx[4] > 200);
     }
 }

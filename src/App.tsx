@@ -6,6 +6,7 @@ import { JitterHistogram } from "./components/JitterHistogram";
 import { PalettesAndControls } from "./components/PalettesAndControls";
 import { PatchView } from "./components/PatchView";
 import { SceneAndFxManager } from "./components/SceneAndFxManager";
+import { TimelineEditor } from "./components/TimelineEditor";
 import { TopStatusBar } from "./components/TopStatusBar";
 import { useTaktStore } from "./store/useTaktStore";
 
@@ -35,6 +36,7 @@ export function App() {
         {activeTab === "grid" && <FixtureGrid2D />}
         {activeTab === "palettes" && <PalettesAndControls />}
         {activeTab === "scenes" && <SceneAndFxManager />}
+        {activeTab === "timeline" && <TimelineEditor />}
         {activeTab === "fixtures" && <FixtureBuilder />}
       </main>
     </div>

@@ -154,6 +154,36 @@ pub fn compile_render_plan(
         }
     }
 
+    // Validate target precedence across Timeline tracks and clips
+    for tl in &show.timelines {
+        for track in &tl.tracks {
+            let track_has_target = track
+                .target_group
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some();
+            for clip in &track.clips {
+                if let Some(ref block_id) = clip.ref_block {
+                    let Some(block) = show.fx_library.iter().find(|b| &b.id == block_id) else {
+                        continue;
+                    };
+                    let block_has_target = block
+                        .target_group
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_some();
+                    if !track_has_target && !block_has_target {
+                        return Err(ShowError::MissingTargetGroup(block.id.clone()));
+                    }
+                } else if !clip.inline_fx.is_empty() && !track_has_target {
+                    return Err(ShowError::MissingTargetGroup(track.id.clone()));
+                }
+            }
+        }
+    }
+
     Ok(RenderPlan {
         revision,
         universes,
@@ -169,6 +199,7 @@ pub fn compile_render_plan(
         show_bpm: show.bpm,
         fx_blocks: show.fx_library.clone(),
         scenes: show.scenes.clone(),
+        timelines: show.timelines.clone(),
     })
 }
 

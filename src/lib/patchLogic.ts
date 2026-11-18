@@ -4,6 +4,7 @@ import type {
   DimmerPaletteDef,
   FxBlockDef,
   SceneDef,
+  TimelineDef,
 } from "./mixerLogic";
 
 export type WhiteMode = "replace" | "add" | "off";
@@ -77,6 +78,7 @@ export interface ShowStateDto {
   groups: FixtureGroupDef[];
   fx_library: FxBlockDef[];
   scenes: SceneDef[];
+  timelines: TimelineDef[];
 }
 
 export interface UniverseSegment {

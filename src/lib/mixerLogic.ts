@@ -104,6 +104,68 @@ export interface ActiveSceneInstance {
   release_start_alpha: number;
 }
 
+export interface TempoPointDef {
+  at_sec: number;
+  bpm: number;
+}
+
+export interface AudioTrackDef {
+  file: string;
+  abs_fallback: string | null;
+  sha256: string | null;
+  offset_sec: number;
+  transient_sensitivity: number;
+}
+
+export interface ClipDef {
+  ref_block: string | null;
+  start_sec: number;
+  duration_sec: number;
+  fade_in_sec: number;
+  fade_out_sec: number;
+  inline_fx: FxElementDef[];
+}
+
+export interface TrackDef {
+  id: string;
+  name: string;
+  target_group: string | null;
+  clips: ClipDef[];
+}
+
+export interface TimelineDef {
+  id: string;
+  name: string;
+  duration_sec: number;
+  grid_offset_sec: number;
+  tempo_map: TempoPointDef[];
+  audio_track: AudioTrackDef | null;
+  tracks: TrackDef[];
+}
+
+export type TransientBand = "kick" | "snare";
+
+export interface TransientMarker {
+  time_sec: number;
+  band: TransientBand;
+  strength: number;
+}
+
+export interface WaveformPeak {
+  min: number;
+  max: number;
+}
+
+export interface AudioAnalysisResult {
+  sha256: string;
+  sample_rate: number;
+  duration_sec: number;
+  estimated_bpm: number;
+  grid_offset_sec: number;
+  transients: TransientMarker[];
+  waveform_peaks: WaveformPeak[];
+}
+
 export interface ColorPaletteDef {
   id: string;
   name: string;
@@ -699,12 +761,160 @@ function mapShutterChannelTs(
   return Math.round(d0 + t * (d1 - d0));
 }
 
+export function integrateTempoMapBeats(
+  tempoMap: TempoPointDef[],
+  defaultBpm: number,
+  tStartSec: number,
+  tEndSec: number,
+): number {
+  if (tEndSec <= tStartSec) return 0;
+  const fallback = Math.max(20, Math.min(300, defaultBpm || 120));
+  if (tempoMap.length === 0) {
+    return ((tEndSec - tStartSec) * fallback) / 60;
+  }
+
+  const points = [...tempoMap].sort((a, b) => a.at_sec - b.at_sec);
+  const bpmAt = (t: number): number => {
+    let active = fallback;
+    for (const pt of points) {
+      if (pt.at_sec <= t) active = Math.max(20, Math.min(300, pt.bpm));
+      else break;
+    }
+    return active;
+  };
+
+  let cur = tStartSec;
+  let beats = 0;
+  for (const pt of points) {
+    if (pt.at_sec > cur && pt.at_sec < tEndSec) {
+      beats += ((pt.at_sec - cur) * bpmAt(cur)) / 60;
+      cur = pt.at_sec;
+    }
+  }
+  if (tEndSec > cur) {
+    beats += ((tEndSec - cur) * bpmAt(cur)) / 60;
+  }
+  return beats;
+}
+
+export function computeClipAlphaAt(
+  clip: Pick<ClipDef, "start_sec" | "duration_sec" | "fade_in_sec" | "fade_out_sec">,
+  tTimelineSec: number,
+): number {
+  if (clip.duration_sec <= 0) return 0;
+  const clipEnd = clip.start_sec + clip.duration_sec;
+  if (tTimelineSec < clip.start_sec || tTimelineSec >= clipEnd) return 0;
+  const dtIn = Math.max(0, tTimelineSec - clip.start_sec);
+  const dtRem = Math.max(0, clipEnd - tTimelineSec);
+  const inAlpha = clip.fade_in_sec <= 1e-6 ? 1 : clamp01(dtIn / clip.fade_in_sec);
+  const outAlpha = clip.fade_out_sec <= 1e-6 ? 1 : clamp01(dtRem / clip.fade_out_sec);
+  return Math.min(inAlpha, outAlpha);
+}
+
+export function computeBeatGridMarkers(args: {
+  durationSec: number;
+  gridOffsetSec: number;
+  tempoMap: TempoPointDef[];
+  defaultBpm: number;
+}): number[] {
+  const { durationSec, gridOffsetSec, tempoMap, defaultBpm } = args;
+  const markers: number[] = [];
+  const points = [...tempoMap].sort((a, b) => a.at_sec - b.at_sec);
+  let t = Math.max(0, gridOffsetSec);
+  let safety = 0;
+  while (t <= durationSec + 1e-6 && safety < 4096) {
+    markers.push(Number(t.toFixed(4)));
+    let activeBpm = Math.max(20, Math.min(300, defaultBpm || 120));
+    for (const pt of points) {
+      if (pt.at_sec <= t + 1e-6) activeBpm = Math.max(20, Math.min(300, pt.bpm));
+      else break;
+    }
+    t += 60 / activeBpm;
+    safety += 1;
+  }
+  return markers;
+}
+
+export function snapTimeSecToMarkers(
+  timeSec: number,
+  markersSec: number[],
+  maxDistanceSec = 0.15,
+): number {
+  let best = timeSec;
+  let bestDist = maxDistanceSec;
+  for (const m of markersSec) {
+    const dist = Math.abs(timeSec - m);
+    if (dist <= bestDist) {
+      bestDist = dist;
+      best = m;
+    }
+  }
+  return Number(best.toFixed(4));
+}
+
+export function analyzeSyntheticTimelineAudio(args: {
+  bpm: number;
+  durationSec: number;
+  gridOffsetSec: number;
+  sensitivity?: number;
+}): AudioAnalysisResult {
+  const bpm = Math.max(60, Math.min(180, args.bpm || 120));
+  const durationSec = Math.max(2, args.durationSec || 16);
+  const offset = Math.max(0, args.gridOffsetSec || 0);
+  const sens = clamp01(args.sensitivity ?? 0.65);
+  const beatSec = 60 / bpm;
+
+  const transients: TransientMarker[] = [];
+  let idx = 0;
+  for (let t = offset; t < durationSec - 0.05; t += beatSec) {
+    const band: TransientBand = idx % 2 === 0 ? "kick" : "snare";
+    const strength = band === "kick" ? 0.92 : Math.max(0.4, 0.7 + (sens - 0.5) * 0.2);
+    if (strength >= 0.95 - sens * 0.6) {
+      transients.push({
+        time_sec: Number(t.toFixed(4)),
+        band,
+        strength,
+      });
+    }
+    idx += 1;
+  }
+
+  const peakCount = Math.max(20, Math.min(800, Math.round(durationSec * 20)));
+  const waveform_peaks: WaveformPeak[] = [];
+  for (let i = 0; i < peakCount; i++) {
+    const t = (i / peakCount) * durationSec;
+    const hitDist = transients.reduce(
+      (min, m) => Math.min(min, Math.abs(t - m.time_sec)),
+      1,
+    );
+    const amp = hitDist < 0.08 ? 0.9 : 0.12 + 0.08 * Math.sin(i * 0.7);
+    waveform_peaks.push({ min: -amp, max: amp });
+  }
+
+  return {
+    sha256: `sim_${bpm.toFixed(1)}_${durationSec.toFixed(1)}`,
+    sample_rate: 44100,
+    duration_sec: durationSec,
+    estimated_bpm: bpm,
+    grid_offset_sec: transients.find((m) => m.band === "kick")?.time_sec ?? offset,
+    transients,
+    waveform_peaks,
+  };
+}
+
 export function evaluateSimulationLayersToDmx(args: {
   show: ShowStateDto;
   fixtureDetailsCache: Record<string, FixtureDetail>;
   liveLayers: SmartControlLayer[];
   activeScenes?: ActiveSceneInstance[];
   beatClock?: BeatClockAnchor;
+  timelineState?: {
+    activeTimelineId: string | null;
+    playing: boolean;
+    playheadSec: number;
+    startAnchorTSec: number;
+    latencyOffsetMs: number;
+  };
   universes: UniverseConfig[];
   grandMaster: number;
   blackout: boolean;
@@ -716,6 +926,7 @@ export function evaluateSimulationLayersToDmx(args: {
     liveLayers,
     activeScenes = [],
     beatClock = { bpm: show.bpm || 120, t_anchor_sec: 0, beat_anchor: 0 },
+    timelineState,
     universes,
     grandMaster,
     blackout,
@@ -786,7 +997,27 @@ export function evaluateSimulationLayersToDmx(args: {
         a.inst.trigger_order - b.inst.trigger_order,
     );
 
-  if (activeLayers.length === 0 && runningScenes.length === 0) {
+  const activeTimeline =
+    timelineState?.activeTimelineId
+      ? show.timelines.find((t) => t.id === timelineState.activeTimelineId) ?? null
+      : null;
+
+  const effectiveTimelineSec = activeTimeline
+    ? Math.max(
+        0,
+        (timelineState!.playing
+          ? timelineState!.playheadSec +
+            Math.max(0, tSec - timelineState!.startAnchorTSec)
+          : timelineState!.playheadSec) +
+          timelineState!.latencyOffsetMs / 1000,
+      )
+    : null;
+
+  if (
+    activeLayers.length === 0 &&
+    runningScenes.length === 0 &&
+    activeTimeline === null
+  ) {
     return { dmxByUniverse, softwareStrobeClamped: false };
   }
 
@@ -811,7 +1042,247 @@ export function evaluateSimulationLayersToDmx(args: {
       : [wc, wc, wc];
   };
 
-  // Stage 1 + 2: Active Scenes -> FxBlocks
+  const foldFxBlock = (
+    block: FxBlockDef,
+    targetGroup: string,
+    alpha: number,
+    tLocal: number,
+    bLocal: number,
+  ) => {
+    const dur = Math.max(1e-4, block.duration_beats);
+    const bBlock = block.loop_block ? remEuclid(bLocal, dur) : Math.min(dur, bLocal);
+
+    for (const elem of block.elements) {
+      const orderOverride = "order" in elem ? elem.order : null;
+      const { cells, fixtures } = resolveTarget(
+        targetGroup,
+        orderOverride,
+        show,
+        fixtureCellStarts,
+        fixtureCellCounts,
+        cellToFixture,
+        totalCells,
+      );
+
+      if (elem.kind === "static_trait") {
+        if (elem.trait === "master_dimmer") {
+          const val = elem.value_start ?? 1;
+          for (const fxIdx of fixtures) {
+            fxStates[fxIdx].masterDimmer = applyScalarMerge(
+              elem.op,
+              fxStates[fxIdx].masterDimmer,
+              val,
+              alpha,
+            );
+            fxStates[fxIdx].masterTouched = true;
+          }
+        } else if (elem.trait === "color") {
+          const v0 = elem.value_start ?? 0;
+          const v1 = elem.value_end ?? 1;
+          for (const [cellIdx, u] of cells) {
+            const rgb = sampleColorPal(elem.palette_ref, v0 + u * (v1 - v0));
+            cellStates[cellIdx].color = [
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+            ];
+            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+          }
+        } else {
+          const pal = elem.palette_ref
+            ? show.dimmer_palettes.find((p) => p.id === elem.palette_ref)
+            : undefined;
+          const v0 = elem.value_start ?? 1;
+          const v1 = elem.value_end ?? v0;
+          for (const [cellIdx, u] of cells) {
+            const val = pal
+              ? clamp01(pal.value_start + u * (pal.value_end - pal.value_start))
+              : v0 + u * (v1 - v0);
+            cellStates[cellIdx].dimmer = applyScalarMerge(
+              elem.op,
+              cellStates[cellIdx].dimmer,
+              val,
+              alpha,
+            );
+            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+          }
+        }
+      } else if (elem.kind === "curve_1d") {
+        if (elem.trait === "master_dimmer") {
+          const val = evaluateCurve1DScalar({
+            waveform: elem.waveform,
+            bBlock,
+            tLocal,
+            u: 0,
+            rateBeats: elem.rate_beats,
+            speedHz: elem.speed_hz,
+            phaseSpreadDeg: elem.phase_spread_deg,
+            duty: elem.duty,
+            amplitude: elem.amplitude,
+            offset: elem.offset,
+            isBipolarAddDimmer: elem.op === "add",
+          });
+          for (const fxIdx of fixtures) {
+            fxStates[fxIdx].masterDimmer = applyScalarMerge(
+              elem.op,
+              fxStates[fxIdx].masterDimmer,
+              val,
+              alpha,
+            );
+            fxStates[fxIdx].masterTouched = true;
+          }
+        } else {
+          const isColor = elem.trait === "color";
+          for (const [cellIdx, u] of cells) {
+            const scalar = evaluateCurve1DScalar({
+              waveform: elem.waveform,
+              bBlock,
+              tLocal,
+              u,
+              rateBeats: elem.rate_beats,
+              speedHz: elem.speed_hz,
+              phaseSpreadDeg: elem.phase_spread_deg,
+              duty: elem.duty,
+              amplitude: elem.amplitude,
+              offset: elem.offset,
+              isBipolarAddDimmer: !isColor && elem.op === "add",
+            });
+            if (isColor) {
+              const rgb = sampleColorPal(elem.palette_ref, scalar);
+              cellStates[cellIdx].color = [
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+              ];
+            } else {
+              cellStates[cellIdx].dimmer = applyScalarMerge(
+                elem.op,
+                cellStates[cellIdx].dimmer,
+                scalar,
+                alpha,
+              );
+            }
+            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+          }
+        }
+      } else if (elem.kind === "step_chase") {
+        const isColor = elem.trait === "color";
+        for (const [cellIdx, u] of cells) {
+          const val = evaluateStepChaseScalar({
+            bBlock,
+            tLocal,
+            u,
+            cellCount: cells.length,
+            stepBeats: elem.step_beats,
+            speedHz: elem.speed_hz,
+            activeRatio: elem.active_ratio,
+            fade: elem.fade,
+            amplitude: elem.amplitude,
+          });
+          if (isColor) {
+            const rgb = sampleColorPal(elem.palette_ref, val);
+            cellStates[cellIdx].color = [
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+            ];
+          } else {
+            cellStates[cellIdx].dimmer = applyScalarMerge(
+              elem.op,
+              cellStates[cellIdx].dimmer,
+              val,
+              alpha,
+            );
+          }
+          fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+        }
+      } else if (elem.kind === "spatial_shader_2d") {
+        const isColor = elem.trait === "color";
+        for (const [cellIdx] of cells) {
+          const s = evaluateSpatialShader2D({
+            shader: elem.shader,
+            canvasXy: cellCanvasXy[cellIdx] ?? [0.5, 0.5],
+            bBlock,
+            tLocal,
+            rateBeats: elem.rate_beats,
+            speedHz: elem.speed_hz,
+            spatialFreq: elem.spatial_freq,
+            directionDeg: elem.direction_deg,
+            centerX: elem.center_x,
+            centerY: elem.center_y,
+          });
+          if (isColor) {
+            const rgb = sampleColorPal(elem.palette_ref, s);
+            cellStates[cellIdx].color = [
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+              applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+            ];
+          } else {
+            cellStates[cellIdx].dimmer = applyScalarMerge(
+              elem.op,
+              cellStates[cellIdx].dimmer,
+              s,
+              alpha,
+            );
+          }
+          fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+        }
+      }
+    }
+  };
+
+  // Stage 1.1: Timeline tracks evaluated bottom-to-top below live Scenes
+  if (activeTimeline && effectiveTimelineSec !== null) {
+    for (const track of activeTimeline.tracks) {
+      const trackTarget = track.target_group?.trim() || "";
+      for (const clip of track.clips) {
+        const clipAlpha = computeClipAlphaAt(clip, effectiveTimelineSec);
+        if (clipAlpha <= 0) continue;
+        const tLocal = Math.max(0, effectiveTimelineSec - clip.start_sec);
+        const bLocal = integrateTempoMapBeats(
+          activeTimeline.tempo_map,
+          show.bpm || 120,
+          clip.start_sec,
+          effectiveTimelineSec,
+        );
+        if (clip.ref_block) {
+          const block = show.fx_library.find((b) => b.id === clip.ref_block);
+          if (!block) continue;
+          const targetGroup = trackTarget || block.target_group?.trim() || "";
+          if (!targetGroup) continue;
+          foldFxBlock(block, targetGroup, clipAlpha, tLocal, bLocal);
+        } else if (clip.inline_fx.length > 0) {
+          const targetGroup = trackTarget || "all";
+          const clipBeats = Math.max(
+            0.25,
+            integrateTempoMapBeats(
+              activeTimeline.tempo_map,
+              show.bpm || 120,
+              clip.start_sec,
+              clip.start_sec + clip.duration_sec,
+            ),
+          );
+          foldFxBlock(
+            {
+              id: "_inline",
+              name: "_inline",
+              target_group: targetGroup,
+              duration_beats: clipBeats,
+              loop_block: true,
+              elements: clip.inline_fx,
+            },
+            targetGroup,
+            clipAlpha,
+            tLocal,
+            bLocal,
+          );
+        }
+      }
+    }
+  }
+
+  // Stage 1.2 + Stage 2: Active Scenes -> FxBlocks
   const bNow = computeBeatAt(beatClock, tSec);
   for (const { inst, def, alpha } of runningScenes) {
     const tLocal = Math.max(0, tSec - inst.trigger_t_sec);
@@ -822,187 +1293,7 @@ export function evaluateSimulationLayersToDmx(args: {
       const targetGroup =
         def.target_group?.trim() || block.target_group?.trim() || "";
       if (!targetGroup) continue;
-      const dur = Math.max(1e-4, block.duration_beats);
-      const bBlock = block.loop_block ? remEuclid(bLocal, dur) : Math.min(dur, bLocal);
-
-      for (const elem of block.elements) {
-        const orderOverride = "order" in elem ? elem.order : null;
-        const { cells, fixtures } = resolveTarget(
-          targetGroup,
-          orderOverride,
-          show,
-          fixtureCellStarts,
-          fixtureCellCounts,
-          cellToFixture,
-          totalCells,
-        );
-
-        if (elem.kind === "static_trait") {
-          if (elem.trait === "master_dimmer") {
-            const val = elem.value_start ?? 1;
-            for (const fxIdx of fixtures) {
-              fxStates[fxIdx].masterDimmer = applyScalarMerge(
-                elem.op,
-                fxStates[fxIdx].masterDimmer,
-                val,
-                alpha,
-              );
-              fxStates[fxIdx].masterTouched = true;
-            }
-          } else if (elem.trait === "color") {
-            const v0 = elem.value_start ?? 0;
-            const v1 = elem.value_end ?? 1;
-            for (const [cellIdx, u] of cells) {
-              const rgb = sampleColorPal(elem.palette_ref, v0 + u * (v1 - v0));
-              cellStates[cellIdx].color = [
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
-              ];
-              fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
-            }
-          } else {
-            const pal = elem.palette_ref
-              ? show.dimmer_palettes.find((p) => p.id === elem.palette_ref)
-              : undefined;
-            const v0 = elem.value_start ?? 1;
-            const v1 = elem.value_end ?? v0;
-            for (const [cellIdx, u] of cells) {
-              const val = pal
-                ? clamp01(pal.value_start + u * (pal.value_end - pal.value_start))
-                : v0 + u * (v1 - v0);
-              cellStates[cellIdx].dimmer = applyScalarMerge(
-                elem.op,
-                cellStates[cellIdx].dimmer,
-                val,
-                alpha,
-              );
-              fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
-            }
-          }
-        } else if (elem.kind === "curve_1d") {
-          if (elem.trait === "master_dimmer") {
-            const val = evaluateCurve1DScalar({
-              waveform: elem.waveform,
-              bBlock,
-              tLocal,
-              u: 0,
-              rateBeats: elem.rate_beats,
-              speedHz: elem.speed_hz,
-              phaseSpreadDeg: elem.phase_spread_deg,
-              duty: elem.duty,
-              amplitude: elem.amplitude,
-              offset: elem.offset,
-              isBipolarAddDimmer: elem.op === "add",
-            });
-            for (const fxIdx of fixtures) {
-              fxStates[fxIdx].masterDimmer = applyScalarMerge(
-                elem.op,
-                fxStates[fxIdx].masterDimmer,
-                val,
-                alpha,
-              );
-              fxStates[fxIdx].masterTouched = true;
-            }
-          } else {
-            const isColor = elem.trait === "color";
-            for (const [cellIdx, u] of cells) {
-              const scalar = evaluateCurve1DScalar({
-                waveform: elem.waveform,
-                bBlock,
-                tLocal,
-                u,
-                rateBeats: elem.rate_beats,
-                speedHz: elem.speed_hz,
-                phaseSpreadDeg: elem.phase_spread_deg,
-                duty: elem.duty,
-                amplitude: elem.amplitude,
-                offset: elem.offset,
-                isBipolarAddDimmer: !isColor && elem.op === "add",
-              });
-              if (isColor) {
-                const rgb = sampleColorPal(elem.palette_ref, scalar);
-                cellStates[cellIdx].color = [
-                  applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
-                  applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
-                  applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
-                ];
-              } else {
-                cellStates[cellIdx].dimmer = applyScalarMerge(
-                  elem.op,
-                  cellStates[cellIdx].dimmer,
-                  scalar,
-                  alpha,
-                );
-              }
-              fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
-            }
-          }
-        } else if (elem.kind === "step_chase") {
-          const isColor = elem.trait === "color";
-          for (const [cellIdx, u] of cells) {
-            const val = evaluateStepChaseScalar({
-              bBlock,
-              tLocal,
-              u,
-              cellCount: cells.length,
-              stepBeats: elem.step_beats,
-              speedHz: elem.speed_hz,
-              activeRatio: elem.active_ratio,
-              fade: elem.fade,
-              amplitude: elem.amplitude,
-            });
-            if (isColor) {
-              const rgb = sampleColorPal(elem.palette_ref, val);
-              cellStates[cellIdx].color = [
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
-              ];
-            } else {
-              cellStates[cellIdx].dimmer = applyScalarMerge(
-                elem.op,
-                cellStates[cellIdx].dimmer,
-                val,
-                alpha,
-              );
-            }
-            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
-          }
-        } else if (elem.kind === "spatial_shader_2d") {
-          const isColor = elem.trait === "color";
-          for (const [cellIdx] of cells) {
-            const s = evaluateSpatialShader2D({
-              shader: elem.shader,
-              canvasXy: cellCanvasXy[cellIdx] ?? [0.5, 0.5],
-              bBlock,
-              tLocal,
-              rateBeats: elem.rate_beats,
-              speedHz: elem.speed_hz,
-              spatialFreq: elem.spatial_freq,
-              directionDeg: elem.direction_deg,
-              centerX: elem.center_x,
-              centerY: elem.center_y,
-            });
-            if (isColor) {
-              const rgb = sampleColorPal(elem.palette_ref, s);
-              cellStates[cellIdx].color = [
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
-                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
-              ];
-            } else {
-              cellStates[cellIdx].dimmer = applyScalarMerge(
-                elem.op,
-                cellStates[cellIdx].dimmer,
-                s,
-                alpha,
-              );
-            }
-            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
-          }
-        }
-      }
+      foldFxBlock(block, targetGroup, alpha, tLocal, bLocal);
     }
   }
 

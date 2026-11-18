@@ -301,4 +301,95 @@ describe("useTaktStore", () => {
         .activeScenes.every((s) => s.release_t_sec === 2.0),
     ).toBe(true);
   });
+
+  it("manages multi-track timelines with Undo/Redo, XML round-trip, audio analysis, and scene busking overlay", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube TL",
+        1,
+        1,
+        1,
+      );
+
+    await useTaktStore.getState().upsertTimeline({
+      id: "tl_custom",
+      name: "Custom Track Show",
+      duration_sec: 12,
+      grid_offset_sec: 0.12,
+      tempo_map: [
+        { at_sec: 0, bpm: 120 },
+        { at_sec: 4, bpm: 140 },
+      ],
+      audio_track: {
+        file: "audio/track.wav",
+        abs_fallback: null,
+        sha256: null,
+        offset_sec: 0,
+        transient_sensitivity: 0.7,
+      },
+      tracks: [
+        {
+          id: "trk_base",
+          name: "Base Wave",
+          target_group: "all",
+          clips: [
+            {
+              ref_block: "blk_cyber_wave",
+              start_sec: 1.0,
+              duration_sec: 6.0,
+              fade_in_sec: 0.0,
+              fade_out_sec: 0.5,
+              inline_fx: [],
+            },
+          ],
+        },
+      ],
+    });
+    expect(
+      useTaktStore.getState().showState.timelines.some((t) => t.id === "tl_custom"),
+    ).toBe(true);
+
+    await useTaktStore.getState().undoShow();
+    expect(
+      useTaktStore.getState().showState.timelines.some((t) => t.id === "tl_custom"),
+    ).toBe(false);
+    await useTaktStore.getState().redoShow();
+    expect(
+      useTaktStore.getState().showState.timelines.some((t) => t.id === "tl_custom"),
+    ).toBe(true);
+
+    // Before clip starts (playhead = 0.2s): DMX Master Ch1 = 0
+    await useTaktStore.getState().setTimelineTransport("tl_custom", false, 0.2, 0);
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
+
+    // Inside clip (playhead = 2.0s): DMX Master Ch1 = 255
+    await useTaktStore.getState().setTimelineTransport("tl_custom", false, 2.0, 0);
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
+
+    // Latency offset adjustment updates state cleanly
+    await useTaktStore.getState().setLatencyOffsetMs(-15);
+    expect(useTaktStore.getState().latencyOffsetMs).toBe(-15);
+
+    // Audio analysis populates transients + BPM
+    const res = await useTaktStore
+      .getState()
+      .analyzeTimelineAudio("tl_custom", undefined, 128, 8, 0.65);
+    expect(res.transients.length).toBeGreaterThan(0);
+    expect(useTaktStore.getState().audioAnalysisByTimeline["tl_custom"]).toBeDefined();
+
+    // XML export + import round-trip preserves <Timelines>
+    const xml = await useTaktStore.getState().exportShowXml();
+    expect(xml).toContain('id="tl_custom"');
+    await useTaktStore.getState().deleteTimeline("tl_custom");
+    expect(
+      useTaktStore.getState().showState.timelines.some((t) => t.id === "tl_custom"),
+    ).toBe(false);
+    await useTaktStore.getState().importShowXml(xml);
+    expect(
+      useTaktStore.getState().showState.timelines.some((t) => t.id === "tl_custom"),
+    ).toBe(true);
+  });
 });
