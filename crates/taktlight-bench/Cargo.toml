@@ -1,0 +1,12 @@
+[package]
+name = "taktlight-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+parking_lot.workspace = true
+taktlight-engine = { path = "../taktlight-engine" }
+tokio.workspace = true

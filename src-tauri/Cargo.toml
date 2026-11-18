@@ -1,0 +1,21 @@
+[package]
+name = "taktlight-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "taktlight_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arc-swap.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+taktlight-engine = { path = "../crates/taktlight-engine" }
+tauri = { version = "2", features = [] }
+tokio.workspace = true

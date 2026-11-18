@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/taktlight-engine",
+  "crates/taktlight-bench",
+  "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Another German Engineer"]
+license = "MIT"
+
+[workspace.dependencies]
+arc-swap = "1"
+if-addrs = "0.13"
+insta = "1"
+parking_lot = "0.12"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+socket2 = { version = "0.5", features = ["all"] }
+spin_sleep = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
