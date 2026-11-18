@@ -220,7 +220,7 @@ pub struct SmartControlLayer {
     pub trait_spec: SmartLayerTrait,
 }
 
-fn resolve_target_cells_and_fixtures(
+pub fn resolve_target_cells_and_fixtures(
     target: &str,
     order_override: Option<OrderRule>,
     fixtures: &[CompiledFixture],
@@ -293,19 +293,17 @@ fn sample_inline_hex_oklab_linear(hex_start: &str, hex_end: &str, u: f32) -> [f3
     ])
 }
 
-pub fn evaluate_layer_stack_inputs(
+#[allow(clippy::too_many_arguments)]
+pub fn fold_layers_into_states(
     fixtures: &[CompiledFixture],
     groups: &[CompiledGroup],
     color_palettes: &[CompiledColorPalette],
     dimmer_palettes: &[CompiledDimmerPalette],
     cell_count: usize,
     layers: &[SmartControlLayer],
-    grand_master: f32,
-    blackout: bool,
-) -> (Vec<FixtureTraitState>, Vec<CellTraitState>) {
-    let mut fixture_states = vec![FixtureTraitState::default(); fixtures.len()];
-    let mut cell_states = vec![CellTraitState::default(); cell_count];
-
+    fixture_states: &mut [FixtureTraitState],
+    cell_states: &mut [CellTraitState],
+) {
     let mut cell_to_fixture = vec![0usize; cell_count];
     let mut fixture_index_by_id: HashMap<&str, usize> = HashMap::with_capacity(fixtures.len());
     for (fx_idx, fx) in fixtures.iter().enumerate() {
@@ -412,6 +410,31 @@ pub fn evaluate_layer_stack_inputs(
             }
         }
     }
+}
+
+pub fn evaluate_layer_stack_inputs(
+    fixtures: &[CompiledFixture],
+    groups: &[CompiledGroup],
+    color_palettes: &[CompiledColorPalette],
+    dimmer_palettes: &[CompiledDimmerPalette],
+    cell_count: usize,
+    layers: &[SmartControlLayer],
+    grand_master: f32,
+    blackout: bool,
+) -> (Vec<FixtureTraitState>, Vec<CellTraitState>) {
+    let mut fixture_states = vec![FixtureTraitState::default(); fixtures.len()];
+    let mut cell_states = vec![CellTraitState::default(); cell_count];
+
+    fold_layers_into_states(
+        fixtures,
+        groups,
+        color_palettes,
+        dimmer_palettes,
+        cell_count,
+        layers,
+        &mut fixture_states,
+        &mut cell_states,
+    );
 
     for fx_state in &mut fixture_states {
         fx_state.finalize_fixture_state(grand_master, blackout);

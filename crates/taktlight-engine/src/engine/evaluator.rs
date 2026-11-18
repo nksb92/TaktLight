@@ -1,6 +1,6 @@
+use crate::fx::scene::evaluate_scenes_and_live_layers;
 use crate::mixer::quantizer::quantize_fixture_to_dmx;
 pub use crate::mixer::quantizer::QuantizerState;
-use crate::mixer::traits::evaluate_layer_stack;
 use crate::ofl::expander::{ChannelRole, ChannelTarget};
 use crate::ofl::model::OflColor;
 use crate::state::plan::RenderPlan;
@@ -62,18 +62,14 @@ impl Engine {
             });
         }
 
-        // Stages 1 to 4: Layer Stack -> Trait-Space Mixer -> Hardware Quantizer
+        // Stages 1 to 4: Scenes + Layer Stack -> Trait-Space Mixer -> Hardware Quantizer
         if !plan.fixtures.is_empty()
-            && (!plan.static_layers.is_empty() || !runtime.live_layers.is_empty())
+            && (!runtime.active_scenes.is_empty()
+                || !plan.static_layers.is_empty()
+                || !runtime.live_layers.is_empty())
         {
-            let combined_layers: Vec<_> = plan
-                .static_layers
-                .iter()
-                .cloned()
-                .chain(runtime.live_layers.iter().cloned())
-                .collect();
             let (fx_states, cell_states) =
-                evaluate_layer_stack(plan, &combined_layers, runtime.grand_master, runtime.blackout);
+                evaluate_scenes_and_live_layers(plan, clock, runtime);
 
             for (fx_idx, fixture) in plan.fixtures.iter().enumerate() {
                 quantize_fixture_to_dmx(
@@ -346,5 +342,199 @@ mod tests {
         runtime.set_park(1, 3, Some(123)).unwrap();
         let parked = Engine::evaluate_frame(&plan, &clock, &runtime, &mut q);
         assert_eq!(parked.universes[0].dmx[2], 123);
+    }
+
+    #[test]
+    fn golden_frame_cyberpunk_sine_and_step_chase_scene_across_time_steps() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance, WhiteMode};
+        use crate::show::spatial::{GridPos, OrderRule};
+        use crate::show::xml::{
+            ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef, FxBlockDef, FxElementDef,
+            SceneDef, ShowState,
+        };
+
+        let library = FixtureLibrary::load(None);
+        let mut show = ShowState::default();
+        show.bpm = 120.0;
+        show.color_palettes.push(ColorPaletteDef {
+            id: "pal_cyber".into(),
+            name: "Cyberpunk Dual".into(),
+            hex_start: "#FF5500".into(),
+            hex_end: "#2255AA".into(),
+        });
+        show.dimmer_palettes.push(DimmerPaletteDef {
+            id: "dim_half".into(),
+            name: "Studio 60%".into(),
+            value_start: 0.60,
+            value_end: 0.60,
+        });
+        show.patch.push(FixtureInstance {
+            id: "fx_201".into(),
+            profile: "age/rlcv3_8_segment_tube.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Tube Left".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos::default(),
+            calibration: FixtureCalibration {
+                gamma: 2.2,
+                min_dimmer_dmx: 4,
+                max_dimmer_dmx: 255,
+                white_mode: WhiteMode::Replace,
+                white_gain: 0.85,
+            },
+        });
+        show.groups.push(FixtureGroupDef {
+            id: "grp_tubes_cells".into(),
+            name: "All Tube Pixels".into(),
+            order: OrderRule::CenterOut,
+            targets: vec!["fx_201:0..7".into()],
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_cyber_wave".into(),
+            name: "Cyberpunk Sine Wave".into(),
+            target_group: Some("grp_tubes_cells".into()),
+            duration_beats: 4.0,
+            loop_block: true,
+            elements: vec![
+                FxElementDef::StaticTrait {
+                    trait_name: "dimmer".into(),
+                    op: "htp".into(),
+                    palette_ref: Some("dim_half".into()),
+                    value_start: None,
+                    value_end: None,
+                    order: None,
+                },
+                FxElementDef::StaticTrait {
+                    trait_name: "color".into(),
+                    op: "ltp".into(),
+                    palette_ref: Some("pal_cyber".into()),
+                    value_start: None,
+                    value_end: None,
+                    order: Some(OrderRule::Mirror),
+                },
+                FxElementDef::Curve1D {
+                    trait_name: "dimmer".into(),
+                    op: "add".into(),
+                    waveform: "sine".into(),
+                    amplitude: 0.40,
+                    offset: 0.0,
+                    rate_beats: Some(2.0),
+                    speed_hz: None,
+                    phase_spread_deg: 360.0,
+                    duty: Some(0.5),
+                    palette_ref: None,
+                    order: None,
+                },
+                FxElementDef::StepChase {
+                    trait_name: "dimmer".into(),
+                    op: "htp".into(),
+                    step_beats: Some(0.5),
+                    speed_hz: None,
+                    active_ratio: Some(0.25),
+                    fade: 0.20,
+                    amplitude: 1.0,
+                    palette_ref: None,
+                    order: None,
+                },
+            ],
+        });
+        let scene = SceneDef {
+            id: "sc_cyber_wave".into(),
+            name: "Cyberpunk Sine Wave".into(),
+            bank: Some("main".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.5,
+            fade_out_sec: 1.0,
+            block_refs: vec!["blk_cyber_wave".into()],
+        };
+        show.scenes.push(scene.clone());
+
+        let plan = compile_render_plan(1, &show, &library).unwrap();
+        let mut rt = RuntimeControl::new();
+        rt.trigger_scene(&scene, 0.0);
+
+        let mut q = QuantizerState::default();
+        let f0 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 0,
+            },
+            &rt,
+            &mut q,
+        );
+        let f25 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.25,
+                frame_index: 11,
+            },
+            &rt,
+            &mut q,
+        );
+        let f50 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.5,
+                frame_index: 22,
+            },
+            &rt,
+            &mut q,
+        );
+        let f100 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 1.0,
+                frame_index: 44,
+            },
+            &rt,
+            &mut q,
+        );
+
+        // Determinism check: evaluating out-of-order returns byte-identical result
+        let f50_repeat = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.5,
+                frame_index: 22,
+            },
+            &rt,
+            &mut q,
+        );
+        assert_eq!(f50.universes[0].dmx, f50_repeat.universes[0].dmx);
+
+        // At t=0.0s (fade_in=0.5 -> alpha=0.0): Master=0, Shutter=Open(11), all cells=0
+        assert_eq!(f0.universes[0].dmx[0], 0);
+        assert_eq!(f0.universes[0].dmx[1], 11);
+        assert_eq!(&f0.universes[0].dmx[2..34], &[0u8; 32]);
+
+        // Fade-in strictly increases energy from t=0.25 to t=0.50
+        let sum25: u32 = f25.universes[0].dmx[2..34].iter().map(|&b| b as u32).sum();
+        let sum50: u32 = f50.universes[0].dmx[2..34].iter().map(|&b| b as u32).sum();
+        assert!(sum25 > 0 && sum50 > sum25);
+        assert_eq!(f25.universes[0].dmx[0], 255);
+        assert_eq!(f50.universes[0].dmx[0], 255);
+
+        // Pixel 0 (u_mirror=0.0 -> #FF5500 orange) vs Pixel 3 (center -> u_mirror=1.0 -> #2255AA blue)
+        assert_ne!(&f50.universes[0].dmx[2..6], &f50.universes[0].dmx[14..18]);
+
+        // Time evolution changes chase/wave state between t=0.5s and t=1.0s
+        assert_ne!(&f50.universes[0].dmx[2..34], &f100.universes[0].dmx[2..34]);
+
+        const GOLDEN_F50: [u8; 34] = [
+            255, 11, 255, 5, 0, 0, 70, 4, 0, 6, 5, 0, 4, 5, 0, 4, 5, 4, 0, 4, 5, 4, 5, 0, 4, 5, 70,
+            4, 0, 6, 255, 5, 0, 0,
+        ];
+        const GOLDEN_F100: [u8; 34] = [
+            255, 11, 255, 5, 0, 0, 6, 4, 0, 4, 8, 0, 6, 7, 0, 4, 22, 5, 0, 4, 22, 5, 8, 0, 6, 7, 6,
+            4, 0, 4, 255, 5, 0, 0,
+        ];
+        assert_eq!(&f50.universes[0].dmx[0..34], &GOLDEN_F50);
+        assert_eq!(&f100.universes[0].dmx[0..34], &GOLDEN_F100);
     }
 }

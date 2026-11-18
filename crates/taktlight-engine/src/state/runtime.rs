@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::fx::scene::{ActiveSceneInstance, BeatClockAnchor};
 use crate::mixer::traits::SmartControlLayer;
+use crate::show::xml::SceneDef;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -20,6 +22,14 @@ pub struct RuntimeControl {
     pub parked_channels: BTreeMap<(u16, u16), u8>,
     #[serde(default)]
     pub live_layers: Vec<SmartControlLayer>,
+    #[serde(default)]
+    pub beat_clock: BeatClockAnchor,
+    #[serde(default)]
+    pub active_scenes: Vec<ActiveSceneInstance>,
+    #[serde(default)]
+    pub tap_history_sec: Vec<f64>,
+    #[serde(default)]
+    pub next_scene_trigger_order: u64,
 }
 
 impl Default for RuntimeControl {
@@ -29,6 +39,10 @@ impl Default for RuntimeControl {
             blackout: false,
             parked_channels: BTreeMap::new(),
             live_layers: Vec::new(),
+            beat_clock: BeatClockAnchor::new(120.0),
+            active_scenes: Vec::new(),
+            tap_history_sec: Vec::new(),
+            next_scene_trigger_order: 1,
         }
     }
 }
@@ -82,6 +96,98 @@ impl RuntimeControl {
 
     pub fn set_live_layers(&mut self, layers: Vec<SmartControlLayer>) {
         self.live_layers = layers;
+    }
+
+    pub fn prune_finished_scenes(&mut self, t_now_sec: f64) {
+        self.active_scenes.retain(|s| !s.is_finished(t_now_sec));
+    }
+
+    pub fn trigger_scene(&mut self, scene: &SceneDef, t_now_sec: f64) {
+        self.prune_finished_scenes(t_now_sec);
+        let norm_bank = scene
+            .bank
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        if let Some(ref bank_name) = norm_bank {
+            for active in &mut self.active_scenes {
+                if active.scene_id != scene.id
+                    && active.bank.as_deref() == Some(bank_name.as_str())
+                    && active.release_t_sec.is_none()
+                {
+                    let cur_alpha = active.alpha_at(t_now_sec);
+                    active.release_start_alpha = cur_alpha;
+                    active.release_t_sec = Some(t_now_sec);
+                }
+            }
+        }
+
+        self.active_scenes.retain(|s| s.scene_id != scene.id);
+        let order = self.next_scene_trigger_order.max(1);
+        self.next_scene_trigger_order = order.saturating_add(1);
+
+        self.active_scenes.push(ActiveSceneInstance {
+            scene_id: scene.id.clone(),
+            bank: norm_bank,
+            trigger_t_sec: t_now_sec,
+            trigger_beat: self.beat_clock.beat_at(t_now_sec),
+            trigger_order: order,
+            fade_in_sec: scene.fade_in_sec.max(0.0),
+            fade_out_sec: scene.fade_out_sec.max(0.0),
+            release_t_sec: None,
+            release_start_alpha: 1.0,
+        });
+    }
+
+    pub fn release_scene(&mut self, scene_id: &str, t_now_sec: f64) {
+        for active in &mut self.active_scenes {
+            if active.scene_id == scene_id && active.release_t_sec.is_none() {
+                active.release_start_alpha = active.alpha_at(t_now_sec);
+                active.release_t_sec = Some(t_now_sec);
+            }
+        }
+        self.prune_finished_scenes(t_now_sec);
+    }
+
+    pub fn release_all_scenes(&mut self, t_now_sec: f64) {
+        for active in &mut self.active_scenes {
+            if active.release_t_sec.is_none() {
+                active.release_start_alpha = active.alpha_at(t_now_sec);
+                active.release_t_sec = Some(t_now_sec);
+            }
+        }
+        self.prune_finished_scenes(t_now_sec);
+    }
+
+    pub fn set_live_bpm(&mut self, bpm: f32, t_now_sec: f64) {
+        if !bpm.is_nan() {
+            self.beat_clock.set_bpm_phase_continuous(bpm, t_now_sec);
+        }
+    }
+
+    pub fn tap_tempo(&mut self, tap_t_sec: f64) -> f32 {
+        if let Some(&last) = self.tap_history_sec.last() {
+            if (tap_t_sec - last).abs() > 3.0 || tap_t_sec < last {
+                self.tap_history_sec.clear();
+            }
+        }
+        self.tap_history_sec.push(tap_t_sec);
+        if self.tap_history_sec.len() > 8 {
+            let excess = self.tap_history_sec.len() - 8;
+            self.tap_history_sec.drain(0..excess);
+        }
+        if self.tap_history_sec.len() >= 2 {
+            let span =
+                self.tap_history_sec[self.tap_history_sec.len() - 1] - self.tap_history_sec[0];
+            let intervals = (self.tap_history_sec.len() - 1) as f64;
+            if span > 1e-4 {
+                let bpm = ((60.0 * intervals) / span) as f32;
+                self.set_live_bpm(bpm, tap_t_sec);
+            }
+        }
+        self.beat_clock.bpm
     }
 }
 

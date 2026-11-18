@@ -7,6 +7,7 @@ use crate::mixer::traits::SmartControlLayer;
 use crate::ofl::expander::{ChannelRole, ChannelTarget};
 use crate::show::patch::FixtureCalibration;
 use crate::show::spatial::OrderRule;
+use crate::show::xml::{FxBlockDef, SceneDef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -110,6 +111,9 @@ pub struct RenderPlan {
     pub color_palettes: Vec<CompiledColorPalette>,
     pub dimmer_palettes: Vec<CompiledDimmerPalette>,
     pub static_layers: Vec<SmartControlLayer>,
+    pub show_bpm: f32,
+    pub fx_blocks: Vec<FxBlockDef>,
+    pub scenes: Vec<SceneDef>,
 }
 
 impl Default for RenderPlan {
@@ -150,6 +154,9 @@ impl RenderPlan {
             color_palettes: Vec::new(),
             dimmer_palettes: Vec::new(),
             static_layers: Vec::new(),
+            show_bpm: 120.0,
+            fx_blocks: Vec::new(),
+            scenes: Vec::new(),
         }
     }
 }

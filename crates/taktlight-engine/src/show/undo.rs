@@ -10,7 +10,8 @@ use super::patch::{
 };
 use super::spatial::GridPos;
 use super::xml::{
-    serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef, ShowState,
+    serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef, FxBlockDef, SceneDef,
+    ShowState,
 };
 use super::ShowError;
 
@@ -71,6 +72,20 @@ pub enum ShowCommand {
     },
     DeleteDimmerPalette {
         removed: DimmerPaletteDef,
+    },
+    UpsertFxBlock {
+        before: Option<FxBlockDef>,
+        after: FxBlockDef,
+    },
+    DeleteFxBlock {
+        removed: FxBlockDef,
+    },
+    UpsertScene {
+        before: Option<SceneDef>,
+        after: SceneDef,
+    },
+    DeleteScene {
+        removed: SceneDef,
     },
     ReplaceShowState {
         before: Box<ShowState>,
@@ -259,6 +274,30 @@ impl ShowCommand {
                 state.dimmer_palettes.retain(|p| p.id != removed.id);
                 Ok(())
             }
+            Self::UpsertFxBlock { after, .. } => {
+                if let Some(existing) = state.fx_library.iter_mut().find(|b| b.id == after.id) {
+                    *existing = after.clone();
+                } else {
+                    state.fx_library.push(after.clone());
+                }
+                Ok(())
+            }
+            Self::DeleteFxBlock { removed } => {
+                state.fx_library.retain(|b| b.id != removed.id);
+                Ok(())
+            }
+            Self::UpsertScene { after, .. } => {
+                if let Some(existing) = state.scenes.iter_mut().find(|s| s.id == after.id) {
+                    *existing = after.clone();
+                } else {
+                    state.scenes.push(after.clone());
+                }
+                Ok(())
+            }
+            Self::DeleteScene { removed } => {
+                state.scenes.retain(|s| s.id != removed.id);
+                Ok(())
+            }
             Self::ReplaceShowState { after, .. } => {
                 *state = (**after).clone();
                 Ok(())
@@ -385,6 +424,34 @@ impl ShowCommand {
             }
             Self::DeleteDimmerPalette { removed } => {
                 state.dimmer_palettes.push(removed.clone());
+                Ok(())
+            }
+            Self::UpsertFxBlock { before, after } => {
+                if let Some(prev) = before {
+                    if let Some(existing) = state.fx_library.iter_mut().find(|b| b.id == prev.id) {
+                        *existing = prev.clone();
+                    }
+                } else {
+                    state.fx_library.retain(|b| b.id != after.id);
+                }
+                Ok(())
+            }
+            Self::DeleteFxBlock { removed } => {
+                state.fx_library.push(removed.clone());
+                Ok(())
+            }
+            Self::UpsertScene { before, after } => {
+                if let Some(prev) = before {
+                    if let Some(existing) = state.scenes.iter_mut().find(|s| s.id == prev.id) {
+                        *existing = prev.clone();
+                    }
+                } else {
+                    state.scenes.retain(|s| s.id != after.id);
+                }
+                Ok(())
+            }
+            Self::DeleteScene { removed } => {
+                state.scenes.push(removed.clone());
                 Ok(())
             }
             Self::ReplaceShowState { before, .. } => {

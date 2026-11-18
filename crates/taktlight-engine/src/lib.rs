@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod frame;
+pub mod fx;
 pub mod mixer;
 pub mod ofl;
 pub mod protocol;

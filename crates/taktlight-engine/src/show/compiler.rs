@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::mixer::color::{CompiledColorPalette, CompiledDimmerPalette};
-use crate::mixer::traits::{MergeOp, SmartControlLayer, SmartLayerTrait};
 use crate::ofl::library::FixtureLibrary;
 use crate::state::plan::{CompiledCell, CompiledChannelSlot, CompiledFixture, CompiledGroup, RenderPlan};
 
 use super::spatial::compute_order_u;
 use super::targets::TargetRef;
-use super::xml::{FxElementDef, ShowState};
+use super::xml::ShowState;
 use super::ShowError;
 
 pub fn compile_render_plan(
@@ -130,62 +129,27 @@ pub fn compile_render_plan(
         .map(CompiledDimmerPalette::from_def)
         .collect();
 
-    let mut static_layers = Vec::new();
-    let mut seq_trigger: u64 = 1;
+    // Validate target precedence across referenced scene FX blocks
     for scene in &show.scenes {
         for block_id in &scene.block_refs {
             let Some(block) = show.fx_library.iter().find(|b| &b.id == block_id) else {
                 continue;
             };
-            let Some(target_group) = scene
+            let has_target = scene
                 .target_group
                 .as_deref()
-                .or(block.target_group.as_deref())
-            else {
-                continue;
-            };
-            for elem in &block.elements {
-                if let FxElementDef::StaticTrait {
-                    trait_name,
-                    op,
-                    palette_ref,
-                    value_start,
-                    value_end,
-                    order,
-                } = elem
-                {
-                    let parsed_op = MergeOp::from_str(op).unwrap_or(MergeOp::Htp);
-                    let trait_spec = match trait_name.as_str() {
-                        "color" => SmartLayerTrait::Color {
-                            op: parsed_op,
-                            palette_ref: palette_ref.clone(),
-                            hex_start: "#FFFFFF".to_string(),
-                            hex_end: "#FFFFFF".to_string(),
-                        },
-                        "master_dimmer" => SmartLayerTrait::MasterDimmer {
-                            op: parsed_op,
-                            value: value_start.unwrap_or(1.0),
-                        },
-                        _ => SmartLayerTrait::Dimmer {
-                            op: parsed_op,
-                            palette_ref: palette_ref.clone(),
-                            value_start: value_start.unwrap_or(1.0),
-                            value_end: value_end.unwrap_or(value_start.unwrap_or(1.0)),
-                        },
-                    };
-                    static_layers.push(SmartControlLayer {
-                        id: format!("{}_{}", scene.id, seq_trigger),
-                        name: scene.name.clone(),
-                        enabled: true,
-                        priority: scene.priority,
-                        trigger_order: seq_trigger,
-                        alpha: 1.0,
-                        target: target_group.to_string(),
-                        order_override: *order,
-                        trait_spec,
-                    });
-                    seq_trigger += 1;
-                }
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    block
+                        .target_group
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .is_some();
+            if !has_target {
+                return Err(ShowError::MissingTargetGroup(block.id.clone()));
             }
         }
     }
@@ -201,7 +165,10 @@ pub fn compile_render_plan(
         groups: compiled_groups,
         color_palettes,
         dimmer_palettes,
-        static_layers,
+        static_layers: Vec::new(),
+        show_bpm: show.bpm,
+        fx_blocks: show.fx_library.clone(),
+        scenes: show.scenes.clone(),
     })
 }
 
