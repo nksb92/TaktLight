@@ -560,18 +560,21 @@ mod tests {
         // Removing sACN universe emits 3-packet Stream_Terminated burst
         let artnet_only = RenderPlan {
             revision: 2,
-            universes: vec![UniverseConfig {
-                id: 1,
-                protocol: ProtocolKind::ArtNet {
+            universes: vec![UniverseConfig::new(
+                1,
+                ProtocolKind::ArtNet {
                     mode: ArtNetOutputMode::Broadcast,
                     net: 0,
                     subnet: 0,
                     uni: 0,
                 },
-            }],
+            )],
             artsync_enabled: true,
             cell_count: 0,
             base_dmx: vec![[0u8; 512]],
+            fixtures: Vec::new(),
+            cells: Vec::new(),
+            groups: Vec::new(),
         };
         let f2 = Engine::evaluate_frame(
             &artnet_only,

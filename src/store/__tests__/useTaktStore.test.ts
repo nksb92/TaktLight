@@ -99,4 +99,58 @@ describe("useTaktStore", () => {
       .deleteUserFixture("user/bench_test_bar.json");
     expect(useTaktStore.getState().fixtureSummaries).toHaveLength(2);
   });
+
+  it("patches split fixtures, undoes/redoes, coalesces grid drags, and exports/imports XML", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube Left",
+        1,
+        1,
+        505,
+      );
+
+    let state = useTaktStore.getState();
+    expect(state.showState.patch).toHaveLength(1);
+    expect(state.compiledCells).toHaveLength(8);
+    expect(state.crossProtocolWarning).toBe(true);
+    expect(state.patchToast).toBe(
+      "Tube Left split: U1.505 to U1.512 + U2.001 to U2.026",
+    );
+
+    const fxId = state.showState.patch[0].id;
+    const basePos = state.showState.patch[0].grid_pos;
+
+    await useTaktStore
+      .getState()
+      .updateFixtureGridPos(fxId, { ...basePos, x: 0.3 }, "drag_fx");
+    await useTaktStore
+      .getState()
+      .updateFixtureGridPos(fxId, { ...basePos, x: 0.7 }, "drag_fx");
+
+    // Undo should revert the entire coalesced drag back to basePos.x
+    await useTaktStore.getState().undoShow();
+    expect(useTaktStore.getState().showState.patch[0].grid_pos.x).toBeCloseTo(
+      basePos.x,
+      4,
+    );
+
+    await useTaktStore.getState().redoShow();
+    expect(useTaktStore.getState().showState.patch[0].grid_pos.x).toBeCloseTo(
+      0.7,
+      4,
+    );
+
+    const xml = await useTaktStore.getState().exportShowXml();
+    expect(xml).toContain("<TaktLightShow");
+    expect(xml).toContain("Tube Left");
+
+    await useTaktStore.getState().unpatchFixture(fxId);
+    expect(useTaktStore.getState().showState.patch).toHaveLength(0);
+
+    await useTaktStore.getState().importShowXml(xml);
+    expect(useTaktStore.getState().showState.patch).toHaveLength(1);
+  });
 });

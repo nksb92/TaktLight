@@ -104,3 +104,115 @@ describe("TaktLight Slice 1 Studio UI", () => {
     expect(await screen.findByText(/\/name/)).toBeInTheDocument();
   });
 });
+
+describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
+  beforeEach(() => {
+    useTaktStore.getState().resetForTest();
+  });
+
+  it("supports dual-universe patching, rollover split toast + Undo/Redo, calibration, and .takt.xml export", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Patch View/i }));
+
+    expect(screen.getByTestId("patch-universe-1")).toBeInTheDocument();
+    expect(screen.getByTestId("patch-universe-2")).toBeInTheDocument();
+    expect(screen.getAllByText(/512 free \| largest block 512/)).toHaveLength(2);
+
+    const rolloverBtn = screen.getByRole("button", { name: /Rollover: ON/i });
+    fireEvent.click(rolloverBtn);
+    expect(
+      screen.getByRole("button", { name: /Rollover: OFF/i }),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "r" });
+    expect(
+      screen.getByRole("button", { name: /Rollover: ON/i }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Name Prefix"), {
+      target: { value: "Tube Left" },
+    });
+    fireEvent.change(screen.getByLabelText("Start Address"), {
+      target: { value: "505" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Patch Fixtures/i }));
+
+    expect(
+      await screen.findByText(
+        "Tube Left split: U1.505 to U1.512 + U2.001 to U2.026",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/CROSS PROTOCOL SPLIT/i)).toBeInTheDocument();
+
+    const toastUndo = screen.getByTestId("toast-undo-button");
+    fireEvent.click(toastUndo);
+    expect(useTaktStore.getState().showState.patch).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Redo$/i }));
+    expect(useTaktStore.getState().showState.patch).toHaveLength(1);
+
+    fireEvent.change(screen.getByLabelText("Gamma"), {
+      target: { value: "2.6" },
+    });
+    fireEvent.change(screen.getByLabelText("Min Dimmer DMX"), {
+      target: { value: "12" },
+    });
+    fireEvent.change(screen.getByLabelText("White Mode"), {
+      target: { value: "add" },
+    });
+
+    const cal = useTaktStore.getState().showState.patch[0].calibration;
+    expect(cal.gamma).toBeCloseTo(2.6);
+    expect(cal.min_dimmer_dmx).toBe(12);
+    expect(cal.white_mode).toBe("add");
+
+    fireEvent.click(screen.getByRole("button", { name: /Export .takt.xml/i }));
+    const xmlPreview = await screen.findByTestId("show-xml-preview");
+    expect(xmlPreview).toHaveTextContent('<TaktLightShow version="1.0"');
+    expect(xmlPreview).toHaveTextContent('profile="age/rlcv3_8_segment_tube.json"');
+  });
+
+  it("renders 2D Fixture Grid, updates GridPos, and previews 1D OrderRule & TargetRef mapping", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube A",
+        1,
+        1,
+        1,
+      );
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: /2D Grid/i }));
+
+    expect(screen.getByTestId("fixture-grid-canvas")).toBeInTheDocument();
+    expect(screen.getByText("Tube A")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Grid X"), {
+      target: { value: "0.35" },
+    });
+    fireEvent.change(screen.getByLabelText("Grid Rotation"), {
+      target: { value: "45" },
+    });
+
+    const pos = useTaktStore.getState().showState.patch[0].grid_pos;
+    expect(pos.x).toBeCloseTo(0.35);
+    expect(pos.rotation).toBeCloseTo(45);
+
+    fireEvent.change(screen.getByLabelText("Order Rule"), {
+      target: { value: "center_out" },
+    });
+    fireEvent.change(screen.getByLabelText("Target Reference"), {
+      target: { value: "fx_001:7..0" },
+    });
+
+    const preview = screen.getByTestId("order-rule-preview");
+    expect(preview).toHaveTextContent("Cell 7");
+    expect(preview).toHaveTextContent("Cell 0");
+    expect(preview).toHaveTextContent("u=1.00");
+  });
+});

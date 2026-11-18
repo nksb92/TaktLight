@@ -1,3 +1,5 @@
+use crate::ofl::expander::{ChannelRole, ChannelTarget};
+use crate::ofl::model::OflColor;
 use crate::state::plan::RenderPlan;
 use crate::state::runtime::RuntimeControl;
 
@@ -69,7 +71,105 @@ impl Engine {
             });
         }
 
-        let cell_preview_rgbd = vec![0u8; (plan.cell_count as usize) * 4];
+        // Compute cell preview RGBD bytes from live DMX output (supports Channel Park visualization on 2D grid!)
+        let mut cell_preview_rgbd = vec![0u8; (plan.cell_count as usize) * 4];
+        for fx in &plan.fixtures {
+            let mut fixture_master: Option<u8> = None;
+            for ch in &fx.channels {
+                if ch.target == ChannelTarget::Fixture && ch.role == ChannelRole::Intensity {
+                    if let Some(u_idx) = ch.universe_index {
+                        if let Some(u) = universes.get(u_idx) {
+                            fixture_master = Some(u.dmx[(ch.dmx_address - 1) as usize]);
+                        }
+                    }
+                }
+            }
+
+            for local_cell in 0..fx.cell_count {
+                let global_cell = fx.cell_start + (local_cell as usize);
+                if global_cell * 4 + 3 >= cell_preview_rgbd.len() {
+                    continue;
+                }
+                let mut r: u16 = 0;
+                let mut g: u16 = 0;
+                let mut b: u16 = 0;
+                let mut w: u16 = 0;
+                let mut cell_intensity: Option<u8> = None;
+
+                for ch in &fx.channels {
+                    let applies = match &ch.target {
+                        ChannelTarget::Cell { cell_index, .. } => *cell_index == local_cell,
+                        ChannelTarget::Fixture => false,
+                    };
+                    if !applies {
+                        continue;
+                    }
+                    let val = ch
+                        .universe_index
+                        .and_then(|u_idx| universes.get(u_idx))
+                        .map(|u| u.dmx[(ch.dmx_address - 1) as usize])
+                        .unwrap_or(0);
+                    match ch.role {
+                        ChannelRole::Intensity => cell_intensity = Some(val),
+                        ChannelRole::ColorIntensity { color } => match color {
+                            OflColor::Red => r = r.max(val as u16),
+                            OflColor::Green => g = g.max(val as u16),
+                            OflColor::Blue => b = b.max(val as u16),
+                            OflColor::White | OflColor::WarmWhite | OflColor::ColdWhite => {
+                                w = w.max(val as u16)
+                            }
+                            OflColor::Amber => {
+                                r = r.max(val as u16);
+                                g = g.max((val as u16) * 2 / 3);
+                            }
+                            OflColor::Cyan => {
+                                g = g.max(val as u16);
+                                b = b.max(val as u16);
+                            }
+                            OflColor::Magenta => {
+                                r = r.max(val as u16);
+                                b = b.max(val as u16);
+                            }
+                            OflColor::Yellow => {
+                                r = r.max(val as u16);
+                                g = g.max(val as u16);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+
+                let rr = (r + w).min(255) as u8;
+                let gg = (g + w).min(255) as u8;
+                let bb = (b + w).min(255) as u8;
+                let eff_dim = match (cell_intensity, fixture_master) {
+                    (Some(ci), Some(fm)) => (((ci as u16) * (fm as u16)) / 255) as u8,
+                    (Some(ci), None) => ci,
+                    (None, Some(fm)) => fm,
+                    (None, None) => {
+                        if rr > 0 || gg > 0 || bb > 0 {
+                            255
+                        } else {
+                            0
+                        }
+                    }
+                };
+                // If color channels are parked/lit while fixture master was left at 0 in Slice 3 bench testing,
+                // keep preview dimmer proportional to max color channel so parked RGB channels stay visible
+                let display_dim = if eff_dim == 0 && (rr > 0 || gg > 0 || bb > 0) {
+                    rr.max(gg).max(bb) / 2
+                } else {
+                    eff_dim
+                };
+
+                let base_idx = global_cell * 4;
+                cell_preview_rgbd[base_idx] = rr;
+                cell_preview_rgbd[base_idx + 1] = gg;
+                cell_preview_rgbd[base_idx + 2] = bb;
+                cell_preview_rgbd[base_idx + 3] = display_dim;
+            }
+        }
 
         EvaluatedFrame {
             revision: plan.revision,

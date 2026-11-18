@@ -2,6 +2,10 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ofl::expander::{ChannelRole, ChannelTarget};
+use crate::show::patch::FixtureCalibration;
+use crate::show::spatial::OrderRule;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ArtNetOutputMode {
@@ -36,6 +40,59 @@ pub enum ProtocolKind {
 pub struct UniverseConfig {
     pub id: u16,
     pub protocol: ProtocolKind,
+    #[serde(default)]
+    pub review_output: bool,
+}
+
+impl UniverseConfig {
+    pub fn new(id: u16, protocol: ProtocolKind) -> Self {
+        Self {
+            id,
+            protocol,
+            review_output: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompiledCell {
+    pub fixture_index: usize,
+    pub fixture_id: String,
+    pub cell_index: u16,
+    pub pixel_key: String,
+    pub canvas_xy: [f32; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompiledChannelSlot {
+    pub universe_id: u16,
+    pub universe_index: Option<usize>,
+    pub dmx_address: u16,
+    pub name: String,
+    pub default_value: u8,
+    pub target: ChannelTarget,
+    pub role: ChannelRole,
+    pub fine_channel_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompiledFixture {
+    pub id: String,
+    pub name: String,
+    pub profile: String,
+    pub mode: String,
+    pub calibration: FixtureCalibration,
+    pub cell_start: usize,
+    pub cell_count: u16,
+    pub channels: Vec<CompiledChannelSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompiledGroup {
+    pub id: String,
+    pub name: String,
+    pub order: OrderRule,
+    pub cells: Vec<(usize, f32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +102,9 @@ pub struct RenderPlan {
     pub artsync_enabled: bool,
     pub cell_count: u32,
     pub base_dmx: Vec<[u8; 512]>,
+    pub fixtures: Vec<CompiledFixture>,
+    pub cells: Vec<CompiledCell>,
+    pub groups: Vec<CompiledGroup>,
 }
 
 impl Default for RenderPlan {
@@ -58,27 +118,30 @@ impl RenderPlan {
         Self {
             revision: 1,
             universes: vec![
-                UniverseConfig {
-                    id: 1,
-                    protocol: ProtocolKind::ArtNet {
+                UniverseConfig::new(
+                    1,
+                    ProtocolKind::ArtNet {
                         mode: ArtNetOutputMode::Broadcast,
                         net: 0,
                         subnet: 0,
                         uni: 0,
                     },
-                },
-                UniverseConfig {
-                    id: 2,
-                    protocol: ProtocolKind::Sacn {
+                ),
+                UniverseConfig::new(
+                    2,
+                    ProtocolKind::Sacn {
                         mode: SacnOutputMode::Multicast,
                         sacn_universe: 2,
                         priority: 100,
                     },
-                },
+                ),
             ],
             artsync_enabled: true,
             cell_count: 0,
             base_dmx: vec![[0u8; 512], [0u8; 512]],
+            fixtures: Vec::new(),
+            cells: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
