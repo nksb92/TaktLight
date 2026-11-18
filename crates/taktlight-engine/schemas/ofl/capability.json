@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/capability.json",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "NoFunction",
+        "Intensity",
+        "ColorIntensity",
+        "ShutterStrobe",
+        "WheelSlot",
+        "WheelShake",
+        "WheelSlotRotation",
+        "WheelRotation",
+        "Pan",
+        "Tilt",
+        "PanContinuous",
+        "TiltContinuous",
+        "ColorPreset",
+        "ColorTemperature",
+        "Zoom",
+        "Focus",
+        "Iris",
+        "Frost",
+        "Prism",
+        "PrismRotation",
+        "Gobo",
+        "BeamAngle",
+        "Effect",
+        "EffectSpeed",
+        "EffectDuration",
+        "EffectParameter",
+        "SoundSensitivity",
+        "Rotation",
+        "Speed",
+        "Time",
+        "Maintenance",
+        "Generic"
+      ]
+    },
+    "dmxRange": {
+      "$ref": "definitions.json#/definitions/dmxRange"
+    },
+    "color": {
+      "$ref": "definitions.json#/definitions/colorEnum"
+    },
+    "shutterEffect": {
+      "$ref": "definitions.json#/definitions/shutterEffectEnum"
+    },
+    "randomTiming": {
+      "type": "boolean"
+    },
+    "speedStart": {
+      "$ref": "definitions.json#/definitions/frequencyHz"
+    },
+    "speedEnd": {
+      "$ref": "definitions.json#/definitions/frequencyHz"
+    },
+    "wheel": {
+      "type": ["string", "array"]
+    },
+    "slotNumber": {
+      "type": ["integer", "number"],
+      "minimum": 1
+    },
+    "comment": {
+      "type": "string"
+    },
+    "helpWanted": {
+      "type": "string"
+    },
+    "menuClick": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "type": { "const": "ColorIntensity" } },
+        "required": ["type"]
+      },
+      "then": {
+        "required": ["color"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "ShutterStrobe" } },
+        "required": ["type"]
+      },
+      "then": {
+        "required": ["shutterEffect"]
+      }
+    }
+  ]
+}
