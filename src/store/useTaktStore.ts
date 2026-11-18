@@ -6,8 +6,18 @@ import {
   encodeBinaryFrame,
   normalizeFramePayload,
 } from "../lib/frameDecoder";
+import {
+  FixtureDetail,
+  FixtureSummary,
+  FixtureValidationResult,
+  getDefaultShippedFixtures,
+  sanitizeSlug,
+  SchemaValidationIssue,
+  validateAndExpandOflLocally,
+} from "../lib/oflBuilder";
 
 export type DisplayFormat = "DEC" | "HEX" | "PCT";
+export type WorkspaceTab = "monitor" | "fixtures";
 
 export type ArtNetOutputMode =
   | { mode: "broadcast" }
@@ -147,7 +157,14 @@ function createInitialDmxMap(
 }
 
 function createInitialState() {
+  const shipped = getDefaultShippedFixtures();
+  const detailsCache: Record<string, FixtureDetail> = {};
+  for (const item of shipped) {
+    detailsCache[item.summary.id] = item;
+  }
+
   return {
+    activeTab: "monitor" as WorkspaceTab,
     selectedUniverseId: 1,
     universes: DEFAULT_UNIVERSES,
     dmxByUniverse: createInitialDmxMap(DEFAULT_UNIVERSES),
@@ -175,6 +192,9 @@ function createInitialState() {
     connectedMode: isTauriEnvironment()
       ? ("tauri" as const)
       : ("simulation" as const),
+    fixtureSummaries: shipped.map((d) => d.summary),
+    fixtureDetailsCache: detailsCache,
+    selectedFixtureId: shipped[0]?.summary.id ?? null,
   };
 }
 
@@ -231,6 +251,7 @@ function synthesizeSimulationBuffer(state: {
 }
 
 export interface TaktStoreState {
+  activeTab: WorkspaceTab;
   selectedUniverseId: number;
   universes: UniverseConfig[];
   dmxByUniverse: Record<number, Uint8Array>;
@@ -249,7 +270,11 @@ export interface TaktStoreState {
   histogramOpen: boolean;
   selectedChannel: number | null;
   connectedMode: "tauri" | "simulation";
+  fixtureSummaries: FixtureSummary[];
+  fixtureDetailsCache: Record<string, FixtureDetail>;
+  selectedFixtureId: string | null;
 
+  setActiveTab: (tab: WorkspaceTab) => void;
   applyBinaryFrame: (buffer: ArrayBuffer) => void;
   applyEngineSnapshot: (snapshot: EngineSnapshotDto) => void;
   setSelectedUniverse: (universeId: number) => void;
@@ -267,11 +292,24 @@ export interface TaktStoreState {
   toggleHistogram: () => void;
   refreshSnapshot: () => Promise<void>;
   initEngineConnection: () => () => void;
+  loadFixtures: () => Promise<void>;
+  selectFixture: (id: string | null) => Promise<FixtureDetail | null>;
+  validateFixtureJson: (rawJson: string) => Promise<FixtureValidationResult>;
+  saveUserFixture: (
+    slug: string,
+    rawJson: string,
+  ) => Promise<
+    | { ok: true; detail: FixtureDetail }
+    | { ok: false; issues: SchemaValidationIssue[] }
+  >;
+  deleteUserFixture: (id: string) => Promise<void>;
   resetForTest: () => void;
 }
 
 export const useTaktStore = create<TaktStoreState>((set, get) => ({
   ...createInitialState(),
+
+  setActiveTab: (tab) => set({ activeTab: tab }),
 
   applyBinaryFrame: (buffer) => {
     const decoded = decodeBinaryFrame(buffer);
@@ -458,6 +496,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       };
 
       void get().refreshSnapshot();
+      void get().loadFixtures();
       void invoke("subscribe_frames", { channel });
 
       const pollTimer = setInterval(() => {
@@ -475,12 +514,11 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       };
     }
 
-    // Browser / offline UI dev simulation at ~44 Hz
     let tick = 0;
     const simTimer = setInterval(() => {
       const state = get();
-      // Deterministic tiny ±15 us pseudo-jitter for visual histogram preview
-      const pseudoJitter = Math.sin(tick * 1.7) * 14.0 + Math.cos(tick * 0.9) * 6.0;
+      const pseudoJitter =
+        Math.sin(tick * 1.7) * 14.0 + Math.cos(tick * 0.9) * 6.0;
       const sample = 22727.0 + pseudoJitter;
       const nextSamples =
         state.jitterSamplesUs.length >= 256
@@ -499,6 +537,163 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     return () => {
       clearInterval(simTimer);
     };
+  },
+
+  loadFixtures: async () => {
+    if (isTauriEnvironment()) {
+      const summaries = await invoke<FixtureSummary[]>("list_fixtures");
+      set({ fixtureSummaries: summaries });
+      return;
+    }
+    const cache = get().fixtureDetailsCache;
+    set({
+      fixtureSummaries: Object.values(cache)
+        .map((d) => d.summary)
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    });
+  },
+
+  selectFixture: async (id) => {
+    set({ selectedFixtureId: id });
+    if (!id) return null;
+
+    if (isTauriEnvironment()) {
+      const detail = await invoke<FixtureDetail>("get_fixture_detail", { id });
+      set((state) => ({
+        fixtureDetailsCache: {
+          ...state.fixtureDetailsCache,
+          [id]: detail,
+        },
+      }));
+      return detail;
+    }
+
+    return get().fixtureDetailsCache[id] ?? null;
+  },
+
+  validateFixtureJson: async (rawJson) => {
+    if (isTauriEnvironment()) {
+      return await invoke<FixtureValidationResult>("validate_fixture_json", {
+        rawJson,
+      });
+    }
+    return validateAndExpandOflLocally(rawJson);
+  },
+
+  saveUserFixture: async (slug, rawJson) => {
+    if (isTauriEnvironment()) {
+      try {
+        const detail = await invoke<FixtureDetail>("save_user_fixture", {
+          slug,
+          rawJson,
+        });
+        set((state) => {
+          const nextCache = {
+            ...state.fixtureDetailsCache,
+            [detail.summary.id]: detail,
+          };
+          const filtered = state.fixtureSummaries.filter(
+            (s) => s.id !== detail.summary.id,
+          );
+          return {
+            fixtureDetailsCache: nextCache,
+            fixtureSummaries: [...filtered, detail.summary].sort((a, b) =>
+              a.id.localeCompare(b.id),
+            ),
+            selectedFixtureId: detail.summary.id,
+          };
+        });
+        return { ok: true, detail };
+      } catch (err) {
+        const issues = Array.isArray(err)
+          ? (err as SchemaValidationIssue[])
+          : [
+              {
+                instance_path: "/",
+                schema_path: "",
+                message: String(err),
+              },
+            ];
+        return { ok: false, issues };
+      }
+    }
+
+    const clean = sanitizeSlug(slug);
+    if (!clean) {
+      return {
+        ok: false,
+        issues: [
+          {
+            instance_path: "/name",
+            schema_path: "",
+            message: "Fixture name/slug cannot be empty",
+          },
+        ],
+      };
+    }
+
+    const validation = validateAndExpandOflLocally(rawJson);
+    if (!validation.valid) {
+      return { ok: false, issues: validation.issues };
+    }
+
+    const parsed = JSON.parse(rawJson) as {
+      name: string;
+      shortName?: string;
+      categories: string[];
+    };
+    const id = `user/${clean}.json`;
+    const detail: FixtureDetail = {
+      summary: {
+        id,
+        name: parsed.name,
+        short_name: parsed.shortName ?? parsed.name,
+        origin: "user_local",
+        categories: parsed.categories,
+        pixel_count: validation.pixel_count,
+        modes: validation.expanded_modes.map((m) => ({
+          name: m.name,
+          short_name: m.short_name,
+          channel_count: m.channel_count,
+          cell_count: m.cells.length,
+        })),
+      },
+      raw_json: JSON.stringify(parsed, null, 2),
+      expanded_modes: validation.expanded_modes,
+    };
+
+    set((state) => {
+      const nextCache = { ...state.fixtureDetailsCache, [id]: detail };
+      const nextSummaries = Object.values(nextCache)
+        .map((d) => d.summary)
+        .sort((a, b) => a.id.localeCompare(b.id));
+      return {
+        fixtureDetailsCache: nextCache,
+        fixtureSummaries: nextSummaries,
+        selectedFixtureId: id,
+      };
+    });
+
+    return { ok: true, detail };
+  },
+
+  deleteUserFixture: async (id) => {
+    if (isTauriEnvironment()) {
+      await invoke("delete_user_fixture", { id });
+    }
+    set((state) => {
+      const nextCache = { ...state.fixtureDetailsCache };
+      delete nextCache[id];
+      const nextSummaries = state.fixtureSummaries.filter((s) => s.id !== id);
+      return {
+        fixtureDetailsCache: nextCache,
+        fixtureSummaries: nextSummaries,
+        selectedFixtureId:
+          state.selectedFixtureId === id
+            ? (nextSummaries[0]?.id ?? null)
+            : state.selectedFixtureId,
+      };
+    });
   },
 
   resetForTest: () => set(createInitialState()),

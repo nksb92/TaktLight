@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { encodeBinaryFrame } from "../../lib/frameDecoder";
+import {
+  buildOflFixtureJson,
+  createDefaultBuilderDraft,
+} from "../../lib/oflBuilder";
 import { parkKey, useTaktStore } from "../useTaktStore";
 
 describe("useTaktStore", () => {
@@ -70,5 +74,29 @@ describe("useTaktStore", () => {
     expect(useTaktStore.getState().adapterSelection).toEqual({
       mode: "offline",
     });
+  });
+
+  it("loads shipped OFL fixtures, validates, saves, and deletes user fixtures", async () => {
+    await useTaktStore.getState().loadFixtures();
+    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(2);
+
+    const draft = createDefaultBuilderDraft();
+    draft.name = "Bench Test Bar";
+    const validJson = buildOflFixtureJson(draft);
+    const saveRes = await useTaktStore
+      .getState()
+      .saveUserFixture("Bench Test Bar", validJson);
+    expect(saveRes.ok).toBe(true);
+    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(3);
+
+    const badSave = await useTaktStore
+      .getState()
+      .saveUserFixture("Broken", "{\"name\": \"\"}");
+    expect(badSave.ok).toBe(false);
+
+    await useTaktStore
+      .getState()
+      .deleteUserFixture("user/bench_test_bar.json");
+    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(2);
   });
 });

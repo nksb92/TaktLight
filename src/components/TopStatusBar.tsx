@@ -1,4 +1,13 @@
-import { Activity, Cpu, Lock, Network, Radio, ShieldAlert } from "lucide-react";
+import {
+  Activity,
+  Cpu,
+  Layers,
+  Lock,
+  Monitor,
+  Network,
+  Radio,
+  ShieldAlert,
+} from "lucide-react";
 import { AdapterSelection, useTaktStore } from "../store/useTaktStore";
 
 function selectionToKey(sel: AdapterSelection): string {
@@ -15,6 +24,7 @@ function keyToSelection(key: string): AdapterSelection {
 }
 
 export function TopStatusBar() {
+  const activeTab = useTaktStore((s) => s.activeTab);
   const telemetry = useTaktStore((s) => s.telemetry);
   const parkedChannels = useTaktStore((s) => s.parkedChannels);
   const blackout = useTaktStore((s) => s.blackout);
@@ -27,6 +37,7 @@ export function TopStatusBar() {
   const discoveredNodes = useTaktStore((s) => s.discoveredNodes);
   const histogramOpen = useTaktStore((s) => s.histogramOpen);
 
+  const setActiveTab = useTaktStore((s) => s.setActiveTab);
   const setBlackout = useTaktStore((s) => s.setBlackout);
   const setGrandMaster = useTaktStore((s) => s.setGrandMaster);
   const setNetworkAdapter = useTaktStore((s) => s.setNetworkAdapter);
@@ -54,11 +65,45 @@ export function TopStatusBar() {
                 TAKTLIGHT
               </span>
               <span className="font-mono text-[10px] uppercase tracking-widest px-1.5 py-0.5 rounded bg-ink border border-steel text-fog">
-                SLICE 1
+                STUDIO
               </span>
             </div>
           </div>
         </div>
+
+        {/* Workspace View Switcher */}
+        <nav
+          aria-label="Workspace Views"
+          className="flex items-center gap-1 bg-ink border border-steel rounded-md p-0.5"
+        >
+          <button
+            type="button"
+            aria-pressed={activeTab === "monitor"}
+            onClick={() => setActiveTab("monitor")}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded font-sans text-xs font-medium transition-colors ${
+              activeTab === "monitor"
+                ? "bg-ember text-frost"
+                : "text-fog hover:text-mist"
+            }`}
+          >
+            <Monitor className="w-3.5 h-3.5" />
+            <span>DMX Monitor</span>
+          </button>
+
+          <button
+            type="button"
+            aria-pressed={activeTab === "fixtures"}
+            onClick={() => setActiveTab("fixtures")}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded font-sans text-xs font-medium transition-colors ${
+              activeTab === "fixtures"
+                ? "bg-ember text-frost"
+                : "text-fog hover:text-mist"
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5" />
+            <span>Fixture Builder</span>
+          </button>
+        </nav>
 
         {/* 44 Hz Telemetry Pill */}
         <div
