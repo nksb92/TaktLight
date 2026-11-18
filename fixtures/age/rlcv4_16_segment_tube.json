@@ -1,0 +1,99 @@
+{
+  "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+  "name": "RLCV4 16-Segment RGBW Tube",
+  "shortName": "RLCV4-16Px",
+  "categories": ["Pixel Bar", "Color Changer"],
+  "meta": {
+    "authors": ["Another German Engineer"],
+    "createDate": "2026-11-17",
+    "lastModifyDate": "2026-11-18"
+  },
+  "matrix": {
+    "pixelCount": [16, 1, 1],
+    "pixelGroups": {
+      "All": "all"
+    }
+  },
+  "availableChannels": {
+    "Master Dimmer": {
+      "defaultValue": 0,
+      "capability": { "type": "Intensity" }
+    },
+    "Strobe": {
+      "defaultValue": 0,
+      "capabilities": [
+        { "dmxRange": [0, 7], "type": "ShutterStrobe", "shutterEffect": "Closed" },
+        { "dmxRange": [8, 15], "type": "ShutterStrobe", "shutterEffect": "Open" },
+        { "dmxRange": [16, 200], "type": "ShutterStrobe", "shutterEffect": "Strobe", "speedStart": "1Hz", "speedEnd": "20Hz" },
+        { "dmxRange": [201, 255], "type": "ShutterStrobe", "shutterEffect": "Strobe", "randomTiming": true, "speedStart": "1Hz", "speedEnd": "20Hz" }
+      ]
+    },
+    "Red": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "Red" }
+    },
+    "Green": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "Green" }
+    },
+    "Blue": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "Blue" }
+    },
+    "White": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "White" }
+    }
+  },
+  "templateChannels": {
+    "Red $pixelKey": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "Red" }
+    },
+    "Green $pixelKey": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "Green" }
+    },
+    "Blue $pixelKey": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "Blue" }
+    },
+    "White $pixelKey": {
+      "defaultValue": 0,
+      "capability": { "type": "ColorIntensity", "color": "White" }
+    }
+  },
+  "modes": [
+    {
+      "name": "66ch Pixel Mode",
+      "shortName": "66ch",
+      "channels": [
+        "Master Dimmer",
+        "Strobe",
+        {
+          "insert": "matrixChannels",
+          "repeatFor": "eachPixelABC",
+          "channelOrder": "perPixel",
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey",
+            "White $pixelKey"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "6ch Basic Mode",
+      "shortName": "6ch",
+      "channels": [
+        "Master Dimmer",
+        "Strobe",
+        "Red",
+        "Green",
+        "Blue",
+        "White"
+      ]
+    }
+  ]
+}
