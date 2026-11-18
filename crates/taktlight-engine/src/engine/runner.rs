@@ -363,7 +363,8 @@ pub fn run_realtime_loop_with_sink(
     cmd_rx: Receiver<EngineCommand>,
     max_duration: Option<Duration>,
 ) -> JitterStats {
-    let sleeper = SpinSleeper::default();
+    // 2 ms spin cushion prevents Windows WaitableTimer wakeups (>700 us) from overshooting the deadline
+    let sleeper = SpinSleeper::new(2_000_000);
     let mut transmitter = TickTransmitter::new(config.cid, config.source_name);
     let mut jitter = JitterTracker::new();
     let mut quantizer_state = QuantizerState::default();

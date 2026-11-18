@@ -1,13 +1,27 @@
+import { useEffect } from "react";
+import { DmxMonitor } from "./components/DmxMonitor";
+import { JitterHistogram } from "./components/JitterHistogram";
+import { TopStatusBar } from "./components/TopStatusBar";
+import { useTaktStore } from "./store/useTaktStore";
+
 export function App() {
+  const histogramOpen = useTaktStore((s) => s.histogramOpen);
+  const initEngineConnection = useTaktStore((s) => s.initEngineConnection);
+
+  useEffect(() => {
+    const disconnect = initEngineConnection();
+    return () => {
+      disconnect();
+    };
+  }, [initEngineConnection]);
+
   return (
-    <div className="min-h-screen bg-void text-mist flex items-center justify-center font-sans">
-      <div className="bg-slate border-[1.5px] border-steel rounded-panel p-6">
-        <div className="font-mono text-xs uppercase tracking-wider text-fog">
-          SYSTEM STATUS
-        </div>
-        <h1 className="text-xl font-semibold text-mist mt-1">TaktLight Studio</h1>
-        <div className="h-[2px] w-12 bg-ember mt-2" />
-      </div>
+    <div className="min-h-screen bg-void text-mist font-sans flex flex-col">
+      <TopStatusBar />
+      <main className="flex-1 p-4 flex flex-col gap-4 max-w-[1920px] w-full mx-auto">
+        {histogramOpen && <JitterHistogram />}
+        <DmxMonitor />
+      </main>
     </div>
   );
 }
