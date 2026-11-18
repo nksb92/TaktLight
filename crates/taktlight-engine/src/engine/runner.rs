@@ -572,6 +572,9 @@ mod tests {
             artsync_enabled: true,
             cell_count: 0,
             base_dmx: vec![[0u8; 512]],
+            fixtures: Vec::new(),
+            cells: Vec::new(),
+            groups: Vec::new(),
         };
         let f2 = Engine::evaluate_frame(
             &artnet_only,

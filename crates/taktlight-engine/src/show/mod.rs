@@ -1,6 +1,9 @@
+pub mod compiler;
 pub mod patch;
 pub mod spatial;
 pub mod targets;
+pub mod undo;
+pub mod xml;
 
 use thiserror::Error;
 
