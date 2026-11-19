@@ -28,6 +28,17 @@ pub struct EvaluatedFrame {
 
 pub struct Engine;
 
+#[inline]
+fn dmx_to_perceptual_u8(val: u8, gamma: f32) -> u8 {
+    if val == 0 {
+        return 0;
+    }
+    let inv_g = 1.0 / gamma.max(0.1);
+    (((val as f32) / 255.0).powf(inv_g) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
 impl Engine {
     pub fn evaluate_frame(
         plan: &RenderPlan,
@@ -110,7 +121,10 @@ impl Engine {
                 if ch.target == ChannelTarget::Fixture && ch.role == ChannelRole::Intensity {
                     if let Some(u_idx) = ch.universe_index {
                         if let Some(u) = universes.get(u_idx) {
-                            fixture_master = Some(u.dmx[(ch.dmx_address - 1) as usize]);
+                            fixture_master = Some(dmx_to_perceptual_u8(
+                                u.dmx[(ch.dmx_address - 1) as usize],
+                                fx.calibration.gamma,
+                            ));
                         }
                     }
                 }
@@ -141,7 +155,9 @@ impl Engine {
                         .map(|u| u.dmx[(ch.dmx_address - 1) as usize])
                         .unwrap_or(0);
                     match ch.role {
-                        ChannelRole::Intensity => cell_intensity = Some(val),
+                        ChannelRole::Intensity => {
+                            cell_intensity = Some(dmx_to_perceptual_u8(val, fx.calibration.gamma))
+                        }
                         ChannelRole::ColorIntensity { color } => match color {
                             OflColor::Red => r = r.max(val as u16),
                             OflColor::Green => g = g.max(val as u16),
@@ -171,9 +187,9 @@ impl Engine {
                     }
                 }
 
-                let rr = (r + w).min(255) as u8;
-                let gg = (g + w).min(255) as u8;
-                let bb = (b + w).min(255) as u8;
+                let rr = dmx_to_perceptual_u8((r + w).min(255) as u8, fx.calibration.gamma);
+                let gg = dmx_to_perceptual_u8((g + w).min(255) as u8, fx.calibration.gamma);
+                let bb = dmx_to_perceptual_u8((b + w).min(255) as u8, fx.calibration.gamma);
                 let eff_dim = match (cell_intensity, fixture_master) {
                     (Some(ci), Some(fm)) => (((ci as u16) * (fm as u16)) / 255) as u8,
                     (Some(ci), None) => ci,
@@ -186,19 +202,11 @@ impl Engine {
                         }
                     }
                 };
-                // If color channels are parked/lit while fixture master was left at 0 in Slice 3 bench testing,
-                // keep preview dimmer proportional to max color channel so parked RGB channels stay visible
-                let display_dim = if eff_dim == 0 && (rr > 0 || gg > 0 || bb > 0) {
-                    rr.max(gg).max(bb) / 2
-                } else {
-                    eff_dim
-                };
-
                 let base_idx = global_cell * 4;
                 cell_preview_rgbd[base_idx] = rr;
                 cell_preview_rgbd[base_idx + 1] = gg;
                 cell_preview_rgbd[base_idx + 2] = bb;
-                cell_preview_rgbd[base_idx + 3] = display_dim;
+                cell_preview_rgbd[base_idx + 3] = eff_dim;
             }
         }
 
@@ -216,6 +224,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::show::patch::WhiteMode;
 
     #[test]
     fn park_overrides_grand_master_and_blackout() {
@@ -251,7 +260,7 @@ mod tests {
         use crate::mixer::traits::{MergeOp, SmartControlLayer, SmartLayerTrait};
         use crate::ofl::library::FixtureLibrary;
         use crate::show::compiler::compile_render_plan;
-        use crate::show::patch::{FixtureCalibration, FixtureInstance, WhiteMode};
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
         use crate::show::spatial::GridPos;
         use crate::show::xml::{ColorPaletteDef, DimmerPaletteDef, ShowState};
 
@@ -262,6 +271,7 @@ mod tests {
             name: "Pure White".into(),
             hex_start: "#FFFFFF".into(),
             hex_end: "#FFFFFF".into(),
+            colors: Vec::new(),
         });
         show.dimmer_palettes.push(DimmerPaletteDef {
             id: "dim_full".into(),
@@ -349,11 +359,11 @@ mod tests {
     fn golden_frame_cyberpunk_sine_and_step_chase_scene_across_time_steps() {
         use crate::ofl::library::FixtureLibrary;
         use crate::show::compiler::compile_render_plan;
-        use crate::show::patch::{FixtureCalibration, FixtureInstance, WhiteMode};
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
         use crate::show::spatial::{GridPos, OrderRule};
         use crate::show::xml::{
-            ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef, FxBlockDef, FxElementDef,
-            SceneDef, ShowState,
+            ColorPaletteDef, DimmerPaletteDef, DurationUnit, FixtureGroupDef, FxBlockDef,
+            FxElementDef, SceneDef, ShowState,
         };
 
         let library = FixtureLibrary::load(None);
@@ -364,6 +374,7 @@ mod tests {
             name: "Cyberpunk Dual".into(),
             hex_start: "#FF5500".into(),
             hex_end: "#2255AA".into(),
+            colors: Vec::new(),
         });
         show.dimmer_palettes.push(DimmerPaletteDef {
             id: "dim_half".into(),
@@ -399,6 +410,7 @@ mod tests {
             name: "Cyberpunk Sine Wave".into(),
             target_group: Some("grp_tubes_cells".into()),
             duration_beats: 4.0,
+            duration_sec: None,
             loop_block: true,
             elements: vec![
                 FxElementDef::StaticTrait {
@@ -407,6 +419,8 @@ mod tests {
                     palette_ref: Some("dim_half".into()),
                     value_start: None,
                     value_end: None,
+                    hex_start: None,
+                    hex_end: None,
                     order: None,
                 },
                 FxElementDef::StaticTrait {
@@ -415,6 +429,8 @@ mod tests {
                     palette_ref: Some("pal_cyber".into()),
                     value_start: None,
                     value_end: None,
+                    hex_start: None,
+                    hex_end: None,
                     order: Some(OrderRule::Mirror),
                 },
                 FxElementDef::Curve1D {
@@ -425,8 +441,17 @@ mod tests {
                     offset: 0.0,
                     rate_beats: Some(2.0),
                     speed_hz: None,
+                    rate_cycles: None,
+                    phase_deg: 0.0,
                     phase_spread_deg: 360.0,
                     duty: Some(0.5),
+                    grayscale: false,
+                    color_width: 1.0,
+                    gradient: 1.0,
+                    angle_deg: 0.0,
+                    fx_kind_tag: None,
+                    inline_colors: Vec::new(),
+                    value_stops: Vec::new(),
                     palette_ref: None,
                     order: None,
                 },
@@ -435,6 +460,9 @@ mod tests {
                     op: "htp".into(),
                     step_beats: Some(0.5),
                     speed_hz: None,
+                    rate_cycles: None,
+                    one_way: true,
+                    pixels_on: None,
                     active_ratio: Some(0.25),
                     fade: 0.20,
                     amplitude: 1.0,
@@ -451,6 +479,8 @@ mod tests {
             priority: 10,
             fade_in_sec: 0.5,
             fade_out_sec: 1.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_cyber_wave".into()],
         };
         show.scenes.push(scene.clone());
@@ -528,12 +558,12 @@ mod tests {
         assert_ne!(&f50.universes[0].dmx[2..34], &f100.universes[0].dmx[2..34]);
 
         const GOLDEN_F50: [u8; 34] = [
-            255, 11, 255, 5, 0, 0, 70, 4, 0, 6, 5, 0, 4, 5, 0, 4, 5, 4, 0, 4, 5, 4, 5, 0, 4, 5, 70,
-            4, 0, 6, 255, 5, 0, 0,
+            255, 11, 255, 26, 0, 0, 85, 4, 0, 45, 5, 0, 5, 10, 0, 4, 7, 6, 0, 4, 7, 6, 5, 0, 5, 10,
+            85, 4, 0, 45, 255, 26, 0, 0,
         ];
         const GOLDEN_F100: [u8; 34] = [
-            255, 11, 255, 5, 0, 0, 6, 4, 0, 4, 8, 0, 6, 7, 0, 4, 22, 5, 0, 4, 22, 5, 8, 0, 6, 7, 6,
-            4, 0, 4, 255, 5, 0, 0,
+            255, 11, 255, 26, 0, 0, 7, 4, 0, 5, 8, 0, 6, 28, 0, 5, 41, 27, 0, 5, 41, 27, 8, 0, 6,
+            28, 7, 4, 0, 5, 255, 26, 0, 0,
         ];
         assert_eq!(&f50.universes[0].dmx[0..34], &GOLDEN_F50);
         assert_eq!(&f100.universes[0].dmx[0..34], &GOLDEN_F100);
@@ -546,8 +576,8 @@ mod tests {
         use crate::show::patch::{FixtureCalibration, FixtureInstance};
         use crate::show::spatial::GridPos;
         use crate::show::xml::{
-            ClipDef, ColorPaletteDef, FxBlockDef, FxElementDef, SceneDef, ShowState, TempoPointDef,
-            TimelineDef, TrackDef,
+            ClipDef, ColorPaletteDef, DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState,
+            TempoPointDef, TimelineDef, TrackDef,
         };
 
         let lib = FixtureLibrary::load(None);
@@ -557,12 +587,14 @@ mod tests {
             name: "Orange".into(),
             hex_start: "#FF5500".into(),
             hex_end: "#FF5500".into(),
+            colors: Vec::new(),
         });
         show.color_palettes.push(ColorPaletteDef {
             id: "pal_blue".into(),
             name: "Blue".into(),
             hex_start: "#0044FF".into(),
             hex_end: "#0044FF".into(),
+            colors: Vec::new(),
         });
         show.patch.push(FixtureInstance {
             id: "fx_201".into(),
@@ -586,6 +618,7 @@ mod tests {
             name: "Orange".into(),
             target_group: Some("all".into()),
             duration_beats: 4.0,
+            duration_sec: None,
             loop_block: true,
             elements: vec![
                 FxElementDef::StaticTrait {
@@ -594,6 +627,8 @@ mod tests {
                     palette_ref: None,
                     value_start: Some(1.0),
                     value_end: Some(1.0),
+                    hex_start: None,
+                    hex_end: None,
                     order: None,
                 },
                 FxElementDef::StaticTrait {
@@ -602,6 +637,8 @@ mod tests {
                     palette_ref: Some("pal_orange".into()),
                     value_start: Some(0.0),
                     value_end: Some(1.0),
+                    hex_start: None,
+                    hex_end: None,
                     order: None,
                 },
             ],
@@ -611,6 +648,7 @@ mod tests {
             name: "Blue Busk".into(),
             target_group: Some("all".into()),
             duration_beats: 4.0,
+            duration_sec: None,
             loop_block: true,
             elements: vec![
                 FxElementDef::StaticTrait {
@@ -619,6 +657,8 @@ mod tests {
                     palette_ref: None,
                     value_start: Some(1.0),
                     value_end: Some(1.0),
+                    hex_start: None,
+                    hex_end: None,
                     order: None,
                 },
                 FxElementDef::StaticTrait {
@@ -627,6 +667,8 @@ mod tests {
                     palette_ref: Some("pal_blue".into()),
                     value_start: Some(0.0),
                     value_end: Some(1.0),
+                    hex_start: None,
+                    hex_end: None,
                     order: None,
                 },
             ],
@@ -639,6 +681,8 @@ mod tests {
             priority: 10,
             fade_in_sec: 0.0,
             fade_out_sec: 0.5,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_blue".into()],
         });
         show.timelines.push(TimelineDef {
@@ -682,6 +726,8 @@ mod tests {
                                 palette_ref: None,
                                 value_start: Some(1.0),
                                 value_end: Some(1.0),
+                                hex_start: None,
+                                hex_end: None,
                                 order: None,
                             },
                             FxElementDef::StaticTrait {
@@ -690,6 +736,8 @@ mod tests {
                                 palette_ref: Some("pal_blue".into()),
                                 value_start: Some(0.0),
                                 value_end: Some(1.0),
+                                hex_start: None,
+                                hex_end: None,
                                 order: None,
                             },
                         ],
@@ -743,5 +791,341 @@ mod tests {
             &mut q,
         );
         assert!(f_busk.universes[0].dmx[4] > 200);
+    }
+
+    #[test]
+    fn single_gamma_preserves_orange_and_blue_dmx_and_srgb_preview_roundtrip() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::GridPos;
+        use crate::show::xml::{
+            ColorPaletteDef, DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState,
+        };
+
+        let lib = FixtureLibrary::load(None);
+        let mut show = ShowState::default();
+        show.color_palettes.push(ColorPaletteDef {
+            id: "pal_o".into(),
+            name: "Orange".into(),
+            hex_start: "#FF5500".into(),
+            hex_end: "#FF5500".into(),
+            colors: vec!["#FF5500".into(), "#FF5500".into()],
+        });
+        show.patch.push(FixtureInstance {
+            id: "fx_1".into(),
+            profile: "age/rlcv3_8_segment_tube.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Tube".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos::default(),
+            calibration: FixtureCalibration {
+                gamma: 2.2,
+                min_dimmer_dmx: 0,
+                max_dimmer_dmx: 255,
+                white_mode: WhiteMode::Off,
+                white_gain: 1.0,
+            },
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_o".into(),
+            name: "Orange".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![
+                FxElementDef::StaticTrait {
+                    trait_name: "dimmer".into(),
+                    op: "htp".into(),
+                    palette_ref: None,
+                    value_start: Some(1.0),
+                    value_end: Some(1.0),
+                    hex_start: None,
+                    hex_end: None,
+                    order: None,
+                },
+                FxElementDef::StaticTrait {
+                    trait_name: "color".into(),
+                    op: "ltp".into(),
+                    palette_ref: Some("pal_o".into()),
+                    value_start: Some(0.0),
+                    value_end: Some(1.0),
+                    hex_start: None,
+                    hex_end: None,
+                    order: None,
+                },
+            ],
+        });
+        let sc = SceneDef {
+            id: "sc_o".into(),
+            name: "Orange".into(),
+            bank: Some("Bank 1".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_o".into()],
+        };
+        show.scenes.push(sc.clone());
+
+        let plan = compile_render_plan(1, &show, &lib).unwrap();
+        let mut rt = RuntimeControl::new();
+        rt.trigger_scene(&sc, 0.0);
+        let mut q = QuantizerState::default();
+        let frame = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 0,
+            },
+            &rt,
+            &mut q,
+        );
+        // Single gamma 2.2 on #FF5500 (G=85/255 = 1/3 -> (1/3)^2.2 * 255 ~= 23, NOT 1!)
+        assert_eq!(frame.universes[0].dmx[2], 255);
+        assert!(frame.universes[0].dmx[3] >= 20 && frame.universes[0].dmx[3] <= 26);
+        assert_eq!(frame.universes[0].dmx[4], 0);
+        // Inverse-gamma 2D preview reconstructs ~85 for green channel
+        assert_eq!(frame.cell_preview_rgbd[0], 255);
+        assert!((frame.cell_preview_rgbd[1] as i16 - 85).abs() <= 4);
+        assert_eq!(frame.cell_preview_rgbd[2], 0);
+        assert_eq!(frame.cell_preview_rgbd[3], 255);
+    }
+
+    #[test]
+    fn color_only_scene_stays_strictly_dark_until_dimmer_or_master_raised() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::GridPos;
+        use crate::show::xml::{
+            ColorPaletteDef, DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState,
+        };
+
+        let lib = FixtureLibrary::load(None);
+        let mut show = ShowState::default();
+        show.color_palettes.push(ColorPaletteDef {
+            id: "pal_red".into(),
+            name: "Red".into(),
+            hex_start: "#FF0000".into(),
+            hex_end: "#FF0000".into(),
+            colors: Vec::new(),
+        });
+        show.patch.push(FixtureInstance {
+            id: "fx_1".into(),
+            profile: "age/rlcv3_8_segment_tube.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Tube".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos::default(),
+            calibration: FixtureCalibration::default(),
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_col_only".into(),
+            name: "Color Only".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![FxElementDef::StaticTrait {
+                trait_name: "color".into(),
+                op: "ltp".into(),
+                palette_ref: Some("pal_red".into()),
+                value_start: Some(0.0),
+                value_end: Some(1.0),
+                hex_start: None,
+                hex_end: None,
+                order: None,
+            }],
+        });
+        let sc_col = SceneDef {
+            id: "sc_col".into(),
+            name: "Color Only".into(),
+            bank: Some("main".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_col_only".into()],
+        };
+        show.scenes.push(sc_col.clone());
+
+        show.fx_library.push(FxBlockDef {
+            id: "blk_master".into(),
+            name: "Master Overlay".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![FxElementDef::StaticTrait {
+                trait_name: "master_dimmer".into(),
+                op: "htp".into(),
+                palette_ref: None,
+                value_start: Some(1.0),
+                value_end: Some(1.0),
+                hex_start: None,
+                hex_end: None,
+                order: None,
+            }],
+        });
+        let sc_master = SceneDef {
+            id: "sc_master".into(),
+            name: "Master Overlay".into(),
+            bank: Some("overlay".into()),
+            target_group: None,
+            priority: 20,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_master".into()],
+        };
+        show.scenes.push(sc_master.clone());
+
+        let plan = compile_render_plan(1, &show, &lib).unwrap();
+        let mut rt = RuntimeControl::new();
+        rt.trigger_scene(&sc_col, 0.0);
+        let mut q = QuantizerState::default();
+
+        // Color-only scene without any dimmer keeps Master Dimmer = 0 and pixel output = 0
+        let f_dark = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 0,
+            },
+            &rt,
+            &mut q,
+        );
+        assert_eq!(f_dark.universes[0].dmx[0], 0);
+        assert_eq!(f_dark.universes[0].dmx[2], 0);
+        assert_eq!(f_dark.cell_preview_rgbd[3], 0);
+
+        // Triggering Master Dimmer overlay lights up the red color!
+        rt.trigger_scene(&sc_master, 0.0);
+        let f_lit = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 1,
+            },
+            &rt,
+            &mut q,
+        );
+        assert_eq!(f_lit.universes[0].dmx[0], 255);
+        assert_eq!(f_lit.universes[0].dmx[2], 255);
+        assert_eq!(f_lit.cell_preview_rgbd[0], 255);
+        assert_eq!(f_lit.cell_preview_rgbd[3], 255);
+    }
+
+    #[test]
+    fn scene_duration_seconds_vs_beats_controls_fx_cycle_length() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::GridPos;
+        use crate::show::xml::{DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState};
+
+        let lib = FixtureLibrary::load(None);
+        let mut show = ShowState::default();
+        show.bpm = 60.0; // 1 beat = 1.0 sec
+        show.patch.push(FixtureInstance {
+            id: "fx_1".into(),
+            profile: "age/rlcv3_8_segment_tube.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Tube".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos::default(),
+            calibration: FixtureCalibration {
+                gamma: 1.0,
+                white_mode: WhiteMode::Off,
+                ..FixtureCalibration::default()
+            },
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_saw".into(),
+            name: "Saw Curve".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![FxElementDef::Curve1D {
+                trait_name: "dimmer".into(),
+                op: "ltp".into(),
+                waveform: "saw".into(),
+                amplitude: 1.0,
+                offset: 0.0,
+                rate_beats: None,
+                speed_hz: None,
+                rate_cycles: Some(1.0),
+                phase_deg: 0.0,
+                phase_spread_deg: 0.0,
+                duty: None,
+                grayscale: false,
+                color_width: 1.0,
+                gradient: 1.0,
+                angle_deg: 0.0,
+                fx_kind_tag: Some("curve_fx".into()),
+                inline_colors: Vec::new(),
+                value_stops: Vec::new(),
+                palette_ref: None,
+                order: None,
+            }],
+        });
+        let sc_sec = SceneDef {
+            id: "sc_sec".into(),
+            name: "2 Sec Scene".into(),
+            bank: Some("main".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 2.0,
+            duration_unit: DurationUnit::Seconds,
+            block_refs: vec!["blk_saw".into()],
+        };
+        show.scenes.push(sc_sec.clone());
+
+        let plan = compile_render_plan(1, &show, &lib).unwrap();
+        let mut rt = RuntimeControl::new();
+        rt.set_live_bpm(60.0, 0.0);
+        rt.trigger_scene(&sc_sec, 0.0);
+        let mut q = QuantizerState::default();
+
+        // At t=1.0s with duration_value=2.0 Seconds, cycle phase is 0.5 -> saw ~ 128
+        let f_half = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 1.0,
+                frame_index: 1,
+            },
+            &rt,
+            &mut q,
+        );
+        assert!((f_half.universes[0].dmx[2] as i16 - 128).abs() <= 2);
+
+        // At t=1.5s -> phase 0.75 -> saw ~ 191 (independent of BPM since unit is Seconds)
+        rt.set_live_bpm(180.0, 1.0);
+        let f_three_quarter = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 1.5,
+                frame_index: 2,
+            },
+            &rt,
+            &mut q,
+        );
+        assert!((f_three_quarter.universes[0].dmx[2] as i16 - 191).abs() <= 2);
     }
 }

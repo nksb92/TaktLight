@@ -25,7 +25,7 @@ impl FrameCreditGate {
 
     pub fn grant_credit(&self) {
         self.ack_frame.store(true, Ordering::Release);
-        self.notify.notify_one();
+        self.notify.notify_waiters();
     }
 
     pub fn try_consume_credit(&self) -> bool {

@@ -50,6 +50,7 @@ fn main() {
         telemetry,
         sink,
         cmd_rx,
+        true,
         Some(Duration::from_secs(duration_sec)),
     );
 

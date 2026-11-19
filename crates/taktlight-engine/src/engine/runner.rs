@@ -55,6 +55,7 @@ pub struct EngineTelemetrySnapshot {
     pub jitter_stats: JitterStats,
     pub jitter_samples_us: Vec<f32>,
     pub is_offline: bool,
+    pub output_enabled: bool,
     pub discovery_available: bool,
     pub active_interface: Option<NetworkInterfaceInfo>,
     pub discovered_nodes: Vec<TrackedArtNetNode>,
@@ -282,6 +283,7 @@ impl TickTransmitter {
 
 pub enum EngineCommand {
     SetAdapter(AdapterSelection),
+    SetOutputEnabled(bool),
     Shutdown,
 }
 
@@ -295,6 +297,12 @@ impl EngineRunnerHandle {
         self.cmd_tx
             .send(EngineCommand::SetAdapter(selection))
             .map_err(|e| format!("failed to send adapter command: {e}"))
+    }
+
+    pub fn set_output_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.cmd_tx
+            .send(EngineCommand::SetOutputEnabled(enabled))
+            .map_err(|e| format!("failed to send output_enabled command: {e}"))
     }
 
     pub fn shutdown(mut self) -> JitterStats {
@@ -334,6 +342,7 @@ pub fn spawn_engine_loop(
     frame_tx: watch::Sender<Vec<u8>>,
     telemetry: Arc<RwLock<EngineTelemetrySnapshot>>,
     initial_selection: AdapterSelection,
+    initial_output_enabled: bool,
 ) -> EngineRunnerHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let sink = create_sink_for_selection(&initial_selection);
@@ -341,7 +350,15 @@ pub fn spawn_engine_loop(
         .name("taktlight-44hz".into())
         .spawn(move || {
             run_realtime_loop_with_sink(
-                config, plan, runtime, frame_tx, telemetry, sink, cmd_rx, None,
+                config,
+                plan,
+                runtime,
+                frame_tx,
+                telemetry,
+                sink,
+                cmd_rx,
+                initial_output_enabled,
+                None,
             )
         })
         .expect("failed to spawn taktlight-44hz thread");
@@ -361,6 +378,7 @@ pub fn run_realtime_loop_with_sink(
     telemetry: Arc<RwLock<EngineTelemetrySnapshot>>,
     mut sink: Box<dyn PacketSink>,
     cmd_rx: Receiver<EngineCommand>,
+    initial_output_enabled: bool,
     max_duration: Option<Duration>,
 ) -> JitterStats {
     // 2 ms spin cushion prevents Windows WaitableTimer wakeups (>700 us) from overshooting the deadline
@@ -372,6 +390,7 @@ pub fn run_realtime_loop_with_sink(
     let t0 = Instant::now();
     let mut tick_index: u64 = 0;
     let mut prev_post_send: Option<Instant> = None;
+    let mut output_enabled = initial_output_enabled;
 
     loop {
         if let Some(limit) = max_duration {
@@ -389,6 +408,13 @@ pub fn run_realtime_loop_with_sink(
                 EngineCommand::SetAdapter(selection) => {
                     let _ = transmitter.terminate_all_sacn(&mut *sink, Some(SACN_TERMINATION_GAP));
                     sink = create_sink_for_selection(&selection);
+                }
+                EngineCommand::SetOutputEnabled(enabled) => {
+                    if output_enabled && !enabled {
+                        let _ =
+                            transmitter.terminate_all_sacn(&mut *sink, Some(SACN_TERMINATION_GAP));
+                    }
+                    output_enabled = enabled;
                 }
             }
         }
@@ -425,9 +451,10 @@ pub fn run_realtime_loop_with_sink(
             &mut quantizer_state,
         );
 
-        if transmitter
-            .transmit_frame(&current_plan, &evaluated, &mut *sink, Some(SACN_TERMINATION_GAP))
-            .is_err()
+        if output_enabled
+            && transmitter
+                .transmit_frame(&current_plan, &evaluated, &mut *sink, Some(SACN_TERMINATION_GAP))
+                .is_err()
         {
             // Graceful offline fallback if network adapter drops mid-stream
             sink = Box::new(OfflineSink);
@@ -463,6 +490,7 @@ pub fn run_realtime_loop_with_sink(
             guard.jitter_stats = stats;
             guard.jitter_samples_us = jitter.samples();
             guard.is_offline = sink.is_offline();
+            guard.output_enabled = output_enabled;
             guard.discovery_available = sink.discovery_available();
             guard.active_interface = sink.active_interface().cloned();
             guard.discovered_nodes = transmitter.discovered_nodes();
@@ -599,5 +627,31 @@ mod tests {
         assert_eq!(term_packets[0][111], 2);
         assert_eq!(term_packets[1][111], 3);
         assert_eq!(term_packets[2][111], 4);
+    }
+
+    #[test]
+    fn loop_with_initial_output_disabled_transmits_zero_packets_until_enabled() {
+        let mut plan = RenderPlan::default_studio_plan();
+        plan.base_dmx[0][0] = 255;
+        let plan = Arc::new(ArcSwap::from_pointee(plan));
+        let runtime = Arc::new(ArcSwap::from_pointee(RuntimeControl::new()));
+        let (frame_tx, _frame_rx) = watch::channel(Vec::new());
+        let telemetry = Arc::new(RwLock::new(EngineTelemetrySnapshot::default()));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let sink = MockPacketSink::new();
+        let _ = cmd_tx;
+
+        run_realtime_loop_with_sink(
+            EngineConfig::default(),
+            plan,
+            runtime,
+            frame_tx,
+            telemetry.clone(),
+            Box::new(sink),
+            cmd_rx,
+            false,
+            Some(Duration::from_millis(60)),
+        );
+        assert!(!telemetry.read().output_enabled);
     }
 }

@@ -6,7 +6,8 @@ use crate::show::patch::{FixtureCalibration, WhiteMode};
 use crate::state::plan::{CompiledChannelSlot, CompiledFixture};
 
 use super::color::{
-    linear_rgb_to_oklab, oklab_distance, parse_hex_to_oklab, resolve_named_css_color_to_oklab,
+    linear_channel_to_srgb, linear_rgb_to_oklab, oklab_distance, parse_hex_to_oklab,
+    resolve_named_css_color_to_oklab,
 };
 use super::traits::{CellTraitState, FixtureTraitState, ShutterState};
 
@@ -443,20 +444,31 @@ where
                     }
                 };
 
+                let perceptual_rgb = [
+                    linear_channel_to_srgb(cell_color[0]),
+                    linear_channel_to_srgb(cell_color[1]),
+                    linear_channel_to_srgb(cell_color[2]),
+                ];
+
                 let (rw, gw, bw, ww) = if has_white {
                     extract_rgbw(
-                        cell_color[0],
-                        cell_color[1],
-                        cell_color[2],
+                        perceptual_rgb[0],
+                        perceptual_rgb[1],
+                        perceptual_rgb[2],
                         cal.white_mode,
                         cal.white_gain,
                         cal.gamma,
                     )
                 } else {
-                    (cell_color[0], cell_color[1], cell_color[2], 0.0)
+                    (
+                        perceptual_rgb[0],
+                        perceptual_rgb[1],
+                        perceptual_rgb[2],
+                        0.0,
+                    )
                 };
 
-                let component = color_component_for_ofl(*color, rw, gw, bw, ww, cell_color);
+                let component = color_component_for_ofl(*color, rw, gw, bw, ww, perceptual_rgb);
                 if has_int {
                     write_scalar_slot(ch_idx, fixture, component, false, cal, &mut write_channel);
                 } else {
@@ -545,6 +557,7 @@ mod tests {
                 master_dimmer: 1.0,
                 master_dimmer_touched: false,
                 any_cell_touched: true,
+                any_cell_dimmer_touched: true,
                 shutter: ShutterState::Open,
                 shutter_touched: false,
             },
@@ -608,6 +621,7 @@ mod tests {
                 master_dimmer: 0.5,
                 master_dimmer_touched: true,
                 any_cell_touched: true,
+                any_cell_dimmer_touched: true,
                 shutter: ShutterState::Open,
                 shutter_touched: false,
             },
@@ -841,6 +855,7 @@ mod tests {
                 master_dimmer: 1.0,
                 master_dimmer_touched: false,
                 any_cell_touched: true,
+                any_cell_dimmer_touched: true,
                 shutter: ShutterState::Open,
                 shutter_touched: false,
             },

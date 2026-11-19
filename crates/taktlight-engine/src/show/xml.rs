@@ -24,6 +24,26 @@ pub struct ColorPaletteDef {
     pub name: String,
     pub hex_start: String,
     pub hex_end: String,
+    #[serde(default)]
+    pub colors: Vec<String>,
+}
+
+impl ColorPaletteDef {
+    pub fn effective_colors(&self) -> Vec<String> {
+        if !self.colors.is_empty() {
+            self.colors.clone()
+        } else {
+            vec![self.hex_start.clone(), self.hex_end.clone()]
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DurationUnit {
+    #[default]
+    Beats,
+    Seconds,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +68,10 @@ pub enum FxElementDef {
         #[serde(default)]
         value_end: Option<f32>,
         #[serde(default)]
+        hex_start: Option<String>,
+        #[serde(default)]
+        hex_end: Option<String>,
+        #[serde(default)]
         order: Option<OrderRule>,
     },
     #[serde(rename = "curve_1d")]
@@ -64,9 +88,27 @@ pub enum FxElementDef {
         #[serde(default)]
         speed_hz: Option<f32>,
         #[serde(default)]
+        rate_cycles: Option<f32>,
+        #[serde(default)]
+        phase_deg: f32,
+        #[serde(default)]
         phase_spread_deg: f32,
         #[serde(default)]
         duty: Option<f32>,
+        #[serde(default)]
+        grayscale: bool,
+        #[serde(default = "default_one")]
+        color_width: f32,
+        #[serde(default = "default_one")]
+        gradient: f32,
+        #[serde(default)]
+        angle_deg: f32,
+        #[serde(default)]
+        fx_kind_tag: Option<String>,
+        #[serde(default)]
+        inline_colors: Vec<String>,
+        #[serde(default)]
+        value_stops: Vec<f32>,
         #[serde(default)]
         palette_ref: Option<String>,
         #[serde(default)]
@@ -80,6 +122,12 @@ pub enum FxElementDef {
         step_beats: Option<f32>,
         #[serde(default)]
         speed_hz: Option<f32>,
+        #[serde(default)]
+        rate_cycles: Option<f32>,
+        #[serde(default = "default_true")]
+        one_way: bool,
+        #[serde(default)]
+        pixels_on: Option<u16>,
         #[serde(default)]
         active_ratio: Option<f32>,
         #[serde(default)]
@@ -103,8 +151,22 @@ pub enum FxElementDef {
         rate_beats: Option<f32>,
         #[serde(default)]
         speed_hz: Option<f32>,
+        #[serde(default)]
+        rate_cycles: Option<f32>,
         #[serde(default = "default_one")]
         spatial_freq: f32,
+        #[serde(default = "default_one")]
+        color_width: f32,
+        #[serde(default = "default_one")]
+        gradient: f32,
+        #[serde(default)]
+        grayscale: bool,
+        #[serde(default)]
+        transform: Option<String>,
+        #[serde(default)]
+        inline_colors: Vec<String>,
+        #[serde(default)]
+        value_stops: Vec<f32>,
         #[serde(default)]
         direction_deg: f32,
         #[serde(default = "default_half")]
@@ -120,6 +182,10 @@ fn default_one() -> f32 {
 
 fn default_half() -> f32 {
     0.5
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,6 +204,8 @@ pub struct FxBlockDef {
     pub target_group: Option<String>,
     #[serde(default = "default_beats")]
     pub duration_beats: f32,
+    #[serde(default)]
+    pub duration_sec: Option<f32>,
     #[serde(default = "default_true")]
     pub loop_block: bool,
     #[serde(default)]
@@ -166,6 +234,10 @@ pub struct SceneDef {
     pub fade_in_sec: f32,
     #[serde(default)]
     pub fade_out_sec: f32,
+    #[serde(default = "default_beats")]
+    pub duration_value: f32,
+    #[serde(default)]
+    pub duration_unit: DurationUnit,
     #[serde(default)]
     pub block_refs: Vec<String>,
 }
@@ -416,6 +488,8 @@ enum PaletteItemXml {
         hex_start: String,
         #[serde(rename = "@hex_end")]
         hex_end: String,
+        #[serde(rename = "@colors", default, skip_serializing_if = "Option::is_none")]
+        colors: Option<String>,
     },
     DimmerPalette {
         #[serde(rename = "@id")]
@@ -581,6 +655,12 @@ struct FxBlockXml {
     target_group: Option<String>,
     #[serde(rename = "@duration_beats", default = "default_beats")]
     duration_beats: f32,
+    #[serde(
+        rename = "@duration_sec",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    duration_sec: Option<f32>,
     #[serde(rename = "@loop", default = "default_true")]
     loop_block: bool,
     #[serde(rename = "$value", default)]
@@ -608,6 +688,10 @@ enum FxElementXml {
         value_start: Option<f32>,
         #[serde(rename = "@value_end", default, skip_serializing_if = "Option::is_none")]
         value_end: Option<f32>,
+        #[serde(rename = "@hex_start", default, skip_serializing_if = "Option::is_none")]
+        hex_start: Option<String>,
+        #[serde(rename = "@hex_end", default, skip_serializing_if = "Option::is_none")]
+        hex_end: Option<String>,
         #[serde(rename = "@order", default, skip_serializing_if = "Option::is_none")]
         order: Option<String>,
     },
@@ -630,10 +714,44 @@ enum FxElementXml {
         rate_beats: Option<f32>,
         #[serde(rename = "@speed_hz", default, skip_serializing_if = "Option::is_none")]
         speed_hz: Option<f32>,
+        #[serde(
+            rename = "@rate_cycles",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        rate_cycles: Option<f32>,
+        #[serde(rename = "@phase_deg", default)]
+        phase_deg: f32,
         #[serde(rename = "@phase_spread_deg", default)]
         phase_spread_deg: f32,
         #[serde(rename = "@duty", default, skip_serializing_if = "Option::is_none")]
         duty: Option<f32>,
+        #[serde(rename = "@grayscale", default, skip_serializing_if = "is_false")]
+        grayscale: bool,
+        #[serde(rename = "@color_width", default = "default_one")]
+        color_width: f32,
+        #[serde(rename = "@gradient", default = "default_one")]
+        gradient: f32,
+        #[serde(rename = "@angle_deg", default)]
+        angle_deg: f32,
+        #[serde(
+            rename = "@fx_kind_tag",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        fx_kind_tag: Option<String>,
+        #[serde(
+            rename = "@inline_colors",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        inline_colors: Option<String>,
+        #[serde(
+            rename = "@value_stops",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        value_stops: Option<String>,
         #[serde(
             rename = "@palette_ref",
             default,
@@ -656,6 +774,20 @@ enum FxElementXml {
         step_beats: Option<f32>,
         #[serde(rename = "@speed_hz", default, skip_serializing_if = "Option::is_none")]
         speed_hz: Option<f32>,
+        #[serde(
+            rename = "@rate_cycles",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        rate_cycles: Option<f32>,
+        #[serde(rename = "@one_way", default = "default_true")]
+        one_way: bool,
+        #[serde(
+            rename = "@pixels_on",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        pixels_on: Option<u16>,
         #[serde(
             rename = "@active_ratio",
             default,
@@ -696,8 +828,38 @@ enum FxElementXml {
         rate_beats: Option<f32>,
         #[serde(rename = "@speed_hz", default, skip_serializing_if = "Option::is_none")]
         speed_hz: Option<f32>,
+        #[serde(
+            rename = "@rate_cycles",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        rate_cycles: Option<f32>,
         #[serde(rename = "@spatial_freq", default = "default_one")]
         spatial_freq: f32,
+        #[serde(rename = "@color_width", default = "default_one")]
+        color_width: f32,
+        #[serde(rename = "@gradient", default = "default_one")]
+        gradient: f32,
+        #[serde(rename = "@grayscale", default, skip_serializing_if = "is_false")]
+        grayscale: bool,
+        #[serde(
+            rename = "@transform",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        transform: Option<String>,
+        #[serde(
+            rename = "@inline_colors",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        inline_colors: Option<String>,
+        #[serde(
+            rename = "@value_stops",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        value_stops: Option<String>,
         #[serde(rename = "@direction_deg", default)]
         direction_deg: f32,
         #[serde(rename = "@center_x", default = "default_half")]
@@ -733,6 +895,14 @@ struct SceneXml {
     fade_in_sec: f32,
     #[serde(rename = "@fade_out_sec", default)]
     fade_out_sec: f32,
+    #[serde(rename = "@duration_value", default = "default_beats")]
+    duration_value: f32,
+    #[serde(
+        rename = "@duration_unit",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    duration_unit: Option<String>,
     #[serde(rename = "BlockRef", default)]
     block_refs: Vec<BlockRefXml>,
 }
@@ -888,6 +1058,43 @@ pub fn migrate_v0_9_to_v1_0(raw_xml: &str) -> String {
 // Conversions (XML <-> Domain)
 // =========================================================================
 
+fn parse_csv_strings(raw: Option<String>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn serialize_csv_strings(items: &[String]) -> Option<String> {
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.join(","))
+    }
+}
+
+fn parse_csv_f32(raw: Option<String>) -> Vec<f32> {
+    raw.map(|s| {
+        s.split(',')
+            .filter_map(|p| p.trim().parse::<f32>().ok())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn serialize_csv_f32(items: &[f32]) -> Option<String> {
+    if items.is_empty() {
+        None
+    } else {
+        let joined: Vec<String> = items.iter().map(|v| format!("{v}")).collect();
+        Some(joined.join(","))
+    }
+}
+
 fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
     match el {
         FxElementXml::StaticTrait {
@@ -896,6 +1103,8 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             palette_ref,
             value_start,
             value_end,
+            hex_start,
+            hex_end,
             order,
         } => Ok(FxElementDef::StaticTrait {
             trait_name,
@@ -903,6 +1112,8 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             palette_ref,
             value_start,
             value_end,
+            hex_start,
+            hex_end,
             order: order.as_deref().map(OrderRule::from_str).transpose()?,
         }),
         FxElementXml::Curve1D {
@@ -913,8 +1124,17 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             offset,
             rate_beats,
             speed_hz,
+            rate_cycles,
+            phase_deg,
             phase_spread_deg,
             duty,
+            grayscale,
+            color_width,
+            gradient,
+            angle_deg,
+            fx_kind_tag,
+            inline_colors,
+            value_stops,
             palette_ref,
             order,
         } => Ok(FxElementDef::Curve1D {
@@ -925,8 +1145,17 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             offset,
             rate_beats,
             speed_hz,
+            rate_cycles,
+            phase_deg,
             phase_spread_deg,
             duty,
+            grayscale,
+            color_width,
+            gradient,
+            angle_deg,
+            fx_kind_tag,
+            inline_colors: parse_csv_strings(inline_colors),
+            value_stops: parse_csv_f32(value_stops),
             palette_ref,
             order: order.as_deref().map(OrderRule::from_str).transpose()?,
         }),
@@ -935,6 +1164,9 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             op,
             step_beats,
             speed_hz,
+            rate_cycles,
+            one_way,
+            pixels_on,
             active_ratio,
             fade,
             amplitude,
@@ -945,6 +1177,9 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             op,
             step_beats,
             speed_hz,
+            rate_cycles,
+            one_way,
+            pixels_on,
             active_ratio,
             fade,
             amplitude,
@@ -958,7 +1193,14 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             palette_ref,
             rate_beats,
             speed_hz,
+            rate_cycles,
             spatial_freq,
+            color_width,
+            gradient,
+            grayscale,
+            transform,
+            inline_colors,
+            value_stops,
             direction_deg,
             center_x,
             center_y,
@@ -969,7 +1211,14 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             palette_ref,
             rate_beats,
             speed_hz,
+            rate_cycles,
             spatial_freq,
+            color_width,
+            gradient,
+            grayscale,
+            transform,
+            inline_colors: parse_csv_strings(inline_colors),
+            value_stops: parse_csv_f32(value_stops),
             direction_deg,
             center_x,
             center_y,
@@ -985,6 +1234,8 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             palette_ref,
             value_start,
             value_end,
+            hex_start,
+            hex_end,
             order,
         } => FxElementXml::StaticTrait {
             trait_name: trait_name.clone(),
@@ -992,6 +1243,8 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             palette_ref: palette_ref.clone(),
             value_start: *value_start,
             value_end: *value_end,
+            hex_start: hex_start.clone(),
+            hex_end: hex_end.clone(),
             order: order.map(|o| o.to_string()),
         },
         FxElementDef::Curve1D {
@@ -1002,8 +1255,17 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             offset,
             rate_beats,
             speed_hz,
+            rate_cycles,
+            phase_deg,
             phase_spread_deg,
             duty,
+            grayscale,
+            color_width,
+            gradient,
+            angle_deg,
+            fx_kind_tag,
+            inline_colors,
+            value_stops,
             palette_ref,
             order,
         } => FxElementXml::Curve1D {
@@ -1014,8 +1276,17 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             offset: *offset,
             rate_beats: *rate_beats,
             speed_hz: *speed_hz,
+            rate_cycles: *rate_cycles,
+            phase_deg: *phase_deg,
             phase_spread_deg: *phase_spread_deg,
             duty: *duty,
+            grayscale: *grayscale,
+            color_width: *color_width,
+            gradient: *gradient,
+            angle_deg: *angle_deg,
+            fx_kind_tag: fx_kind_tag.clone(),
+            inline_colors: serialize_csv_strings(inline_colors),
+            value_stops: serialize_csv_f32(value_stops),
             palette_ref: palette_ref.clone(),
             order: order.map(|o| o.to_string()),
         },
@@ -1024,6 +1295,9 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             op,
             step_beats,
             speed_hz,
+            rate_cycles,
+            one_way,
+            pixels_on,
             active_ratio,
             fade,
             amplitude,
@@ -1034,6 +1308,9 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             op: op.clone(),
             step_beats: *step_beats,
             speed_hz: *speed_hz,
+            rate_cycles: *rate_cycles,
+            one_way: *one_way,
+            pixels_on: *pixels_on,
             active_ratio: *active_ratio,
             fade: *fade,
             amplitude: *amplitude,
@@ -1047,7 +1324,14 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             palette_ref,
             rate_beats,
             speed_hz,
+            rate_cycles,
             spatial_freq,
+            color_width,
+            gradient,
+            grayscale,
+            transform,
+            inline_colors,
+            value_stops,
             direction_deg,
             center_x,
             center_y,
@@ -1058,7 +1342,14 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             palette_ref: palette_ref.clone(),
             rate_beats: *rate_beats,
             speed_hz: *speed_hz,
+            rate_cycles: *rate_cycles,
             spatial_freq: *spatial_freq,
+            color_width: *color_width,
+            gradient: *gradient,
+            grayscale: *grayscale,
+            transform: transform.clone(),
+            inline_colors: serialize_csv_strings(inline_colors),
+            value_stops: serialize_csv_f32(value_stops),
             direction_deg: *direction_deg,
             center_x: *center_x,
             center_y: *center_y,
@@ -1133,6 +1424,11 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
             name: cp.name.clone(),
             hex_start: cp.hex_start.clone(),
             hex_end: cp.hex_end.clone(),
+            colors: if cp.colors.len() >= 2 {
+                Some(cp.colors.join(","))
+            } else {
+                None
+            },
         });
     }
     for dp in &show.dimmer_palettes {
@@ -1201,6 +1497,7 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
             name: b.name.clone(),
             target_group: b.target_group.clone(),
             duration_beats: b.duration_beats,
+            duration_sec: b.duration_sec,
             loop_block: b.loop_block,
             elements: b.elements.iter().map(fx_to_xml).collect(),
         })
@@ -1217,6 +1514,11 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
             priority: s.priority,
             fade_in_sec: s.fade_in_sec,
             fade_out_sec: s.fade_out_sec,
+            duration_value: s.duration_value,
+            duration_unit: Some(match s.duration_unit {
+                DurationUnit::Beats => "beats".to_string(),
+                DurationUnit::Seconds => "seconds".to_string(),
+            }),
             block_refs: s
                 .block_refs
                 .iter()
@@ -1389,11 +1691,13 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
                 name,
                 hex_start,
                 hex_end,
+                colors,
             } => color_palettes.push(ColorPaletteDef {
                 id,
                 name,
                 hex_start,
                 hex_end,
+                colors: parse_csv_strings(colors),
             }),
             PaletteItemXml::DimmerPalette {
                 id,
@@ -1473,6 +1777,7 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
             name: b.name,
             target_group: b.target_group,
             duration_beats: b.duration_beats,
+            duration_sec: b.duration_sec,
             loop_block: b.loop_block,
             elements,
         });
@@ -1492,6 +1797,16 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
                 return Err(ShowError::MissingTargetGroup(ref_id.clone()));
             }
         }
+        let duration_unit = match s
+            .duration_unit
+            .as_deref()
+            .map(str::trim)
+            .map(|u| u.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("seconds") | Some("sec") | Some("s") => DurationUnit::Seconds,
+            _ => DurationUnit::Beats,
+        };
         scenes.push(SceneDef {
             id: s.id,
             name: s.name,
@@ -1500,6 +1815,8 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
             priority: s.priority,
             fade_in_sec: s.fade_in_sec,
             fade_out_sec: s.fade_out_sec,
+            duration_value: s.duration_value.max(0.05),
+            duration_unit,
             block_refs: refs,
         });
     }
@@ -1836,5 +2153,107 @@ mod tests {
         assert_eq!(resolve_audio_track_path(&dir, &track), AudioRelinkStatus::Missing);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_multistop_palettes_duration_units_and_daslight_fx_attrs() {
+        let mut show = ShowState::default();
+        show.color_palettes.push(ColorPaletteDef {
+            id: "pal_rainbow".into(),
+            name: "Rainbow".into(),
+            hex_start: "#FF0000".into(),
+            hex_end: "#AA00FF".into(),
+            colors: vec![
+                "#FF0000".into(),
+                "#00FF00".into(),
+                "#0044FF".into(),
+                "#AA00FF".into(),
+            ],
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_fx".into(),
+            name: "Daslight FX".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: Some(2.5),
+            loop_block: true,
+            elements: vec![
+                FxElementDef::Curve1D {
+                    trait_name: "color".into(),
+                    op: "ltp".into(),
+                    waveform: "saw".into(),
+                    amplitude: 1.0,
+                    offset: 0.0,
+                    rate_beats: None,
+                    speed_hz: None,
+                    rate_cycles: Some(2.0),
+                    phase_deg: 45.0,
+                    phase_spread_deg: 360.0,
+                    duty: None,
+                    grayscale: true,
+                    color_width: 0.75,
+                    gradient: 0.5,
+                    angle_deg: 180.0,
+                    fx_kind_tag: Some("color_fx".into()),
+                    inline_colors: vec!["#FF0000".into(), "#00FF00".into(), "#0000FF".into()],
+                    value_stops: Vec::new(),
+                    palette_ref: Some("pal_rainbow".into()),
+                    order: Some(OrderRule::Linear),
+                },
+                FxElementDef::StepChase {
+                    trait_name: "dimmer".into(),
+                    op: "ltp".into(),
+                    step_beats: None,
+                    speed_hz: None,
+                    rate_cycles: Some(1.5),
+                    one_way: false,
+                    pixels_on: Some(2),
+                    active_ratio: None,
+                    fade: 0.0,
+                    amplitude: 1.0,
+                    palette_ref: None,
+                    order: None,
+                },
+                FxElementDef::SpatialShader2D {
+                    trait_name: "dimmer".into(),
+                    op: "ltp".into(),
+                    shader: "radial_wave".into(),
+                    palette_ref: None,
+                    rate_beats: None,
+                    speed_hz: None,
+                    rate_cycles: Some(1.0),
+                    spatial_freq: 1.0,
+                    color_width: 1.25,
+                    gradient: 0.25,
+                    grayscale: false,
+                    transform: Some("mirror_x".into()),
+                    inline_colors: Vec::new(),
+                    value_stops: vec![0.0, 1.0, 0.25],
+                    direction_deg: 90.0,
+                    center_x: 0.5,
+                    center_y: 0.5,
+                },
+            ],
+        });
+        show.scenes.push(SceneDef {
+            id: "sc_dur".into(),
+            name: "Timed Scene".into(),
+            bank: Some("Bank 1".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 2.5,
+            duration_unit: DurationUnit::Seconds,
+            block_refs: vec!["blk_fx".into()],
+        });
+
+        let xml_out = serialize_show_xml(&show).expect("serialize");
+        let parsed = deserialize_show_xml(&xml_out).expect("deserialize");
+        assert_eq!(parsed.color_palettes[0].colors.len(), 4);
+        assert_eq!(parsed.scenes[0].duration_value, 2.5);
+        assert_eq!(parsed.scenes[0].duration_unit, DurationUnit::Seconds);
+        assert_eq!(parsed.fx_library[0].duration_sec, Some(2.5));
+        assert_eq!(parsed.fx_library[0].elements, show.fx_library[0].elements);
     }
 }

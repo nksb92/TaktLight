@@ -87,6 +87,11 @@ pub enum ShowCommand {
     DeleteScene {
         removed: SceneDef,
     },
+    RenameSceneBank {
+        old_name: String,
+        new_name: String,
+        affected_scene_ids: Vec<String>,
+    },
     UpsertTimeline {
         before: Option<TimelineDef>,
         after: TimelineDef,
@@ -326,6 +331,18 @@ impl ShowCommand {
                 state.timelines.retain(|t| t.id != removed.id);
                 Ok(())
             }
+            Self::RenameSceneBank {
+                new_name,
+                affected_scene_ids,
+                ..
+            } => {
+                for sc in &mut state.scenes {
+                    if affected_scene_ids.iter().any(|id| id == &sc.id) {
+                        sc.bank = Some(new_name.clone());
+                    }
+                }
+                Ok(())
+            }
             Self::ReplaceShowState { after, .. } => {
                 *state = (**after).clone();
                 Ok(())
@@ -480,6 +497,18 @@ impl ShowCommand {
             }
             Self::DeleteScene { removed } => {
                 state.scenes.push(removed.clone());
+                Ok(())
+            }
+            Self::RenameSceneBank {
+                old_name,
+                affected_scene_ids,
+                ..
+            } => {
+                for sc in &mut state.scenes {
+                    if affected_scene_ids.iter().any(|id| id == &sc.id) {
+                        sc.bank = Some(old_name.clone());
+                    }
+                }
                 Ok(())
             }
             Self::UpsertTimeline { before, after, .. } => {

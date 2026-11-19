@@ -4,17 +4,22 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::evaluator::ClockInput;
-use crate::mixer::color::{CompiledColorPalette, CompiledDimmerPalette};
+use crate::mixer::color::{
+    linear_rgb_to_oklab, oklab_to_linear_rgb, parse_hex_to_linear_rgb, sample_hex_stops_linear,
+    sample_value_stops, CompiledColorPalette, CompiledDimmerPalette,
+};
 use crate::mixer::traits::{
     fold_layers_into_states, resolve_target_cells_and_fixtures, CellTraitDelta, CellTraitState,
     FixtureTraitDelta, FixtureTraitState, MergeOp,
 };
-use crate::show::xml::{ClipDef, FxBlockDef, FxElementDef, SceneDef, TempoPointDef};
+use crate::show::xml::{
+    ClipDef, DurationUnit, FxBlockDef, FxElementDef, SceneDef, TempoPointDef,
+};
 use crate::state::plan::RenderPlan;
 use crate::state::runtime::RuntimeControl;
 
 use super::evaluators::{
-    evaluate_curve_1d_scalar, evaluate_spatial_shader_2d, evaluate_step_chase_scalar,
+    evaluate_curve_1d_phase, evaluate_spatial_shader_2d_phase, evaluate_step_chase_phase,
     Shader2DKind, Waveform1D,
 };
 
@@ -90,7 +95,10 @@ impl ActiveSceneInstance {
     }
 
     pub fn is_finished(&self, t_now_sec: f64) -> bool {
-        self.release_t_sec.is_some() && self.alpha_at(t_now_sec) <= 1e-6
+        match self.release_t_sec {
+            Some(rel_t) => t_now_sec >= rel_t && self.alpha_at(t_now_sec) <= 1e-6,
+            None => false,
+        }
     }
 }
 
@@ -107,11 +115,56 @@ fn sample_color_palette_linear(
     }
 }
 
+fn sample_color_element_linear(
+    color_map: &HashMap<&str, &CompiledColorPalette>,
+    palette_ref: Option<&str>,
+    inline_colors: &[String],
+    w: f32,
+    gradient: f32,
+    grayscale: bool,
+    cyclic: bool,
+) -> [f32; 3] {
+    if !inline_colors.is_empty() {
+        return sample_hex_stops_linear(inline_colors, w, gradient, grayscale, cyclic);
+    }
+    if let Some(pal) = palette_ref.and_then(|id| color_map.get(id).copied()) {
+        return pal.sample_linear_rgb_ex(w, gradient, grayscale, cyclic);
+    }
+    let clamped = if cyclic {
+        w.rem_euclid(1.0)
+    } else {
+        w.clamp(0.0, 1.0)
+    };
+    [clamped, clamped, clamped]
+}
+
+fn resolve_element_base_phase(
+    b_block: f64,
+    t_local: f64,
+    cycle_cycles: f64,
+    legacy_beats: Option<f32>,
+    speed_hz: Option<f32>,
+    rate_cycles: Option<f32>,
+) -> f64 {
+    if let Some(hz) = speed_hz {
+        if hz > 0.0 {
+            return t_local * (hz as f64);
+        }
+    }
+    if let Some(rb) = legacy_beats {
+        if rb > 0.0 {
+            return b_block / (rb as f64);
+        }
+    }
+    cycle_cycles * (rate_cycles.unwrap_or(1.0).max(1e-4) as f64)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fold_fx_block_into_states(
     plan: &RenderPlan,
     block: &FxBlockDef,
     effective_target_group: &str,
+    scene_duration: Option<(f32, DurationUnit)>,
     scene_alpha: f32,
     t_local: f64,
     b_local: f64,
@@ -123,11 +176,38 @@ fn fold_fx_block_into_states(
     cell_states: &mut [CellTraitState],
 ) {
     let cell_count = plan.cell_count as usize;
-    let dur = (block.duration_beats as f64).max(1e-4);
+    let dur_beats = match scene_duration {
+        Some((val, DurationUnit::Beats)) => (val as f64).max(0.05),
+        _ => (block.duration_beats as f64).max(0.05),
+    };
     let b_block = if block.loop_block {
-        b_local.rem_euclid(dur)
+        b_local.rem_euclid(dur_beats)
     } else {
-        b_local.min(dur)
+        b_local.min(dur_beats)
+    };
+    let cycle_cycles = match scene_duration {
+        Some((val, DurationUnit::Seconds)) => {
+            let dur_sec = (val as f64).max(0.05);
+            if block.loop_block {
+                t_local / dur_sec
+            } else {
+                (t_local / dur_sec).min(1.0)
+            }
+        }
+        _ => {
+            if let Some(sec) = block.duration_sec {
+                let dur_sec = (sec as f64).max(0.05);
+                if block.loop_block {
+                    t_local / dur_sec
+                } else {
+                    (t_local / dur_sec).min(1.0)
+                }
+            } else if block.loop_block {
+                b_local / dur_beats
+            } else {
+                (b_local / dur_beats).min(1.0)
+            }
+        }
     };
 
     for elem in &block.elements {
@@ -138,6 +218,8 @@ fn fold_fx_block_into_states(
                 palette_ref,
                 value_start,
                 value_end,
+                hex_start,
+                hex_end,
                 order,
             } => {
                 let parsed_op = MergeOp::from_str(op).unwrap_or(MergeOp::Htp);
@@ -161,9 +243,29 @@ fn fold_fx_block_into_states(
                 } else if trait_name == "color" {
                     let v0 = value_start.unwrap_or(0.0);
                     let v1 = value_end.unwrap_or(1.0);
+                    let inline_start = hex_start
+                        .as_deref()
+                        .and_then(parse_hex_to_linear_rgb);
+                    let inline_end = hex_end
+                        .as_deref()
+                        .and_then(parse_hex_to_linear_rgb)
+                        .or(inline_start);
                     for (cell_idx, u) in target_cells {
                         let w = v0 + u * (v1 - v0);
-                        let rgb = sample_color_palette_linear(color_map, palette_ref.as_deref(), w);
+                        let rgb = if palette_ref.is_some() {
+                            sample_color_palette_linear(color_map, palette_ref.as_deref(), w)
+                        } else if let (Some(c0), Some(c1)) = (inline_start, inline_end) {
+                            let lab0 = linear_rgb_to_oklab(c0);
+                            let lab1 = linear_rgb_to_oklab(c1);
+                            let t = w.clamp(0.0, 1.0);
+                            oklab_to_linear_rgb([
+                                lab0[0] + t * (lab1[0] - lab0[0]),
+                                lab0[1] + t * (lab1[1] - lab0[1]),
+                                lab0[2] + t * (lab1[2] - lab0[2]),
+                            ])
+                        } else {
+                            sample_color_palette_linear(color_map, None, w)
+                        };
                         let delta = CellTraitDelta {
                             dimmer: None,
                             color: Some((parsed_op, rgb)),
@@ -192,6 +294,7 @@ fn fold_fx_block_into_states(
                         if cell_states[cell_idx].apply_cell_delta(&delta, scene_alpha) {
                             if let Some(&fx_idx) = cell_to_fixture.get(cell_idx) {
                                 fixture_states[fx_idx].any_cell_touched = true;
+                                fixture_states[fx_idx].any_cell_dimmer_touched = true;
                             }
                         }
                     }
@@ -205,13 +308,30 @@ fn fold_fx_block_into_states(
                 offset,
                 rate_beats,
                 speed_hz,
+                rate_cycles,
+                phase_deg,
                 phase_spread_deg,
                 duty,
+                grayscale,
+                color_width,
+                gradient,
+                angle_deg,
+                fx_kind_tag,
+                inline_colors,
+                value_stops,
                 palette_ref,
                 order,
             } => {
                 let parsed_op = MergeOp::from_str(op).unwrap_or(MergeOp::Add);
                 let parsed_wf = Waveform1D::from_str(waveform).unwrap_or(Waveform1D::Sine);
+                let base_phase = resolve_element_base_phase(
+                    b_block,
+                    t_local,
+                    cycle_cycles,
+                    *rate_beats,
+                    *speed_hz,
+                    *rate_cycles,
+                );
                 let (target_cells, target_fixtures) = resolve_target_cells_and_fixtures(
                     effective_target_group,
                     *order,
@@ -223,13 +343,11 @@ fn fold_fx_block_into_states(
                 );
                 if trait_name == "master_dimmer" {
                     let is_bipolar = parsed_op == MergeOp::Add;
-                    let val = evaluate_curve_1d_scalar(
+                    let val = evaluate_curve_1d_phase(
                         parsed_wf,
-                        b_block,
-                        t_local,
+                        base_phase,
                         0.0,
-                        *rate_beats,
-                        *speed_hz,
+                        *phase_deg,
                         *phase_spread_deg,
                         *duty,
                         *amplitude,
@@ -244,21 +362,52 @@ fn fold_fx_block_into_states(
                         fixture_states[fx_idx].apply_fixture_delta(&delta, scene_alpha);
                     }
                 } else if trait_name == "color" {
+                    let is_color_fx = fx_kind_tag.as_deref() == Some("color_fx");
+                    let cw = color_width.clamp(0.1, 4.0);
+                    let dir_sign = if angle_deg.rem_euclid(360.0) >= 180.0 {
+                        -1.0f64
+                    } else {
+                        1.0f64
+                    };
                     for (cell_idx, u) in target_cells {
-                        let w = evaluate_curve_1d_scalar(
-                            parsed_wf,
-                            b_block,
-                            t_local,
-                            u,
-                            *rate_beats,
-                            *speed_hz,
-                            *phase_spread_deg,
-                            *duty,
-                            *amplitude,
-                            *offset,
-                            false,
-                        );
-                        let rgb = sample_color_palette_linear(color_map, palette_ref.as_deref(), w);
+                        let rgb = if is_color_fx {
+                            let phi = (base_phase * dir_sign
+                                + (*phase_deg as f64) / 360.0
+                                + (u as f64)
+                                    * ((*phase_spread_deg as f64) / 360.0)
+                                    / (cw as f64))
+                                .rem_euclid(1.0) as f32;
+                            sample_color_element_linear(
+                                color_map,
+                                palette_ref.as_deref(),
+                                inline_colors,
+                                phi,
+                                *gradient,
+                                *grayscale,
+                                true,
+                            )
+                        } else {
+                            let w = evaluate_curve_1d_phase(
+                                parsed_wf,
+                                base_phase,
+                                u,
+                                *phase_deg,
+                                *phase_spread_deg,
+                                *duty,
+                                *amplitude,
+                                *offset,
+                                false,
+                            );
+                            sample_color_element_linear(
+                                color_map,
+                                palette_ref.as_deref(),
+                                inline_colors,
+                                w,
+                                *gradient,
+                                *grayscale,
+                                false,
+                            )
+                        };
                         let delta = CellTraitDelta {
                             dimmer: None,
                             color: Some((parsed_op, rgb)),
@@ -271,20 +420,29 @@ fn fold_fx_block_into_states(
                     }
                 } else {
                     let is_bipolar = parsed_op == MergeOp::Add;
+                    let is_value_fx =
+                        fx_kind_tag.as_deref() == Some("value_fx") && !value_stops.is_empty();
                     for (cell_idx, u) in target_cells {
-                        let val = evaluate_curve_1d_scalar(
-                            parsed_wf,
-                            b_block,
-                            t_local,
-                            u,
-                            *rate_beats,
-                            *speed_hz,
-                            *phase_spread_deg,
-                            *duty,
-                            *amplitude,
-                            *offset,
-                            is_bipolar,
-                        );
+                        let val = if is_value_fx {
+                            let phi = (base_phase
+                                + (*phase_deg as f64) / 360.0
+                                + (u as f64) * ((*phase_spread_deg as f64) / 360.0))
+                                .rem_euclid(1.0) as f32;
+                            *offset
+                                + *amplitude * sample_value_stops(value_stops, phi, *gradient, true)
+                        } else {
+                            evaluate_curve_1d_phase(
+                                parsed_wf,
+                                base_phase,
+                                u,
+                                *phase_deg,
+                                *phase_spread_deg,
+                                *duty,
+                                *amplitude,
+                                *offset,
+                                is_bipolar,
+                            )
+                        };
                         let delta = CellTraitDelta {
                             dimmer: Some((parsed_op, val)),
                             color: None,
@@ -292,6 +450,7 @@ fn fold_fx_block_into_states(
                         if cell_states[cell_idx].apply_cell_delta(&delta, scene_alpha) {
                             if let Some(&fx_idx) = cell_to_fixture.get(cell_idx) {
                                 fixture_states[fx_idx].any_cell_touched = true;
+                                fixture_states[fx_idx].any_cell_dimmer_touched = true;
                             }
                         }
                     }
@@ -302,6 +461,9 @@ fn fold_fx_block_into_states(
                 op,
                 step_beats,
                 speed_hz,
+                rate_cycles,
+                one_way,
+                pixels_on,
                 active_ratio,
                 fade,
                 amplitude,
@@ -309,6 +471,14 @@ fn fold_fx_block_into_states(
                 order,
             } => {
                 let parsed_op = MergeOp::from_str(op).unwrap_or(MergeOp::Htp);
+                let base_phase = resolve_element_base_phase(
+                    b_block,
+                    t_local,
+                    cycle_cycles,
+                    *step_beats,
+                    *speed_hz,
+                    *rate_cycles,
+                );
                 let (target_cells, _) = resolve_target_cells_and_fixtures(
                     effective_target_group,
                     *order,
@@ -320,14 +490,13 @@ fn fold_fx_block_into_states(
                 );
                 let total = target_cells.len();
                 for (cell_idx, u) in target_cells {
-                    let val = evaluate_step_chase_scalar(
-                        b_block,
-                        t_local,
+                    let val = evaluate_step_chase_phase(
+                        base_phase,
                         u,
                         total,
-                        *step_beats,
-                        *speed_hz,
                         *active_ratio,
+                        *pixels_on,
+                        *one_way,
                         *fade,
                         *amplitude,
                     );
@@ -347,6 +516,9 @@ fn fold_fx_block_into_states(
                     if cell_states[cell_idx].apply_cell_delta(&delta, scene_alpha) {
                         if let Some(&fx_idx) = cell_to_fixture.get(cell_idx) {
                             fixture_states[fx_idx].any_cell_touched = true;
+                            if delta.dimmer.is_some() {
+                                fixture_states[fx_idx].any_cell_dimmer_touched = true;
+                            }
                         }
                     }
                 }
@@ -358,13 +530,28 @@ fn fold_fx_block_into_states(
                 palette_ref,
                 rate_beats,
                 speed_hz,
+                rate_cycles,
                 spatial_freq,
+                color_width,
+                gradient,
+                grayscale,
+                transform,
+                inline_colors,
+                value_stops,
                 direction_deg,
                 center_x,
                 center_y,
             } => {
                 let parsed_op = MergeOp::from_str(op).unwrap_or(MergeOp::Ltp);
                 let parsed_shader = Shader2DKind::from_str(shader).unwrap_or(Shader2DKind::LinearSweep);
+                let base_phase = resolve_element_base_phase(
+                    b_block,
+                    t_local,
+                    cycle_cycles,
+                    *rate_beats,
+                    *speed_hz,
+                    *rate_cycles,
+                );
                 let (target_cells, _) = resolve_target_cells_and_fixtures(
                     effective_target_group,
                     None,
@@ -374,39 +561,81 @@ fn fold_fx_block_into_states(
                     &plan.groups,
                     cell_count,
                 );
+                let mut min_x = f32::INFINITY;
+                let mut max_x = f32::NEG_INFINITY;
+                let mut min_y = f32::INFINITY;
+                let mut max_y = f32::NEG_INFINITY;
+                for &(cell_idx, _) in &target_cells {
+                    if let Some(c) = plan.cells.get(cell_idx) {
+                        min_x = min_x.min(c.canvas_xy[0]);
+                        max_x = max_x.max(c.canvas_xy[0]);
+                        min_y = min_y.min(c.canvas_xy[1]);
+                        max_y = max_y.max(c.canvas_xy[1]);
+                    }
+                }
+                let span_x = max_x - min_x;
+                let span_y = max_y - min_y;
+
                 for (cell_idx, _) in target_cells {
                     let canvas_xy = plan
                         .cells
                         .get(cell_idx)
                         .map(|c| c.canvas_xy)
                         .unwrap_or([0.5, 0.5]);
-                    let s = evaluate_spatial_shader_2d(
+                    let nx = if span_x > 1e-4 {
+                        (canvas_xy[0] - min_x) / span_x
+                    } else {
+                        0.5
+                    };
+                    let ny = if span_y > 1e-4 {
+                        (canvas_xy[1] - min_y) / span_y
+                    } else {
+                        0.5
+                    };
+                    let s = evaluate_spatial_shader_2d_phase(
                         parsed_shader,
-                        canvas_xy,
-                        b_block,
-                        t_local,
-                        *rate_beats,
-                        *speed_hz,
+                        [nx, ny],
+                        base_phase,
                         *spatial_freq,
+                        *color_width,
                         *direction_deg,
                         *center_x,
                         *center_y,
+                        transform.as_deref(),
                     );
                     let delta = if trait_name == "color" {
-                        let rgb = sample_color_palette_linear(color_map, palette_ref.as_deref(), s);
+                        let rgb = sample_color_element_linear(
+                            color_map,
+                            palette_ref.as_deref(),
+                            inline_colors,
+                            s,
+                            *gradient,
+                            *grayscale,
+                            true,
+                        );
                         CellTraitDelta {
                             dimmer: None,
                             color: Some((parsed_op, rgb)),
                         }
                     } else {
+                        let val = if !value_stops.is_empty() {
+                            sample_value_stops(value_stops, s, *gradient, true)
+                        } else if *gradient < 0.01 {
+                            (s * 4.0).floor() / 4.0
+                        } else {
+                            s
+                        };
                         CellTraitDelta {
-                            dimmer: Some((parsed_op, s)),
+                            dimmer: Some((parsed_op, val)),
                             color: None,
                         }
                     };
                     if cell_states[cell_idx].apply_cell_delta(&delta, scene_alpha) {
                         if let Some(&fx_idx) = cell_to_fixture.get(cell_idx) {
                             fixture_states[fx_idx].any_cell_touched = true;
+                            if delta.dimmer.is_some() {
+                                fixture_states[fx_idx].any_cell_dimmer_touched = true;
+                            }
                         }
                     }
                 }
@@ -557,6 +786,7 @@ pub fn evaluate_scenes_and_live_layers(
                             plan,
                             block,
                             target_group,
+                            None,
                             clip_alpha,
                             t_local,
                             b_local,
@@ -581,6 +811,7 @@ pub fn evaluate_scenes_and_live_layers(
                             name: String::new(),
                             target_group: Some(target_group.to_string()),
                             duration_beats: clip_beats,
+                            duration_sec: None,
                             loop_block: true,
                             elements: clip.inline_fx.clone(),
                         };
@@ -588,6 +819,7 @@ pub fn evaluate_scenes_and_live_layers(
                             plan,
                             &inline_block,
                             target_group,
+                            None,
                             clip_alpha,
                             t_local,
                             b_local,
@@ -643,6 +875,7 @@ pub fn evaluate_scenes_and_live_layers(
                 plan,
                 block,
                 target_group,
+                Some((def.duration_value, def.duration_unit)),
                 alpha,
                 t_local,
                 b_local,
@@ -671,8 +904,16 @@ pub fn evaluate_scenes_and_live_layers(
     for fx_state in &mut fixture_states {
         fx_state.finalize_fixture_state(runtime.grand_master, runtime.blackout);
     }
-    for cell_state in &mut cell_states {
-        cell_state.finalize_cell_state(runtime.grand_master, runtime.blackout);
+    for (cell_idx, cell_state) in cell_states.iter_mut().enumerate() {
+        let fx_state = cell_to_fixture
+            .get(cell_idx)
+            .and_then(|&fx_idx| fixture_states.get(fx_idx));
+        match fx_state {
+            Some(fs) => {
+                cell_state.finalize_cell_state_with_fixture(fs, runtime.grand_master, runtime.blackout)
+            }
+            None => cell_state.finalize_cell_state(runtime.grand_master, runtime.blackout),
+        }
     }
 
     (fixture_states, cell_states)
@@ -691,6 +932,8 @@ mod tests {
             priority,
             fade_in_sec: fade_in,
             fade_out_sec: fade_out,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_1".to_string()],
         }
     }
