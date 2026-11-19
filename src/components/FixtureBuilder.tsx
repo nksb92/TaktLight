@@ -624,6 +624,22 @@ export function FixtureBuilder() {
                           className="w-8 h-6 bg-transparent border border-steel rounded cursor-pointer"
                         />
                       )}
+                      {draft.wheelSlots.length > 1 && (
+                        <button
+                          type="button"
+                          aria-label={`Delete wheel slot ${idx + 1}`}
+                          title="Delete wheel slot"
+                          onClick={() =>
+                            updateDraft((d) => ({
+                              ...d,
+                              wheelSlots: d.wheelSlots.filter((_, i) => i !== idx),
+                            }))
+                          }
+                          className="p-1 rounded bg-ink border border-steel text-fog hover:text-signal hover:border-signal transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </div>
                   ))}
                   <button
@@ -708,6 +724,22 @@ export function FixtureBuilder() {
                       }
                       className="w-16 bg-ink border border-steel rounded px-2 py-1 font-mono text-xs text-mist"
                     />
+                    <button
+                      type="button"
+                      aria-label={`Delete control channel ${ch.name}`}
+                      title="Delete control channel"
+                      onClick={() =>
+                        updateDraft((d) => ({
+                          ...d,
+                          customChannels: d.customChannels.filter(
+                            (_, i) => i !== idx,
+                          ),
+                        }))
+                      }
+                      className="p-1 rounded bg-ink border border-steel text-fog hover:text-signal hover:border-signal transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 ))}
               </div>
