@@ -1,0 +1,81 @@
+{
+  "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+  "availableChannels": {
+    "Macro 1": {
+      "capability": {
+        "type": "NoFunction"
+      },
+      "defaultValue": 0
+    },
+    "Master Dimmer": {
+      "capability": {
+        "type": "Intensity"
+      },
+      "defaultValue": 0
+    }
+  },
+  "categories": [
+    "LED Tube"
+  ],
+  "matrix": {
+    "pixelCount": [
+      24,
+      1,
+      1
+    ],
+    "pixelGroups": {
+      "All": "all"
+    }
+  },
+  "meta": {
+    "authors": [
+      "Another German Engineer"
+    ],
+    "createDate": "2026-11-19",
+    "lastModifyDate": "2026-11-19"
+  },
+  "modes": [
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": "eachPixelABC",
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "73 CH Mode",
+      "shortName": "74ch"
+    }
+  ],
+  "name": "RLCV3",
+  "shortName": "RLCV3",
+  "templateChannels": {
+    "Blue $pixelKey": {
+      "capability": {
+        "color": "Blue",
+        "type": "ColorIntensity"
+      },
+      "defaultValue": 0
+    },
+    "Green $pixelKey": {
+      "capability": {
+        "color": "Green",
+        "type": "ColorIntensity"
+      },
+      "defaultValue": 0
+    },
+    "Red $pixelKey": {
+      "capability": {
+        "color": "Red",
+        "type": "ColorIntensity"
+      },
+      "defaultValue": 0
+    }
+  }
+}
