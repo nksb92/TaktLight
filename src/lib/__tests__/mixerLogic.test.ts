@@ -1,20 +1,31 @@
 import { describe, expect, it } from "vitest";
 import {
+  amplitudeOffsetToRangePct,
   analyzeSyntheticTimelineAudio,
   applyScalarMerge,
+  buildCurve1DSvgPreview,
+  buildStepChasePreviewBlocks,
   computeBeatGridMarkers,
   computeClipAlphaAt,
+  DEFAULT_COLOR_PALETTES,
+  dmxToPerceptualU8,
   evaluateCurve1DScalar,
+  evaluateSimulationLayersToDmx,
   evaluateSpatialShader2D,
   evaluateStepChaseScalar,
   evalUnipolarWaveform,
   extractRgbw,
   integrateTempoMapBeats,
   linearRgbToOklab,
+  MERGE_OP_LABELS,
+  patternScaleToSpatialFreq,
   quantizeChannelValue,
+  rangePctToAmplitudeOffset,
   sampleOklabGradientHex,
   sampleOklabGradientLinear,
+  sampleOklabStopsLinear,
   snapTimeSecToMarkers,
+  spatialFreqToPatternScale,
   srgbHexToLinearRgb,
 } from "../mixerLogic";
 
@@ -144,5 +155,415 @@ describe("mixerLogic", () => {
       0.15,
     );
     expect(snapped).toBeCloseTo(analysis.transients[1].time_sec, 4);
+  });
+
+  it("maps human-friendly blend modes, range inversion, pattern scale, SVG curves, and step-chase blocks", () => {
+    expect(MERGE_OP_LABELS.scale.label).toBe("Multiply (×)");
+    expect(MERGE_OP_LABELS.htp.label).toBe("Highest Wins (HTP)");
+
+    const normal = rangePctToAmplitudeOffset(20, 80, false);
+    expect(normal.offset).toBeCloseTo(0.2, 4);
+    expect(normal.amplitude).toBeCloseTo(0.6, 4);
+    expect(
+      amplitudeOffsetToRangePct(normal.amplitude, normal.offset, false),
+    ).toEqual({ minPct: 20, maxPct: 80, inverted: false });
+
+    const inverted = rangePctToAmplitudeOffset(90, 10, false);
+    expect(inverted.offset).toBeCloseTo(0.9, 4);
+    expect(inverted.amplitude).toBeCloseTo(-0.8, 4);
+    expect(
+      amplitudeOffsetToRangePct(inverted.amplitude, inverted.offset, false).inverted,
+    ).toBe(true);
+
+    const freq = patternScaleToSpatialFreq(2.0);
+    expect(freq).toBeCloseTo(0.5, 3);
+    expect(spatialFreqToPatternScale(freq)).toBeCloseTo(2.0, 2);
+
+    const svg = buildCurve1DSvgPreview({
+      waveform: "sine",
+      amplitude: 0.8,
+      offset: 0.1,
+      phaseSpreadDeg: 360,
+      duty: 0.5,
+      fixtureCount: 6,
+      isBipolarAdd: false,
+    });
+    expect(svg.pathD.startsWith("M")).toBe(true);
+    expect(svg.fixtureDots).toHaveLength(6);
+
+    const chase = buildStepChasePreviewBlocks({
+      cellCount: 8,
+      activeRatio: 0.25,
+      fade: 0.5,
+      order: "center_out",
+    });
+    expect(chase.activePixelCount).toBe(2);
+    expect(chase.blocks).toHaveLength(8);
+  });
+
+  it("layers independent Color scenes and Dimmer Effect scenes cleanly", () => {
+    const show = {
+      version: "1.0",
+      name: "Layer Test",
+      bpm: 120,
+      read_only_newer_version: false,
+      network_outputs: {
+        frame_rate_hz: 44,
+        adapter: "auto",
+        subnet: null,
+        offline_fallback: true,
+        artsync: true,
+        universes: [],
+      },
+      color_palettes: [
+        { id: "pal_red", name: "Red", hex_start: "#FF0000", hex_end: "#FF0000" },
+      ],
+      dimmer_palettes: [],
+      patch: [
+        {
+          id: "fx_1",
+          name: "Par 1",
+          profile: "par_rgb",
+          mode: "4ch",
+          universe: 1,
+          address: 1,
+          channel_count: 4,
+          grid_pos: { x: 0.5, y: 0.5, rotation: 0, scale_x: 0.1, scale_y: 0.1 },
+          calibration: { gamma: 1, white_mode: "off" as const, white_gain: 1, min_dimmer_dmx: 0, max_dimmer_dmx: 255 },
+        },
+      ],
+      groups: [],
+      fx_library: [
+        {
+          id: "blk_col",
+          name: "Pure Red",
+          target_group: "all",
+          duration_beats: 4,
+          loop_block: true,
+          elements: [
+            { kind: "static_trait" as const, trait: "color", op: "ltp" as const, palette_ref: "pal_red", value_start: 0, value_end: 0, order: null },
+          ],
+        },
+        {
+          id: "blk_eff",
+          name: "Half Dim",
+          target_group: "all",
+          duration_beats: 4,
+          loop_block: true,
+          elements: [
+            { kind: "static_trait" as const, trait: "dimmer", op: "htp" as const, palette_ref: null, value_start: 0.5, value_end: 0.5, order: null },
+          ],
+        },
+      ],
+      scenes: [
+        { id: "sc_col", name: "Red", bank: "Colors", target_group: null, priority: 10, fade_in_sec: 0, fade_out_sec: 0, block_refs: ["blk_col"] },
+        { id: "sc_eff", name: "Dim50", bank: "Effects", target_group: null, priority: 10, fade_in_sec: 0, fade_out_sec: 0, block_refs: ["blk_eff"] },
+      ],
+      timelines: [],
+    };
+    const cache = {
+      par_rgb: {
+        summary: {
+          id: "par_rgb",
+          name: "Par",
+          short_name: "Par",
+          origin: "age_built_in" as const,
+          categories: ["Color"],
+          pixel_count: 1,
+          modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cell_count: 1 }],
+        },
+        raw_json: "",
+        expanded_modes: [
+          {
+            name: "4ch",
+            short_name: "4ch",
+            channel_count: 4,
+            cells: [{ cell_index: 0, pixel_key: "1", grid_xyz: [0, 0, 0] as [number, number, number], local_uv: [0, 0] as [number, number] }],
+            channels: [
+              { dmx_offset: 0, channel_number: 1, name: "Dim", role: { kind: "intensity" as const }, target: { scope: "fixture" as const }, default_value: 0, fine_channel_offset: null },
+              { dmx_offset: 1, channel_number: 2, name: "R", role: { kind: "color_intensity" as const, color: "Red" }, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, default_value: 0, fine_channel_offset: null },
+              { dmx_offset: 2, channel_number: 3, name: "G", role: { kind: "color_intensity" as const, color: "Green" }, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, default_value: 0, fine_channel_offset: null },
+              { dmx_offset: 3, channel_number: 4, name: "B", role: { kind: "color_intensity" as const, color: "Blue" }, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, default_value: 0, fine_channel_offset: null },
+            ],
+          },
+        ],
+      },
+    };
+    const uni = [{ id: 1, review_output: false, protocol: { protocol: "art_net" as const, mode: { mode: "broadcast" as const }, net: 0, subnet: 0, uni: 0 } }];
+
+    // Strict A2: Color scene alone without dimmer/master dimmer leaves intensity at 0 (fixture dark)
+    const colorOnly = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_col", bank: "Colors", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 1,
+    });
+    expect(colorOnly.dmxByUniverse[0][0]).toBe(0);
+
+    // Effect scene alone -> half dimmer (~128) & White (255,255,255)
+    const effOnly = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_eff", bank: "Effects", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 1,
+    });
+    expect(effOnly.dmxByUniverse[0][0]).toBeGreaterThan(120);
+    expect(effOnly.dmxByUniverse[0][0]).toBeLessThan(135);
+    expect(effOnly.dmxByUniverse[0][1]).toBe(255);
+    expect(effOnly.dmxByUniverse[0][3]).toBe(255);
+
+    // Layered Color + Effect scenes -> half dimmer (~128) & Red (255,0,0)
+    const layered = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [
+        { scene_id: "sc_col", bank: "Colors", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 },
+        { scene_id: "sc_eff", bank: "Effects", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 2, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 },
+      ],
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 1,
+    });
+    expect(layered.dmxByUniverse[0][0]).toBeGreaterThan(120);
+    expect(layered.dmxByUniverse[0][0]).toBeLessThan(135);
+    expect(layered.dmxByUniverse[0][1]).toBe(255);
+    expect(layered.dmxByUniverse[0][2]).toBe(0);
+    expect(layered.dmxByUniverse[0][3]).toBe(0);
+  });
+
+  it("uses single-gamma quantization and inverse-gamma 2D preview round-trip", () => {
+    const cache = {
+      par_rgb: {
+        summary: {
+          id: "par_rgb",
+          name: "Par",
+          short_name: "Par",
+          origin: "age_built_in" as const,
+          categories: ["Color"],
+          pixel_count: 1,
+          modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cell_count: 1 }],
+        },
+        raw_json: "",
+        expanded_modes: [
+          {
+            name: "4ch",
+            short_name: "4ch",
+            channel_count: 4,
+            cells: [{ cell_index: 0, pixel_key: "1", grid_xyz: [0, 0, 0] as [number, number, number], local_uv: [0, 0] as [number, number] }],
+            channels: [
+              { dmx_offset: 0, channel_number: 1, name: "Dim", role: { kind: "intensity" as const }, target: { scope: "fixture" as const }, default_value: 0, fine_channel_offset: null },
+              { dmx_offset: 1, channel_number: 2, name: "R", role: { kind: "color_intensity" as const, color: "Red" }, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, default_value: 0, fine_channel_offset: null },
+              { dmx_offset: 2, channel_number: 3, name: "G", role: { kind: "color_intensity" as const, color: "Green" }, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, default_value: 0, fine_channel_offset: null },
+              { dmx_offset: 3, channel_number: 4, name: "B", role: { kind: "color_intensity" as const, color: "Blue" }, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, default_value: 0, fine_channel_offset: null },
+            ],
+          },
+        ],
+      },
+    };
+    const show = {
+      version: "1.0",
+      name: "Orange Test",
+      bpm: 120,
+      read_only_newer_version: false,
+      network_outputs: {
+        frame_rate_hz: 44,
+        adapter: "auto",
+        subnet: null,
+        offline_fallback: true,
+        artsync: true,
+        universes: [],
+      },
+      dimmer_palettes: [],
+      color_palettes: [],
+      patch: [
+        {
+          id: "fx_1",
+          name: "Par 1",
+          profile: "par_rgb",
+          mode: "4ch",
+          universe: 1,
+          address: 1,
+          channel_count: 4,
+          grid_pos: { x: 0.5, y: 0.5, rotation: 0, scale_x: 1, scale_y: 1 },
+          calibration: { gamma: 2.2, min_dimmer_dmx: 0, max_dimmer_dmx: 255, white_gain: 1, white_mode: "replace" as const },
+        },
+      ],
+      groups: [],
+      fx_library: [
+        {
+          id: "blk_orange",
+          name: "Orange",
+          target_group: "all",
+          duration_beats: 4,
+          loop_block: true,
+          elements: [
+            { kind: "static_trait" as const, trait: "dimmer", op: "ltp" as const, palette_ref: null, value_start: 1, value_end: 1, order: null },
+            { kind: "static_trait" as const, trait: "color", op: "ltp" as const, palette_ref: null, hex_start: "#FF5500", hex_end: "#FF5500", value_start: 0, value_end: 0, order: null },
+          ],
+        },
+      ],
+      scenes: [
+        { id: "sc_orange", name: "Orange", bank: "Bank 1", target_group: null, priority: 10, fade_in_sec: 0, fade_out_sec: 0, duration_value: 4, duration_unit: "beats" as const, block_refs: ["blk_orange"] },
+      ],
+      timelines: [],
+    };
+    const uni = [{ id: 1, review_output: false, protocol: { protocol: "art_net" as const, mode: { mode: "broadcast" as const }, net: 0, subnet: 0, uni: 0 } }];
+    const out = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_orange", bank: "Bank 1", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 0,
+    });
+    const r = out.dmxByUniverse[0][1];
+    const g = out.dmxByUniverse[0][2];
+    const b = out.dmxByUniverse[0][3];
+    expect(r).toBe(255);
+    expect(g).toBeGreaterThanOrEqual(20);
+    expect(g).toBeLessThanOrEqual(35);
+    expect(b).toBe(0);
+    expect(Math.abs(dmxToPerceptualU8(g, 2.2) - 0x55)).toBeLessThanOrEqual(4);
+  });
+
+  it("normalizes 2D spatial shaders to target cells bounding box and honors Beats vs Seconds scene duration", () => {
+    const cells = [0, 1, 2, 3].map((idx) => ({
+      cell_index: idx,
+      pixel_key: String(idx + 1),
+      grid_xyz: [idx / 3, 0, 0] as [number, number, number],
+      local_uv: [idx / 3, 0.5] as [number, number],
+    }));
+    const channels = [
+      { dmx_offset: 0, channel_number: 1, name: "Master", role: { kind: "intensity" as const }, target: { scope: "fixture" as const }, default_value: 0, fine_channel_offset: null },
+      ...cells.flatMap((_, idx) => [
+        { dmx_offset: 1 + idx * 3, channel_number: 2 + idx * 3, name: `R${idx}`, role: { kind: "color_intensity" as const, color: "Red" }, target: { scope: "cell" as const, cell_index: idx, pixel_key: String(idx + 1) }, default_value: 0, fine_channel_offset: null },
+        { dmx_offset: 2 + idx * 3, channel_number: 3 + idx * 3, name: `G${idx}`, role: { kind: "color_intensity" as const, color: "Green" }, target: { scope: "cell" as const, cell_index: idx, pixel_key: String(idx + 1) }, default_value: 0, fine_channel_offset: null },
+        { dmx_offset: 3 + idx * 3, channel_number: 4 + idx * 3, name: `B${idx}`, role: { kind: "color_intensity" as const, color: "Blue" }, target: { scope: "cell" as const, cell_index: idx, pixel_key: String(idx + 1) }, default_value: 0, fine_channel_offset: null },
+      ]),
+    ];
+    const cache = {
+      bar4: {
+        summary: { id: "bar4", name: "Bar4", short_name: "Bar4", origin: "age_built_in" as const, categories: ["PixelBar"], pixel_count: 4, modes: [{ name: "13ch", short_name: "13ch", channel_count: 13, cell_count: 4 }] },
+        raw_json: "",
+        expanded_modes: [{ name: "13ch", short_name: "13ch", channel_count: 13, cells, channels }],
+      },
+    };
+    const show = {
+      version: "1.0",
+      name: "BBox & Duration Test",
+      bpm: 120,
+      read_only_newer_version: false,
+      network_outputs: {
+        frame_rate_hz: 44,
+        adapter: "auto",
+        subnet: null,
+        offline_fallback: true,
+        artsync: true,
+        universes: [],
+      },
+      dimmer_palettes: [],
+      color_palettes: DEFAULT_COLOR_PALETTES,
+      patch: [
+        {
+          id: "fx_bar",
+          name: "Bar",
+          profile: "bar4",
+          mode: "13ch",
+          universe: 1,
+          address: 1,
+          channel_count: 13,
+          grid_pos: { x: 0.5, y: 0.5, rotation: 0, scale_x: 0.2, scale_y: 0.2 },
+          calibration: { gamma: 2.2, min_dimmer_dmx: 0, max_dimmer_dmx: 255, white_gain: 1, white_mode: "replace" as const },
+        },
+      ],
+      groups: [],
+      fx_library: [
+        {
+          id: "blk_map",
+          name: "Color Map",
+          target_group: "all",
+          duration_beats: 4,
+          loop_block: true,
+          elements: [
+            { kind: "static_trait" as const, trait: "master_dimmer", op: "ltp" as const, palette_ref: null, value_start: 1, value_end: 1, order: null },
+            { kind: "spatial_shader_2d" as const, trait: "color", op: "ltp" as const, shader: "linear_sweep" as const, palette_ref: "pal_rainbow", inline_colors: DEFAULT_COLOR_PALETTES[0].colors, rate_beats: null, speed_hz: null, rate_cycles: 1, spatial_freq: 1, direction_deg: 0, center_x: 0.5, center_y: 0.5 },
+          ],
+        },
+        {
+          id: "blk_sec",
+          name: "Curve",
+          target_group: "all",
+          duration_beats: 4,
+          duration_sec: 2,
+          loop_block: true,
+          elements: [
+            { kind: "curve_1d" as const, trait: "dimmer", op: "ltp" as const, waveform: "saw" as const, amplitude: 1, offset: 0, rate_beats: null, speed_hz: null, rate_cycles: 1, phase_spread_deg: 0, duty: null, palette_ref: null, order: null },
+          ],
+        },
+      ],
+      scenes: [
+        { id: "sc_map", name: "Map", bank: "Bank 1", target_group: null, priority: 10, fade_in_sec: 0, fade_out_sec: 0, duration_value: 4, duration_unit: "beats" as const, block_refs: ["blk_map"] },
+        { id: "sc_sec", name: "Sec", bank: "Bank 1", target_group: null, priority: 10, fade_in_sec: 0, fade_out_sec: 0, duration_value: 2, duration_unit: "seconds" as const, block_refs: ["blk_sec"] },
+      ],
+      timelines: [],
+    };
+    const uni = [{ id: 1, review_output: false, protocol: { protocol: "art_net" as const, mode: { mode: "broadcast" as const }, net: 0, subnet: 0, uni: 0 } }];
+    const mapOut = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_map", bank: "Bank 1", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 0,
+    });
+    // Distinct colors along the 4 cells (bbox normalized to [0..1], not compressed to [0.4..0.6])
+    const cell0 = [mapOut.dmxByUniverse[0][1], mapOut.dmxByUniverse[0][2], mapOut.dmxByUniverse[0][3]];
+    const cell2 = [mapOut.dmxByUniverse[0][7], mapOut.dmxByUniverse[0][8], mapOut.dmxByUniverse[0][9]];
+    expect(cell0).not.toEqual(cell2);
+
+    // Seconds duration is BPM-independent
+    const secBpm120 = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_sec", bank: "Bank 1", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      beatClock: { bpm: 120, t_anchor_sec: 0, beat_anchor: 0 },
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 0.5,
+    });
+    const secBpm60 = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_sec", bank: "Bank 1", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      beatClock: { bpm: 60, t_anchor_sec: 0, beat_anchor: 0 },
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 0.5,
+    });
+    expect(secBpm120.dmxByUniverse[0][0]).toBe(secBpm60.dmxByUniverse[0][0]);
+
+    // Multi-stop palettes
+    expect(DEFAULT_COLOR_PALETTES.length).toBeGreaterThanOrEqual(12);
+    const midTri = sampleOklabStopsLinear(["#FF0000", "#00FF00", "#0000FF"], 0.5, 1, false, false);
+    expect(midTri[1]).toBeGreaterThan(midTri[0]);
+    expect(midTri[1]).toBeGreaterThan(midTri[2]);
   });
 });

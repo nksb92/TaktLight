@@ -172,12 +172,12 @@ describe("useTaktStore", () => {
       hex_start: "#FFFFFF",
       hex_end: "#FFFFFF",
     });
-    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(3);
+    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(13);
 
     await useTaktStore.getState().undoShow();
-    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(2);
+    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(12);
     await useTaktStore.getState().redoShow();
-    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(3);
+    expect(useTaktStore.getState().showState.color_palettes).toHaveLength(13);
 
     await useTaktStore.getState().upsertGroup({
       id: "grp_tube",
@@ -273,12 +273,23 @@ describe("useTaktStore", () => {
     await useTaktStore.getState().upsertScene({
       id: "sc_pulse",
       name: "Pulse Scene",
-      bank: "main",
+      bank: "Bank 1",
       target_group: null,
       priority: 15,
       fade_in_sec: 0,
       fade_out_sec: 1,
       block_refs: ["blk_pulse"],
+    });
+
+    await useTaktStore.getState().upsertScene({
+      id: "sc_cyber_wave",
+      name: "Cyber Wave",
+      bank: "Bank 1",
+      target_group: null,
+      priority: 10,
+      fade_in_sec: 0,
+      fade_out_sec: 0,
+      block_refs: ["blk_cyber_wave"],
     });
 
     await useTaktStore.getState().triggerScene("sc_cyber_wave", 0);
@@ -419,5 +430,156 @@ describe("useTaktStore", () => {
     const restored = useTaktStore.getState().showState.patch[0];
     expect(restored.universe).toBe(1);
     expect(restored.address).toBe(505);
+  });
+
+  it("supports EDIT Preview vs BLIND vs LIVE output isolation, quick scenes, unique FX blocks, pattern selection, and group mixer", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube UX",
+        1,
+        1,
+        1,
+      );
+
+    // Initial blank starter scene outputs 0 DMX in EDIT Preview (no auto dimmer/color)
+    expect(useTaktStore.getState().studioOutputMode).toBe("live");
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
+    useTaktStore.getState().selectSceneForEdit("sc_new_1");
+    useTaktStore.getState().setStudioOutputMode("edit_preview");
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
+
+    // Seed a lit scene referencing blk_cyber_wave to verify EDIT Preview vs BLIND vs LIVE
+    await useTaktStore.getState().upsertScene({
+      id: "sc_cyber_wave",
+      name: "Cyberpunk Wave",
+      bank: "Bank 1",
+      target_group: null,
+      priority: 10,
+      fade_in_sec: 0,
+      fade_out_sec: 0,
+      block_refs: ["blk_cyber_wave"],
+    });
+    useTaktStore.getState().setStudioOutputMode("live");
+
+    // EDIT Preview outputs selected scene immediately to DMX and 2D preview
+    useTaktStore.getState().selectSceneForEdit("sc_cyber_wave");
+    useTaktStore.getState().setStudioOutputMode("edit_preview");
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
+    expect(useTaktStore.getState().cellPreviewRgbd[0]).toBeGreaterThan(0);
+
+    // BLIND mode keeps DMX isolated (0) while updating 2D preview
+    useTaktStore.getState().setStudioOutputMode("blind");
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
+    expect(useTaktStore.getState().cellPreviewRgbd[0]).toBeGreaterThan(0);
+
+    // Bank & quick-scene creation defaults (0 fade, blank block_refs unless bank default overridden)
+    expect(useTaktStore.getState().sceneBanks).toEqual(["Bank 1"]);
+    const quickBlank = await useTaktStore.getState().createQuickSceneInBank("Bank 1");
+    expect(quickBlank.fade_in_sec).toBe(0);
+    expect(quickBlank.fade_out_sec).toBe(0);
+    expect(quickBlank.block_refs).toEqual([]);
+
+    // Bank default fade inheritance & instant quick scene creation
+    useTaktStore.getState().setBankDefaultFade("Bank 1", 1.5, 2.0);
+    const created = await useTaktStore.getState().createQuickSceneInBank("Bank 1");
+    expect(created.fade_in_sec).toBe(1.5);
+    expect(created.fade_out_sec).toBe(2.0);
+    await useTaktStore.getState().upsertScene({
+      ...created,
+      block_refs: ["blk_cyber_wave"],
+    });
+
+    // Duplicate & Make Unique FX Block protection
+    const dup = await useTaktStore.getState().duplicateScene(created.id);
+    expect(dup).not.toBeNull();
+    const uniqueBlock = await useTaktStore
+      .getState()
+      .makeFxBlockUniqueForScene(dup!.id, dup!.block_refs[0]);
+    expect(uniqueBlock).not.toBeNull();
+    expect(uniqueBlock!.id).not.toBe("blk_cyber_wave");
+
+    // 2D Quick-Pattern Selection Filters
+    useTaktStore.getState().applyCellSelectionPattern("1/2");
+    expect(useTaktStore.getState().selectedCellIndices).toEqual([0, 2, 4, 6]);
+    useTaktStore.getState().applyCellSelectionPattern("shift_right");
+    expect(useTaktStore.getState().selectedCellIndices).toEqual([1, 3, 5, 7]);
+    useTaktStore.getState().applyCellSelectionPattern("invert");
+    expect(useTaktStore.getState().selectedCellIndices).toEqual([0, 2, 4, 6]);
+
+    // Group Mixer Flash -> turns on DMX in LIVE mode
+    useTaktStore.getState().setStudioOutputMode("live");
+    useTaktStore.getState().updateGroupMixerStrip("all", { flashActive: true });
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
+    useTaktStore.getState().updateGroupMixerStrip("all", { flashActive: false });
+    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
+
+    // Right-click stackable bank mode allows multiple active scenes in same bank
+    useTaktStore.getState().toggleBankStackable("Bank 1");
+    await useTaktStore.getState().triggerScene("sc_cyber_wave", 0);
+    await useTaktStore.getState().triggerScene(created.id, 0.5);
+    expect(
+      useTaktStore
+        .getState()
+        .activeScenes.every((s) => s.release_t_sec === null),
+    ).toBe(true);
+    await useTaktStore.getState().releaseAllScenes(1);
+    useTaktStore.getState().toggleBankStackable("Bank 1");
+
+    // Live Snapshot capture
+    const snapScene = await useTaktStore
+      .getState()
+      .captureLiveSnapshotToScene("Captured Look");
+    expect(snapScene.name).toBe("Captured Look");
+  });
+
+  it("enforces TX OFF default, zero fades, blank starter scene, 12+ palettes, dirty tracking, and custom master dimmer fixture loading", async () => {
+    const initial = useTaktStore.getState();
+    expect(initial.outputEnabled).toBe(false);
+    expect(initial.isDirty).toBe(false);
+    expect(initial.showState.color_palettes.length).toBeGreaterThanOrEqual(12);
+    expect(initial.showState.scenes).toHaveLength(1);
+    expect(initial.showState.scenes[0]).toMatchObject({
+      id: "sc_new_1",
+      fade_in_sec: 0,
+      fade_out_sec: 0,
+      duration_value: 4,
+      duration_unit: "beats",
+      block_refs: [],
+    });
+
+    await initial.upsertScene({
+      ...initial.showState.scenes[0],
+      name: "Edited Name",
+    });
+    expect(useTaktStore.getState().isDirty).toBe(true);
+    useTaktStore.getState().markShowSaved();
+    expect(useTaktStore.getState().isDirty).toBe(false);
+
+    // Custom fixture with Master Dimmer + pixels populates fixtureDetailsCache automatically
+    const draft = createDefaultBuilderDraft();
+    draft.name = "Master Pixel Bar";
+    draft.shortName = "MPBar";
+    draft.includeMasterDimmer = true;
+    draft.isMatrix = true;
+    draft.pixelCountX = 4;
+    const saved = await useTaktStore
+      .getState()
+      .saveUserFixture("Master Pixel Bar", buildOflFixtureJson(draft));
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    await useTaktStore
+      .getState()
+      .patchFixtures(saved.detail.summary.id, draft.modeName, "Master Bar", 1, 1, 1);
+    await useTaktStore.getState().ensureFixtureDetailsLoaded([saved.detail.summary.id]);
+    const cached = useTaktStore.getState().fixtureDetailsCache[saved.detail.summary.id];
+    expect(cached).toBeDefined();
+    expect(
+      cached.expanded_modes[0].channels.some(
+        (c) => c.target.scope === "fixture" && c.role.kind === "intensity",
+      ),
+    ).toBe(true);
   });
 });

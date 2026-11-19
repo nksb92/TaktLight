@@ -25,10 +25,14 @@ import {
   ColorPaletteDef,
   computeBeatAt,
   computeSceneAlphaAt,
+  DEFAULT_COLOR_PALETTES,
   DimmerPaletteDef,
+  dmxToPerceptualU8,
+  type DurationUnit,
   evaluateSimulationLayersToDmx,
   type FxBlockDef,
   type FxElementDef,
+  type FxKindTag,
   type MergeOp,
   type SceneDef,
   type Shader2DKind,
@@ -53,6 +57,35 @@ import {
 } from "../lib/patchLogic";
 
 export type DisplayFormat = "DEC" | "HEX" | "PCT";
+export type StudioOutputMode = "edit_preview" | "blind" | "live";
+export type StudioSubMode = "builder" | "live_busking";
+export type MappingOverlayMode = "off" | "key" | "midi";
+
+export interface BankDefaultFade {
+  fadeInSec: number;
+  fadeOutSec: number;
+}
+
+export interface GroupMixerStripState {
+  dimmer: number;
+  hueShiftDeg: number;
+  saturation: number;
+  strobeEnabled: boolean;
+  strobeHz: number;
+  mode: "normal" | "full" | "exclusive_full" | "blackout";
+  flashActive: boolean;
+  exclusiveFlashActive: boolean;
+}
+
+export type CellSelectionPattern =
+  | "all"
+  | "1/2"
+  | "1/3"
+  | "1/4"
+  | "invert"
+  | "shift_left"
+  | "shift_right";
+
 export type WorkspaceTab =
   | "monitor"
   | "patch"
@@ -152,6 +185,7 @@ export interface EngineSnapshotDto {
   interfaces: NetworkInterfaceInfo[];
   adapter_selection: AdapterSelection;
   is_offline: boolean;
+  output_enabled?: boolean;
   discovery_available: boolean;
   active_interface: NetworkInterfaceInfo | null;
   discovered_nodes: TrackedArtNetNode[];
@@ -230,20 +264,7 @@ function createInitialShowState(): ShowStateDto {
       artsync: true,
       universes: DEFAULT_UNIVERSES,
     },
-    color_palettes: [
-      {
-        id: "pal_cyber",
-        name: "Cyberpunk Dual",
-        hex_start: "#FF5500",
-        hex_end: "#2255AA",
-      },
-      {
-        id: "pal_warm",
-        name: "Warm Tungsten",
-        hex_start: "#FFAA44",
-        hex_end: "#FF8822",
-      },
-    ],
+    color_palettes: structuredClone(DEFAULT_COLOR_PALETTES),
     dimmer_palettes: [
       {
         id: "dim_full",
@@ -260,6 +281,7 @@ function createInitialShowState(): ShowStateDto {
         name: "Cyberpunk Wave",
         target_group: "all",
         duration_beats: 4,
+        duration_sec: null,
         loop_block: true,
         elements: [
           {
@@ -285,14 +307,16 @@ function createInitialShowState(): ShowStateDto {
     ],
     scenes: [
       {
-        id: "sc_cyber_wave",
-        name: "Cyberpunk Wave",
-        bank: "main",
+        id: "sc_new_1",
+        name: "New Scene",
+        bank: "Bank 1",
         target_group: null,
         priority: 10,
         fade_in_sec: 0,
-        fade_out_sec: 0.5,
-        block_refs: ["blk_cyber_wave"],
+        fade_out_sec: 0,
+        duration_value: 4,
+        duration_unit: "beats",
+        block_refs: [],
       },
     ],
     timelines: [
@@ -320,7 +344,7 @@ function createInitialShowState(): ShowStateDto {
                 start_sec: 0.0,
                 duration_sec: 8.0,
                 fade_in_sec: 0.0,
-                fade_out_sec: 0.5,
+                fade_out_sec: 0.0,
                 inline_fx: [],
               },
             ],
@@ -423,7 +447,34 @@ function createInitialState() {
     patchToast: null as string | null,
     crossProtocolWarning: false,
     selectedFixtureInstanceId: null as string | null,
+    selectedFixtureIds: [] as string[],
+    sceneBanks: ["Bank 1"],
+    stackableBanks: {} as Record<string, boolean>,
     focusedPatchUniverse: 1,
+    outputEnabled: false,
+    showRevision: 0,
+    savedRevision: 0,
+    isDirty: false,
+    closePromptOpen: false,
+
+    studioOutputMode: "live" as StudioOutputMode,
+    studioSubMode: "builder" as StudioSubMode,
+    selectedSceneId: "sc_new_1" as string | null,
+    multiSelectedSceneIds: [] as string[],
+    bankDefaultFades: {
+      "Bank 1": { fadeInSec: 0, fadeOutSec: 0 },
+    } as Record<string, BankDefaultFade>,
+    flashSceneIds: {} as Record<string, boolean>,
+    groupMixerStrips: {} as Record<string, GroupMixerStripState>,
+    mappingOverlayMode: "off" as MappingOverlayMode,
+    selectedMappingTarget: null as string | null,
+    keyBindings: { sc_new_1: "1" } as Record<string, string>,
+    midiBindings: { sc_new_1: "Note 36" } as Record<string, string>,
+    selectedCellIndices: [] as number[],
+    activeGroupFilterId: "all",
+    canvasOrderRule: "linear" as OrderRuleStr,
+    activeShaderGizmoBlockId: null as string | null,
+
     _simUndo: [] as SimUndoEntry[],
     _simRedo: [] as SimUndoEntry[],
     _simNextSeq: 1,
@@ -433,6 +484,259 @@ function createInitialState() {
   };
 }
 
+function hsvToHex(hueDeg: number, sat: number, val = 1): string {
+  const h = (((hueDeg % 360) + 360) % 360) / 60;
+  const s = Math.max(0, Math.min(1, sat));
+  const v = Math.max(0, Math.min(1, val));
+  const c = v * s;
+  const x = c * (1 - Math.abs((h % 2) - 1));
+  const m = v - c;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (h < 1) [r, g, b] = [c, x, 0];
+  else if (h < 2) [r, g, b] = [x, c, 0];
+  else if (h < 3) [r, g, b] = [0, c, x];
+  else if (h < 4) [r, g, b] = [0, x, c];
+  else if (h < 5) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  const toByte = (n: number) =>
+    Math.round(Math.max(0, Math.min(1, n + m)) * 255)
+      .toString(16)
+      .padStart(2, "0")
+      .toUpperCase();
+  return `#${toByte(r)}${toByte(g)}${toByte(b)}`;
+}
+
+function buildGroupMixerOverlayLayers(
+  strips: Record<string, GroupMixerStripState>,
+  hasLiveOrSceneBase: boolean,
+): SmartControlLayer[] {
+  const entries = Object.entries(strips);
+  if (entries.length === 0) return [];
+  const layers: SmartControlLayer[] = [];
+  let seq = 10000;
+
+  const exclusiveTargets = entries
+    .filter(([, st]) => st.exclusiveFlashActive || st.mode === "exclusive_full")
+    .map(([id]) => id);
+
+  if (exclusiveTargets.length > 0) {
+    layers.push({
+      id: "_gm_excl_blackout",
+      name: "Exclusive Blackout",
+      enabled: true,
+      priority: 900,
+      trigger_order: seq++,
+      alpha: 1,
+      target: "all",
+      order_override: null,
+      trait_spec: {
+        trait_kind: "dimmer",
+        op: "ltp",
+        palette_ref: null,
+        value_start: 0,
+        value_end: 0,
+      },
+    });
+  }
+
+  for (const [targetId, st] of entries) {
+    const isBoost =
+      st.exclusiveFlashActive ||
+      st.flashActive ||
+      st.mode === "full" ||
+      st.mode === "exclusive_full";
+    const isBlackout = st.mode === "blackout" && !st.flashActive && !st.exclusiveFlashActive;
+
+    if (isBlackout) {
+      layers.push({
+        id: `_gm_bo_${targetId}`,
+        name: `Blackout ${targetId}`,
+        enabled: true,
+        priority: 910,
+        trigger_order: seq++,
+        alpha: 1,
+        target: targetId,
+        order_override: null,
+        trait_spec: {
+          trait_kind: "dimmer",
+          op: "ltp",
+          palette_ref: null,
+          value_start: 0,
+          value_end: 0,
+        },
+      });
+    } else if (isBoost) {
+      layers.push({
+        id: `_gm_boost_${targetId}`,
+        name: `Full ${targetId}`,
+        enabled: true,
+        priority: 915,
+        trigger_order: seq++,
+        alpha: 1,
+        target: targetId,
+        order_override: null,
+        trait_spec: {
+          trait_kind: "dimmer",
+          op: "htp",
+          palette_ref: null,
+          value_start: 1,
+          value_end: 1,
+        },
+      });
+      if (!hasLiveOrSceneBase && st.hueShiftDeg === 0 && st.saturation >= 0.99) {
+        layers.push({
+          id: `_gm_boost_col_${targetId}`,
+          name: `Full White ${targetId}`,
+          enabled: true,
+          priority: 914,
+          trigger_order: seq++,
+          alpha: 1,
+          target: targetId,
+          order_override: null,
+          trait_spec: {
+            trait_kind: "color",
+            op: "htp",
+            palette_ref: null,
+            hex_start: "#FFFFFF",
+            hex_end: "#FFFFFF",
+          },
+        });
+      }
+    } else if (st.dimmer < 0.999) {
+      layers.push({
+        id: `_gm_dim_${targetId}`,
+        name: `Dimmer ${targetId}`,
+        enabled: true,
+        priority: 912,
+        trigger_order: seq++,
+        alpha: 1,
+        target: targetId,
+        order_override: null,
+        trait_spec: {
+          trait_kind: "dimmer",
+          op: "scale",
+          palette_ref: null,
+          value_start: st.dimmer,
+          value_end: st.dimmer,
+        },
+      });
+    }
+
+    if (st.hueShiftDeg !== 0 || st.saturation < 0.99) {
+      const hex = hsvToHex(st.hueShiftDeg, st.saturation, 1);
+      layers.push({
+        id: `_gm_col_${targetId}`,
+        name: `Color ${targetId}`,
+        enabled: true,
+        priority: 918,
+        trigger_order: seq++,
+        alpha: 1,
+        target: targetId,
+        order_override: null,
+        trait_spec: {
+          trait_kind: "color",
+          op: "ltp",
+          palette_ref: null,
+          hex_start: hex,
+          hex_end: hex,
+        },
+      });
+    }
+
+    if (st.strobeEnabled) {
+      layers.push({
+        id: `_gm_shutter_${targetId}`,
+        name: `Strobe ${targetId}`,
+        enabled: true,
+        priority: 920,
+        trigger_order: seq++,
+        alpha: 1,
+        target: targetId,
+        order_override: null,
+        trait_spec: {
+          trait_kind: "shutter",
+          state: { kind: "strobe_hz", hz: st.strobeHz },
+        },
+      });
+    }
+  }
+
+  return layers;
+}
+
+function computeCellPreviewRgbdFromDmx(
+  show: ShowStateDto,
+  fixtureDetailsCache: Record<string, FixtureDetail>,
+  universes: UniverseConfig[],
+  universeBuffers: Uint8Array[],
+  cellCountTotal: number,
+): Uint8Array {
+  const uniLookup = new Map<number, Uint8Array>();
+  universes.forEach((u, idx) => uniLookup.set(u.id, universeBuffers[idx]));
+
+  const cellPreviewRgbd = new Uint8Array(cellCountTotal * 4);
+  let cellOffset = 0;
+  for (const inst of show.patch) {
+    const detail = fixtureDetailsCache[inst.profile];
+    const mode = detail?.expanded_modes.find((m) => m.name === inst.mode);
+    const cellCount = mode?.cells.length ?? 1;
+    const channels = mode?.channels ?? [];
+
+    let masterDimmer: number | null = null;
+    for (const ch of channels) {
+      if (ch.target.scope === "fixture" && ch.role.kind === "intensity") {
+        const linear = inst.address + ch.dmx_offset;
+        const uId = linear <= 512 ? inst.universe : inst.universe + 1;
+        const addr = linear <= 512 ? linear : linear - 512;
+        const rawMaster = uniLookup.get(uId)?.[addr - 1] ?? 0;
+        masterDimmer = dmxToPerceptualU8(rawMaster, inst.calibration.gamma);
+      }
+    }
+
+    for (let lc = 0; lc < cellCount; lc++) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let w = 0;
+      let cellDim: number | null = null;
+      for (const ch of channels) {
+        if (ch.target.scope !== "cell" || ch.target.cell_index !== lc) continue;
+        const linear = inst.address + ch.dmx_offset;
+        const uId = linear <= 512 ? inst.universe : inst.universe + 1;
+        const addr = linear <= 512 ? linear : linear - 512;
+        const val = uniLookup.get(uId)?.[addr - 1] ?? 0;
+        if (ch.role.kind === "intensity") {
+          cellDim = dmxToPerceptualU8(val, inst.calibration.gamma);
+        }
+        if (ch.role.kind === "color_intensity") {
+          if (ch.role.color === "Red") r = Math.max(r, val);
+          if (ch.role.color === "Green") g = Math.max(g, val);
+          if (ch.role.color === "Blue") b = Math.max(b, val);
+          if (ch.role.color === "White") w = Math.max(w, val);
+        }
+      }
+      const rr = dmxToPerceptualU8(Math.min(255, r + w), inst.calibration.gamma);
+      const gg = dmxToPerceptualU8(Math.min(255, g + w), inst.calibration.gamma);
+      const bb = dmxToPerceptualU8(Math.min(255, b + w), inst.calibration.gamma);
+      const eff =
+        cellDim !== null && masterDimmer !== null
+          ? Math.floor((cellDim * masterDimmer) / 255)
+          : cellDim ?? masterDimmer ?? (rr > 0 || gg > 0 || bb > 0 ? 255 : 0);
+      const base = (cellOffset + lc) * 4;
+      if (base + 3 < cellPreviewRgbd.length) {
+        cellPreviewRgbd[base] = rr;
+        cellPreviewRgbd[base + 1] = gg;
+        cellPreviewRgbd[base + 2] = bb;
+        cellPreviewRgbd[base + 3] = eff;
+      }
+    }
+    cellOffset += cellCount;
+  }
+  return cellPreviewRgbd;
+}
+
 function synthesizeSimulationBuffer(state: {
   universes: UniverseConfig[];
   parkedChannels: Record<string, number>;
@@ -440,6 +744,9 @@ function synthesizeSimulationBuffer(state: {
   blackout: boolean;
   liveLayers: SmartControlLayer[];
   activeScenes: ActiveSceneInstance[];
+  studioOutputMode: StudioOutputMode;
+  selectedSceneId: string | null;
+  groupMixerStrips: Record<string, GroupMixerStripState>;
   _simBeatClock: BeatClockAnchor;
   activeTimelineId: string | null;
   timelinePlaying: boolean;
@@ -452,11 +759,51 @@ function synthesizeSimulationBuffer(state: {
   compiledCells: CompiledCell[];
   fixtureDetailsCache: Record<string, FixtureDetail>;
 }): ArrayBuffer {
+  const hasBase =
+    state.activeScenes.length > 0 ||
+    state.liveLayers.length > 0 ||
+    state.activeTimelineId !== null;
+  const mixerLayers = buildGroupMixerOverlayLayers(
+    state.groupMixerStrips,
+    hasBase,
+  );
+  const combinedLiveLayers = [...state.liveLayers, ...mixerLayers];
+
+  const previewSceneDef =
+    state.selectedSceneId && state.studioOutputMode !== "live"
+      ? state.showState.scenes.find((s) => s.id === state.selectedSceneId) ?? null
+      : null;
+
+  const scenesWithPreview = (() => {
+    if (!previewSceneDef) return state.activeScenes;
+    const tNow = state.telemetry.tSec;
+    const filtered = state.activeScenes.filter(
+      (inst) => inst.scene_id !== previewSceneDef.id,
+    );
+    const previewInst: ActiveSceneInstance = {
+      scene_id: previewSceneDef.id,
+      bank: previewSceneDef.bank,
+      trigger_t_sec: tNow,
+      trigger_beat: computeBeatAt(state._simBeatClock, tNow),
+      trigger_order: 999999,
+      fade_in_sec: 0,
+      fade_out_sec: 0,
+      release_t_sec: null,
+      release_start_alpha: 1,
+    };
+    return [...filtered, previewInst];
+  })();
+
+  const dmxScenes =
+    state.studioOutputMode === "edit_preview"
+      ? scenesWithPreview
+      : state.activeScenes;
+
   const simOut = evaluateSimulationLayersToDmx({
     show: state.showState,
     fixtureDetailsCache: state.fixtureDetailsCache,
-    liveLayers: state.liveLayers,
-    activeScenes: state.activeScenes,
+    liveLayers: combinedLiveLayers,
+    activeScenes: dmxScenes,
     beatClock: state._simBeatClock,
     timelineState: {
       activeTimelineId: state.activeTimelineId,
@@ -484,67 +831,36 @@ function synthesizeSimulationBuffer(state: {
     return dmx;
   });
 
-  const uniLookup = new Map<number, Uint8Array>();
-  state.universes.forEach((u, idx) => uniLookup.set(u.id, universeBuffers[idx]));
-
-  const cellPreviewRgbd = new Uint8Array(state.compiledCells.length * 4);
-  let cellOffset = 0;
-  for (const inst of state.showState.patch) {
-    const detail = state.fixtureDetailsCache[inst.profile];
-    const mode = detail?.expanded_modes.find((m) => m.name === inst.mode);
-    const cellCount = mode?.cells.length ?? 1;
-    const channels = mode?.channels ?? [];
-
-    let masterDimmer: number | null = null;
-    for (const ch of channels) {
-      if (ch.target.scope === "fixture" && ch.role.kind === "intensity") {
-        const linear = inst.address + ch.dmx_offset;
-        const uId = linear <= 512 ? inst.universe : inst.universe + 1;
-        const addr = linear <= 512 ? linear : linear - 512;
-        masterDimmer = uniLookup.get(uId)?.[addr - 1] ?? 0;
-      }
-    }
-
-    for (let lc = 0; lc < cellCount; lc++) {
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      let w = 0;
-      let cellDim: number | null = null;
-      for (const ch of channels) {
-        if (ch.target.scope !== "cell" || ch.target.cell_index !== lc) continue;
-        const linear = inst.address + ch.dmx_offset;
-        const uId = linear <= 512 ? inst.universe : inst.universe + 1;
-        const addr = linear <= 512 ? linear : linear - 512;
-        const val = uniLookup.get(uId)?.[addr - 1] ?? 0;
-        if (ch.role.kind === "intensity") cellDim = val;
-        if (ch.role.kind === "color_intensity") {
-          if (ch.role.color === "Red") r = Math.max(r, val);
-          if (ch.role.color === "Green") g = Math.max(g, val);
-          if (ch.role.color === "Blue") b = Math.max(b, val);
-          if (ch.role.color === "White") w = Math.max(w, val);
-        }
-      }
-      const rr = Math.min(255, r + w);
-      const gg = Math.min(255, g + w);
-      const bb = Math.min(255, b + w);
-      let eff =
-        cellDim !== null && masterDimmer !== null
-          ? Math.floor((cellDim * masterDimmer) / 255)
-          : cellDim ?? masterDimmer ?? (rr > 0 || gg > 0 || bb > 0 ? 255 : 0);
-      if (eff === 0 && (rr > 0 || gg > 0 || bb > 0)) {
-        eff = Math.floor(Math.max(rr, gg, bb) / 2);
-      }
-      const base = (cellOffset + lc) * 4;
-      if (base + 3 < cellPreviewRgbd.length) {
-        cellPreviewRgbd[base] = rr;
-        cellPreviewRgbd[base + 1] = gg;
-        cellPreviewRgbd[base + 2] = bb;
-        cellPreviewRgbd[base + 3] = eff;
-      }
-    }
-    cellOffset += cellCount;
+  let cellPreviewBuffers = universeBuffers;
+  if (state.studioOutputMode === "blind" && previewSceneDef) {
+    const blindOut = evaluateSimulationLayersToDmx({
+      show: state.showState,
+      fixtureDetailsCache: state.fixtureDetailsCache,
+      liveLayers: combinedLiveLayers,
+      activeScenes: scenesWithPreview,
+      beatClock: state._simBeatClock,
+      timelineState: {
+        activeTimelineId: state.activeTimelineId,
+        playing: state.timelinePlaying,
+        playheadSec: state.timelinePlayheadSec,
+        startAnchorTSec: state._simTimelineAnchorTSec,
+        latencyOffsetMs: state.latencyOffsetMs,
+      },
+      universes: state.universes,
+      grandMaster: state.grandMaster,
+      blackout: state.blackout,
+      tSec: state.telemetry.tSec,
+    });
+    cellPreviewBuffers = blindOut.dmxByUniverse;
   }
+
+  const cellPreviewRgbd = computeCellPreviewRgbdFromDmx(
+    state.showState,
+    state.fixtureDetailsCache,
+    state.universes,
+    cellPreviewBuffers,
+    state.compiledCells.length,
+  );
 
   const samples = state.jitterSamplesUs;
   let meanUs = 22727.0;
@@ -607,10 +923,13 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
     .join("\n");
 
   const paletteLines = [
-    ...show.color_palettes.map(
-      (p) =>
-        `    <ColorPalette id="${esc(p.id)}" name="${esc(p.name)}" hex_start="${esc(p.hex_start)}" hex_end="${esc(p.hex_end)}" />`,
-    ),
+    ...show.color_palettes.map((p) => {
+      const cols =
+        p.colors && p.colors.length >= 2
+          ? ` colors="${esc(p.colors.join(","))}"`
+          : "";
+      return `    <ColorPalette id="${esc(p.id)}" name="${esc(p.name)}" hex_start="${esc(p.hex_start)}" hex_end="${esc(p.hex_end)}"${cols} />`;
+    }),
     ...show.dimmer_palettes.map(
       (d) =>
         `    <DimmerPalette id="${esc(d.id)}" name="${esc(d.name)}" value_start="${d.value_start}" value_end="${d.value_end}" />`,
@@ -652,20 +971,42 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
         if (el.kind === "curve_1d") {
           const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
           const sh = el.speed_hz !== null ? ` speed_hz="${el.speed_hz}"` : "";
+          const rc = el.rate_cycles != null ? ` rate_cycles="${el.rate_cycles}"` : "";
+          const pd = el.phase_deg ? ` phase_deg="${el.phase_deg}"` : "";
+          const dy = el.duty !== null ? ` duty="${el.duty}"` : "";
+          const gs = el.grayscale ? ` grayscale="true"` : "";
+          const cw = el.color_width !== undefined && el.color_width !== 1 ? ` color_width="${el.color_width}"` : "";
+          const gr = el.gradient !== undefined && el.gradient !== 1 ? ` gradient="${el.gradient}"` : "";
+          const ang = el.angle_deg ? ` angle_deg="${el.angle_deg}"` : "";
+          const tagAttr = el.fx_kind_tag ? ` fx_kind_tag="${escFn(el.fx_kind_tag)}"` : "";
+          const ic = el.inline_colors && el.inline_colors.length > 0 ? ` inline_colors="${escFn(el.inline_colors.join(","))}"` : "";
+          const vs = el.value_stops && el.value_stops.length > 0 ? ` value_stops="${el.value_stops.join(",")}"` : "";
           const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
           const ord = el.order ? ` order="${escFn(el.order)}"` : "";
-          return `${indent}<Curve1D trait="${escFn(el.trait)}" op="${escFn(el.op)}" waveform="${escFn(el.waveform)}" amplitude="${el.amplitude}" offset="${el.offset}"${rb}${sh} phase_spread_deg="${el.phase_spread_deg}"${pr}${ord} />`;
+          return `${indent}<Curve1D trait="${escFn(el.trait)}" op="${escFn(el.op)}" waveform="${escFn(el.waveform)}" amplitude="${el.amplitude}" offset="${el.offset}"${rb}${sh}${rc}${pd} phase_spread_deg="${el.phase_spread_deg}"${dy}${gs}${cw}${gr}${ang}${tagAttr}${ic}${vs}${pr}${ord} />`;
         }
         if (el.kind === "step_chase") {
           const sb = el.step_beats !== null ? ` step_beats="${el.step_beats}"` : "";
+          const sh = el.speed_hz !== null ? ` speed_hz="${el.speed_hz}"` : "";
+          const rc = el.rate_cycles != null ? ` rate_cycles="${el.rate_cycles}"` : "";
+          const ow = el.one_way === false ? ` one_way="false"` : "";
+          const px = el.pixels_on != null ? ` pixels_on="${el.pixels_on}"` : "";
           const ar = el.active_ratio !== null ? ` active_ratio="${el.active_ratio}"` : "";
           const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
           const ord = el.order ? ` order="${escFn(el.order)}"` : "";
-          return `${indent}<StepChase trait="${escFn(el.trait)}" op="${escFn(el.op)}"${sb}${ar} fade="${el.fade}" amplitude="${el.amplitude}"${pr}${ord} />`;
+          return `${indent}<StepChase trait="${escFn(el.trait)}" op="${escFn(el.op)}"${sb}${sh}${rc}${ow}${px}${ar} fade="${el.fade}" amplitude="${el.amplitude}"${pr}${ord} />`;
         }
         const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
+        const sh = el.speed_hz !== null ? ` speed_hz="${el.speed_hz}"` : "";
+        const rc = el.rate_cycles != null ? ` rate_cycles="${el.rate_cycles}"` : "";
+        const cw = el.color_width !== undefined && el.color_width !== 1 ? ` color_width="${el.color_width}"` : "";
+        const gr = el.gradient !== undefined && el.gradient !== 1 ? ` gradient="${el.gradient}"` : "";
+        const gs = el.grayscale ? ` grayscale="true"` : "";
+        const tr = el.transform ? ` transform="${escFn(el.transform)}"` : "";
+        const ic = el.inline_colors && el.inline_colors.length > 0 ? ` inline_colors="${escFn(el.inline_colors.join(","))}"` : "";
+        const vs = el.value_stops && el.value_stops.length > 0 ? ` value_stops="${el.value_stops.join(",")}"` : "";
         const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
-        return `${indent}<SpatialShader2D trait="${escFn(el.trait)}" op="${escFn(el.op)}" shader="${escFn(el.shader)}"${pr}${rb} spatial_freq="${el.spatial_freq}" direction_deg="${el.direction_deg}" center_x="${el.center_x}" center_y="${el.center_y}" />`;
+        return `${indent}<SpatialShader2D trait="${escFn(el.trait)}" op="${escFn(el.op)}" shader="${escFn(el.shader)}"${pr}${rb}${sh}${rc} spatial_freq="${el.spatial_freq}"${cw}${gr}${gs}${tr}${ic}${vs} direction_deg="${el.direction_deg}" center_x="${el.center_x}" center_y="${el.center_y}" />`;
       })
       .join("\n");
 
@@ -673,7 +1014,8 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
     .map((b) => {
       const elemLines = serializeFxElementsXml(b.elements, "      ", esc);
       const tg = b.target_group ? ` target_group="${esc(b.target_group)}"` : "";
-      return `    <FxBlock id="${esc(b.id)}" name="${esc(b.name)}"${tg} duration_beats="${b.duration_beats}" loop="${b.loop_block}">\n${elemLines}\n    </FxBlock>`;
+      const ds = b.duration_sec != null ? ` duration_sec="${b.duration_sec}"` : "";
+      return `    <FxBlock id="${esc(b.id)}" name="${esc(b.name)}"${tg} duration_beats="${b.duration_beats}"${ds} loop="${b.loop_block}">\n${elemLines}\n    </FxBlock>`;
     })
     .join("\n");
 
@@ -681,10 +1023,12 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
     .map((sc) => {
       const bStr = sc.bank ? ` bank="${esc(sc.bank)}"` : "";
       const tg = sc.target_group ? ` target_group="${esc(sc.target_group)}"` : "";
+      const dv = sc.duration_value ?? 4;
+      const du = sc.duration_unit ?? "beats";
       const refs = sc.block_refs
         .map((r) => `      <BlockRef ref="${esc(r)}" />`)
         .join("\n");
-      return `    <Scene id="${esc(sc.id)}" name="${esc(sc.name)}"${bStr}${tg} priority="${sc.priority}" fade_in_sec="${sc.fade_in_sec}" fade_out_sec="${sc.fade_out_sec}">\n${refs}\n    </Scene>`;
+      return `    <Scene id="${esc(sc.id)}" name="${esc(sc.name)}"${bStr}${tg} priority="${sc.priority}" fade_in_sec="${sc.fade_in_sec}" fade_out_sec="${sc.fade_out_sec}" duration_value="${dv}" duration_unit="${du}">\n${refs}\n    </Scene>`;
     })
     .join("\n");
 
@@ -834,11 +1178,19 @@ function parseShowXmlLocally(
 
   const color_palettes: ColorPaletteDef[] = [];
   root.querySelectorAll("Palettes > ColorPalette").forEach((el) => {
+    const rawColors = el.getAttribute("colors");
+    const parsedColors = rawColors
+      ? rawColors
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : undefined;
     color_palettes.push({
       id: el.getAttribute("id") ?? `pal_${color_palettes.length + 1}`,
       name: el.getAttribute("name") ?? "Color Palette",
       hex_start: el.getAttribute("hex_start") ?? "#FF5500",
       hex_end: el.getAttribute("hex_end") ?? "#2255AA",
+      ...(parsedColors && parsedColors.length > 0 ? { colors: parsedColors } : {}),
     });
   });
 
@@ -889,6 +1241,8 @@ function parseShowXmlLocally(
           order: (child.getAttribute("order") as OrderRuleStr) ?? null,
         });
       } else if (tag === "Curve1D") {
+        const icAttr = child.getAttribute("inline_colors");
+        const vsAttr = child.getAttribute("value_stops");
         elements.push({
           kind: "curve_1d",
           trait,
@@ -902,10 +1256,29 @@ function parseShowXmlLocally(
           speed_hz: child.getAttribute("speed_hz")
             ? Number(child.getAttribute("speed_hz"))
             : null,
+          rate_cycles: child.getAttribute("rate_cycles")
+            ? Number(child.getAttribute("rate_cycles"))
+            : null,
+          phase_deg: Number(child.getAttribute("phase_deg") ?? 0),
           phase_spread_deg: Number(child.getAttribute("phase_spread_deg") ?? 0),
           duty: child.getAttribute("duty")
             ? Number(child.getAttribute("duty"))
             : null,
+          grayscale: child.getAttribute("grayscale") === "true",
+          color_width: child.getAttribute("color_width")
+            ? Number(child.getAttribute("color_width"))
+            : 1,
+          gradient: child.getAttribute("gradient")
+            ? Number(child.getAttribute("gradient"))
+            : 1,
+          angle_deg: Number(child.getAttribute("angle_deg") ?? 0),
+          fx_kind_tag: (child.getAttribute("fx_kind_tag") as FxKindTag | null) ?? null,
+          inline_colors: icAttr
+            ? icAttr.split(",").map((s) => s.trim()).filter(Boolean)
+            : [],
+          value_stops: vsAttr
+            ? vsAttr.split(",").map(Number).filter((n) => !Number.isNaN(n))
+            : [],
           palette_ref,
           order: (child.getAttribute("order") as OrderRuleStr) ?? null,
         });
@@ -920,6 +1293,13 @@ function parseShowXmlLocally(
           speed_hz: child.getAttribute("speed_hz")
             ? Number(child.getAttribute("speed_hz"))
             : null,
+          rate_cycles: child.getAttribute("rate_cycles")
+            ? Number(child.getAttribute("rate_cycles"))
+            : null,
+          one_way: child.getAttribute("one_way") !== "false",
+          pixels_on: child.getAttribute("pixels_on")
+            ? Number(child.getAttribute("pixels_on"))
+            : null,
           active_ratio: child.getAttribute("active_ratio")
             ? Number(child.getAttribute("active_ratio"))
             : null,
@@ -929,6 +1309,8 @@ function parseShowXmlLocally(
           order: (child.getAttribute("order") as OrderRuleStr) ?? null,
         });
       } else if (tag === "SpatialShader2D") {
+        const icAttr = child.getAttribute("inline_colors");
+        const vsAttr = child.getAttribute("value_stops");
         elements.push({
           kind: "spatial_shader_2d",
           trait,
@@ -942,7 +1324,24 @@ function parseShowXmlLocally(
           speed_hz: child.getAttribute("speed_hz")
             ? Number(child.getAttribute("speed_hz"))
             : null,
+          rate_cycles: child.getAttribute("rate_cycles")
+            ? Number(child.getAttribute("rate_cycles"))
+            : null,
           spatial_freq: Number(child.getAttribute("spatial_freq") ?? 1),
+          color_width: child.getAttribute("color_width")
+            ? Number(child.getAttribute("color_width"))
+            : 1,
+          gradient: child.getAttribute("gradient")
+            ? Number(child.getAttribute("gradient"))
+            : 1,
+          grayscale: child.getAttribute("grayscale") === "true",
+          transform: child.getAttribute("transform") ?? null,
+          inline_colors: icAttr
+            ? icAttr.split(",").map((s) => s.trim()).filter(Boolean)
+            : [],
+          value_stops: vsAttr
+            ? vsAttr.split(",").map(Number).filter((n) => !Number.isNaN(n))
+            : [],
           direction_deg: Number(child.getAttribute("direction_deg") ?? 0),
           center_x: Number(child.getAttribute("center_x") ?? 0.5),
           center_y: Number(child.getAttribute("center_y") ?? 0.5),
@@ -959,6 +1358,9 @@ function parseShowXmlLocally(
       name: el.getAttribute("name") ?? "FX Block",
       target_group: el.getAttribute("target_group"),
       duration_beats: Number(el.getAttribute("duration_beats") ?? 4),
+      duration_sec: el.getAttribute("duration_sec")
+        ? Number(el.getAttribute("duration_sec"))
+        : null,
       loop_block: el.getAttribute("loop") !== "false",
       elements: parseFxElementsXml(el),
     });
@@ -971,6 +1373,11 @@ function parseShowXmlLocally(
       const ref = bEl.getAttribute("ref");
       if (ref) block_refs.push(ref);
     });
+    const rawUnit = el.getAttribute("duration_unit")?.trim().toLowerCase();
+    const duration_unit: DurationUnit =
+      rawUnit === "seconds" || rawUnit === "sec" || rawUnit === "s"
+        ? "seconds"
+        : "beats";
     scenes.push({
       id: el.getAttribute("id") ?? `sc_${scenes.length + 1}`,
       name: el.getAttribute("name") ?? "Scene",
@@ -978,7 +1385,9 @@ function parseShowXmlLocally(
       target_group: el.getAttribute("target_group"),
       priority: Number(el.getAttribute("priority") ?? 10),
       fade_in_sec: Number(el.getAttribute("fade_in_sec") ?? 0),
-      fade_out_sec: Number(el.getAttribute("fade_out_sec") ?? 0.5),
+      fade_out_sec: Number(el.getAttribute("fade_out_sec") ?? 0),
+      duration_value: Number(el.getAttribute("duration_value") ?? 4),
+      duration_unit,
       block_refs,
     });
   });
@@ -1102,7 +1511,30 @@ export interface TaktStoreState {
   patchToast: string | null;
   crossProtocolWarning: boolean;
   selectedFixtureInstanceId: string | null;
+  selectedFixtureIds: string[];
+  sceneBanks: string[];
+  stackableBanks: Record<string, boolean>;
   focusedPatchUniverse: number;
+  outputEnabled: boolean;
+  showRevision: number;
+  savedRevision: number;
+  isDirty: boolean;
+  closePromptOpen: boolean;
+  studioOutputMode: StudioOutputMode;
+  studioSubMode: StudioSubMode;
+  selectedSceneId: string | null;
+  multiSelectedSceneIds: string[];
+  bankDefaultFades: Record<string, BankDefaultFade>;
+  flashSceneIds: Record<string, boolean>;
+  groupMixerStrips: Record<string, GroupMixerStripState>;
+  mappingOverlayMode: MappingOverlayMode;
+  selectedMappingTarget: string | null;
+  keyBindings: Record<string, string>;
+  midiBindings: Record<string, string>;
+  selectedCellIndices: number[];
+  activeGroupFilterId: string;
+  canvasOrderRule: OrderRuleStr;
+  activeShaderGizmoBlockId: string | null;
   _simUndo: SimUndoEntry[];
   _simRedo: SimUndoEntry[];
   _simNextSeq: number;
@@ -1113,7 +1545,14 @@ export interface TaktStoreState {
   setActiveTab: (tab: WorkspaceTab) => void;
   applyBinaryFrame: (buffer: ArrayBuffer) => void;
   applyEngineSnapshot: (snapshot: EngineSnapshotDto) => void;
-  applyShowSnapshot: (snapshot: ShowSnapshotDto) => void;
+  applyShowSnapshot: (
+    snapshot: ShowSnapshotDto,
+    options?: { markClean?: boolean },
+  ) => void;
+  ensureFixtureDetailsLoaded: (profiles: string[]) => Promise<void>;
+  setClosePromptOpen: (open: boolean) => void;
+  markShowSaved: () => void;
+  saveProjectToFile: () => Promise<boolean>;
   setSelectedUniverse: (universeId: number) => void;
   setDisplayFormat: (format: DisplayFormat) => void;
   selectChannel: (channel: number | null) => void;
@@ -1126,6 +1565,8 @@ export interface TaktStoreState {
   setBlackout: (active: boolean) => Promise<void>;
   setGrandMaster: (value: number) => Promise<void>;
   setNetworkAdapter: (selection: AdapterSelection) => Promise<void>;
+  setOutputEnabled: (enabled: boolean) => Promise<void>;
+  configureUniverse: (config: UniverseConfig) => Promise<void>;
   toggleHistogram: () => void;
   refreshSnapshot: () => Promise<void>;
   initEngineConnection: () => () => void;
@@ -1206,6 +1647,58 @@ export interface TaktStoreState {
   resolveSplitFixtures: () => Promise<void>;
   selectFixtureInstance: (id: string | null) => void;
   setFocusedPatchUniverse: (universeId: number) => void;
+  setStudioOutputMode: (mode: StudioOutputMode) => void;
+  setStudioSubMode: (mode: StudioSubMode) => void;
+  selectSceneForEdit: (sceneId: string | null, multiSelect?: boolean) => void;
+  setBankDefaultFade: (
+    bank: string,
+    fadeInSec: number,
+    fadeOutSec: number,
+  ) => void;
+  createQuickSceneInBank: (
+    bank: string | null,
+    presetMode?: "color" | "color_anim" | "effect",
+  ) => Promise<SceneDef>;
+  createSceneBank: (bankName: string) => void;
+  renameSceneBank: (oldName: string, newName: string) => Promise<void>;
+  deleteSceneBank: (bankName: string) => Promise<void>;
+  toggleBankStackable: (bankName: string) => void;
+  releaseBankScenes: (bankName: string, tSec?: number) => Promise<void>;
+  toggleSelectFixtureInstance: (id: string, additive?: boolean) => void;
+  setSelectedFixtureIds: (ids: string[]) => void;
+  createGroupFromSelectedFixtures: (groupName: string) => Promise<void>;
+  duplicateScene: (sceneId: string) => Promise<SceneDef | null>;
+  batchUpdateSelectedScenes: (patch: {
+    fade_in_sec?: number;
+    fade_out_sec?: number;
+    priority?: number;
+    bank?: string | null;
+  }) => Promise<void>;
+  toggleSceneFlashMode: (sceneId: string) => void;
+  makeFxBlockUniqueForScene: (
+    sceneId: string,
+    blockId: string,
+  ) => Promise<FxBlockDef | null>;
+  updateGroupMixerStrip: (
+    groupId: string,
+    patch: Partial<GroupMixerStripState>,
+  ) => void;
+  captureLiveSnapshotToScene: (
+    name?: string,
+    bank?: string | null,
+  ) => Promise<SceneDef>;
+  setMappingOverlayMode: (mode: MappingOverlayMode) => void;
+  setSelectedMappingTarget: (targetId: string | null) => void;
+  bindKeyToTarget: (targetId: string, key: string) => void;
+  bindMidiToTarget: (targetId: string, midiLabel: string) => void;
+  applyCellSelectionPattern: (
+    pattern: CellSelectionPattern,
+    groupFilterId?: string,
+  ) => void;
+  setSelectedCellIndices: (indices: number[]) => void;
+  setActiveGroupFilterId: (groupId: string) => void;
+  setCanvasOrderRule: (rule: OrderRuleStr) => void;
+  setActiveShaderGizmoBlockId: (blockId: string | null) => void;
   dismissToast: () => void;
   resetForTest: () => void;
 }
@@ -1223,9 +1716,21 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         const uniId = state.universes[idx]?.id ?? idx + 1;
         nextDmx[uniId] = uData;
       });
+      const nextActiveScenes = state.activeScenes.filter(
+        (inst) =>
+          !(
+            inst.release_t_sec !== null &&
+            decoded.tSec >= inst.release_t_sec &&
+            computeSceneAlphaAt(inst, decoded.tSec) <= 1e-6
+          ),
+      );
       return {
         dmxByUniverse: nextDmx,
         cellPreviewRgbd: decoded.cellPreviewRgbd,
+        activeScenes:
+          nextActiveScenes.length === state.activeScenes.length
+            ? state.activeScenes
+            : nextActiveScenes,
         telemetry: {
           revision: decoded.revision,
           tSec: decoded.tSec,
@@ -1279,6 +1784,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         interfaces: snapshot.interfaces,
         adapterSelection: snapshot.adapter_selection,
         isOffline: snapshot.is_offline,
+        outputEnabled: snapshot.output_enabled ?? state.outputEnabled,
         discoveryAvailable: snapshot.discovery_available,
         activeInterface: snapshot.active_interface,
         discoveredNodes: snapshot.discovered_nodes,
@@ -1294,7 +1800,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     });
   },
 
-  applyShowSnapshot: (snapshot) => {
+  applyShowSnapshot: (snapshot, options) => {
     set((state) => {
       const nextUniverses = snapshot.show.network_outputs.universes;
       const nextDmx: Record<number, Uint8Array> = {};
@@ -1302,6 +1808,22 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         nextDmx[u.id] =
           state.dmxByUniverse[u.id] ?? new Uint8Array(DMX_UNIVERSE_CHANNELS);
       }
+      const hasSelected =
+        state.selectedSceneId !== null &&
+        snapshot.show.scenes.some((s) => s.id === state.selectedSceneId);
+      const nextSelectedSceneId = hasSelected
+        ? state.selectedSceneId
+        : (snapshot.show.scenes[0]?.id ?? null);
+      const nextBanks = [...state.sceneBanks];
+      for (const sc of snapshot.show.scenes) {
+        const b = sc.bank?.trim();
+        if (b && !nextBanks.includes(b)) {
+          nextBanks.push(b);
+        }
+      }
+      const nextRev = snapshot.revision;
+      const markClean = Boolean(options?.markClean);
+      const nextSavedRev = markClean ? nextRev : state.savedRevision;
       return {
         showState: snapshot.show,
         universes: nextUniverses,
@@ -1312,8 +1834,80 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         rolloverEnabled: snapshot.rollover_enabled,
         patchToast: snapshot.toast ?? state.patchToast,
         crossProtocolWarning: snapshot.cross_protocol_warning,
+        selectedSceneId: nextSelectedSceneId,
+        sceneBanks: nextBanks.length > 0 ? nextBanks : ["Bank 1"],
+        showRevision: nextRev,
+        savedRevision: nextSavedRev,
+        isDirty: nextRev !== nextSavedRev,
       };
     });
+    const profiles = snapshot.show.patch.map((f) => f.profile);
+    if (profiles.length > 0) {
+      void get().ensureFixtureDetailsLoaded(profiles);
+    }
+  },
+
+  setClosePromptOpen: (open) => set({ closePromptOpen: open }),
+
+  markShowSaved: () =>
+    set((state) => ({
+      savedRevision: state.showRevision,
+      isDirty: false,
+    })),
+
+  saveProjectToFile: async () => {
+    const xml = await get().exportShowXml();
+    const cleanName =
+      get()
+        .showState.name.trim()
+        .replace(/[^a-zA-Z0-9._-]+/g, "_") || "taktlight_show";
+    const fileName = cleanName.endsWith(".takt.xml")
+      ? cleanName
+      : `${cleanName}.takt.xml`;
+
+    if (typeof window !== "undefined") {
+      const pickerWin = window as unknown as {
+        showSaveFilePicker?: (opts: unknown) => Promise<{
+          createWritable: () => Promise<{
+            write: (data: string) => Promise<void>;
+            close: () => Promise<void>;
+          }>;
+        }>;
+      };
+      if (typeof pickerWin.showSaveFilePicker === "function") {
+        try {
+          const handle = await pickerWin.showSaveFilePicker({
+            suggestedName: fileName,
+            types: [
+              {
+                description: "TaktLight Show XML",
+                accept: { "application/xml": [".takt.xml", ".xml"] },
+              },
+            ],
+          });
+          const writable = await handle.createWritable();
+          await writable.write(xml);
+          await writable.close();
+          get().markShowSaved();
+          return true;
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            return false;
+          }
+        }
+      }
+      if (typeof document !== "undefined" && typeof URL.createObjectURL === "function") {
+        const blob = new Blob([xml], { type: "application/xml" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+    }
+    get().markShowSaved();
+    return true;
   },
 
   setSelectedUniverse: (universeId) => set({ selectedUniverseId: universeId }),
@@ -1397,6 +1991,64 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       });
       get().applyEngineSnapshot(snapshot);
     }
+  },
+
+  setOutputEnabled: async (enabled) => {
+    set({ outputEnabled: enabled });
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<EngineSnapshotDto>(
+        "set_output_enabled_command",
+        { enabled },
+      );
+      get().applyEngineSnapshot(snapshot);
+    }
+  },
+
+  configureUniverse: async (config) => {
+    if (isTauriEnvironment()) {
+      const snap = await invoke<ShowSnapshotDto>("configure_universe_command", {
+        config,
+      });
+      get().applyShowSnapshot(snap);
+      return;
+    }
+    const state = get();
+    const prevShow = state.showState;
+    const exists = prevShow.network_outputs.universes.some(
+      (u) => u.id === config.id,
+    );
+    const nextUnis = exists
+      ? prevShow.network_outputs.universes.map((u) =>
+          u.id === config.id ? config : u,
+        )
+      : [...prevShow.network_outputs.universes, config].sort(
+          (a, b) => a.id - b.id,
+        );
+    const nextShow: ShowStateDto = {
+      ...prevShow,
+      network_outputs: {
+        ...prevShow.network_outputs,
+        universes: nextUnis,
+      },
+    };
+    const nextDmx: Record<number, Uint8Array> = { ...state.dmxByUniverse };
+    if (!nextDmx[config.id]) {
+      nextDmx[config.id] = new Uint8Array(DMX_UNIVERSE_CHANNELS);
+    }
+    const nextUndo = [...state._simUndo, { show: prevShow, coalesceKey: null }];
+    set({
+      showState: nextShow,
+      universes: nextUnis,
+      dmxByUniverse: nextDmx,
+      _simUndo: nextUndo,
+      _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
+      canUndo: true,
+      canRedo: false,
+      patchToast: `Configured Universe ${config.id}`,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
   },
 
   toggleHistogram: () =>
@@ -1490,6 +2142,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     if (isTauriEnvironment()) {
       const summaries = await invoke<FixtureSummary[]>("list_fixtures");
       set({ fixtureSummaries: summaries });
+      await get().ensureFixtureDetailsLoaded(summaries.map((s) => s.id));
       return;
     }
     const cache = get().fixtureDetailsCache;
@@ -1498,6 +2151,34 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         .map((d) => d.summary)
         .sort((a, b) => a.id.localeCompare(b.id)),
     });
+  },
+
+  ensureFixtureDetailsLoaded: async (profiles) => {
+    if (!isTauriEnvironment() || profiles.length === 0) return;
+    const unique = Array.from(new Set(profiles)).filter(
+      (id) => Boolean(id) && !get().fixtureDetailsCache[id],
+    );
+    if (unique.length === 0) return;
+    const settled = await Promise.allSettled(
+      unique.map(async (id) => ({
+        id,
+        detail: await invoke<FixtureDetail>("get_fixture_detail", { id }),
+      })),
+    );
+    const additions: Record<string, FixtureDetail> = {};
+    for (const res of settled) {
+      if (res.status === "fulfilled" && res.value.detail) {
+        additions[res.value.id] = res.value.detail;
+      }
+    }
+    if (Object.keys(additions).length > 0) {
+      set((state) => ({
+        fixtureDetailsCache: {
+          ...state.fixtureDetailsCache,
+          ...additions,
+        },
+      }));
+    }
   },
 
   selectFixture: async (id) => {
@@ -1646,7 +2327,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   loadShowSnapshot: async () => {
     if (isTauriEnvironment()) {
       const snapshot = await invoke<ShowSnapshotDto>("get_show_snapshot");
-      get().applyShowSnapshot(snapshot);
+      get().applyShowSnapshot(snapshot, { markClean: true });
     }
   },
 
@@ -1761,6 +2442,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
       _simNextSeq: seq,
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -1817,6 +2500,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       crossProtocolWarning: outcome.crossProtocolWarning,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -1848,6 +2533,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
           : state.selectedFixtureInstanceId,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -1881,6 +2568,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       compiledCells: compileCellsLocally(nextPatch, state.fixtureDetailsCache),
       _simUndo: nextUndo,
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: nextUndo.length > 0,
       canRedo: false,
     });
@@ -1912,6 +2601,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       showState: nextShow,
       _simUndo: nextUndo,
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: nextUndo.length > 0,
       canRedo: false,
     });
@@ -1980,6 +2671,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: "Undid last change",
       _simUndo: nextUndo,
       _simRedo: nextRedo,
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: nextUndo.length > 0,
       canRedo: nextRedo.length > 0,
     });
@@ -2012,6 +2705,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: "Redid change",
       _simUndo: nextUndo,
       _simRedo: nextRedo,
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: nextUndo.length > 0,
       canRedo: nextRedo.length > 0,
     });
@@ -2030,13 +2725,14 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       const snapshot = await invoke<ShowSnapshotDto>("import_show_xml_command", {
         xmlStr,
       });
-      get().applyShowSnapshot(snapshot);
+      get().applyShowSnapshot(snapshot, { markClean: true });
       return;
     }
 
     const state = get();
     const prevShow = structuredClone(state.showState);
     const imported = parseShowXmlLocally(xmlStr, state.fixtureDetailsCache);
+    const nextRev = state.showRevision + 1;
     set({
       showState: imported,
       universes: imported.network_outputs.universes,
@@ -2045,6 +2741,9 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         state.fixtureDetailsCache,
       ),
       patchToast: "Imported .takt.xml show",
+      showRevision: nextRev,
+      savedRevision: nextRev,
+      isDirty: false,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
       canUndo: true,
@@ -2073,6 +2772,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Saved color palette ${palette.name}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2098,6 +2799,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Deleted color palette ${id}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2124,6 +2827,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Saved dimmer palette ${palette.name}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2149,6 +2854,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Deleted dimmer palette ${id}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2174,6 +2881,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Saved group ${group.name}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2198,6 +2907,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Deleted group ${id}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2236,6 +2947,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Saved FX block ${block.name}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2261,6 +2974,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       patchToast: `Deleted FX block ${id}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2283,9 +2998,12 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       : [...prevShow.scenes, scene];
     set({
       showState: { ...prevShow, scenes: nextScenes },
+      selectedSceneId: exists ? state.selectedSceneId : scene.id,
       patchToast: `Saved scene ${scene.name}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2302,14 +3020,24 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     }
     const state = get();
     const prevShow = structuredClone(state.showState);
+    const nextScenes = prevShow.scenes.filter((s) => s.id !== id);
     set({
       showState: {
         ...prevShow,
-        scenes: prevShow.scenes.filter((s) => s.id !== id),
+        scenes: nextScenes,
       },
+      selectedSceneId:
+        state.selectedSceneId === id
+          ? (nextScenes[0]?.id ?? null)
+          : state.selectedSceneId,
+      multiSelectedSceneIds: state.multiSelectedSceneIds.filter(
+        (sid) => sid !== id,
+      ),
       patchToast: `Deleted scene ${id}`,
       _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2330,6 +3058,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     if (!scene) return;
     const tNow = tSec ?? state.telemetry.tSec;
     const normBank = scene.bank?.trim() ? scene.bank.trim() : null;
+    const isStackable = Boolean(normBank && state.stackableBanks[normBank]);
 
     const remaining = state.activeScenes
       .filter((inst) => {
@@ -2340,6 +3069,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       .map((inst) => {
         if (
           normBank &&
+          !isStackable &&
           inst.bank === normBank &&
           inst.release_t_sec === null
         ) {
@@ -2548,6 +3278,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       crossProtocolWarning: false,
       _simUndo: nextUndo,
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: true,
       canRedo: false,
     });
@@ -2579,6 +3311,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       showState: nextShow,
       _simUndo: nextUndo,
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: nextUndo.length > 0,
       canRedo: false,
     });
@@ -2603,6 +3337,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       timelinePlaying: state.activeTimelineId === id ? false : state.timelinePlaying,
       _simUndo: nextUndo,
       _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
       canUndo: nextUndo.length > 0,
       canRedo: false,
     });
@@ -2704,6 +3440,685 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   setFocusedPatchUniverse: (universeId) =>
     set({ focusedPatchUniverse: Math.max(1, universeId) }),
+
+  setStudioOutputMode: (mode) => {
+    set({ studioOutputMode: mode });
+    if (!isTauriEnvironment()) {
+      get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    }
+  },
+
+  setStudioSubMode: (mode) => set({ studioSubMode: mode }),
+
+  selectSceneForEdit: (sceneId, multiSelect = false) => {
+    set((state) => {
+      if (!multiSelect || !sceneId) {
+        return {
+          selectedSceneId: sceneId,
+          multiSelectedSceneIds: sceneId ? [sceneId] : [],
+        };
+      }
+      const exists = state.multiSelectedSceneIds.includes(sceneId);
+      const nextMulti = exists
+        ? state.multiSelectedSceneIds.filter((id) => id !== sceneId)
+        : [...state.multiSelectedSceneIds, sceneId];
+      return {
+        selectedSceneId: sceneId,
+        multiSelectedSceneIds: nextMulti,
+      };
+    });
+    if (!isTauriEnvironment()) {
+      get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    }
+  },
+
+  setBankDefaultFade: (bank, fadeInSec, fadeOutSec) => {
+    const key = bank.trim();
+    set((state) => ({
+      bankDefaultFades: {
+        ...state.bankDefaultFades,
+        [key]: {
+          fadeInSec: Math.max(0, fadeInSec),
+          fadeOutSec: Math.max(0, fadeOutSec),
+        },
+      },
+    }));
+  },
+
+  createSceneBank: (bankName) => {
+    const clean = bankName.trim();
+    if (!clean) return;
+    set((state) => ({
+      sceneBanks: state.sceneBanks.includes(clean)
+        ? state.sceneBanks
+        : [...state.sceneBanks, clean],
+    }));
+  },
+
+  renameSceneBank: async (oldName, newName) => {
+    const from = oldName.trim();
+    const to = newName.trim();
+    if (!from || !to || from === to) return;
+    const state = get();
+    const nextBanks = Array.from(
+      new Set(state.sceneBanks.map((b) => (b === from ? to : b))),
+    );
+    const nextStackable = { ...state.stackableBanks };
+    if (from in nextStackable) {
+      nextStackable[to] = nextStackable[from];
+      delete nextStackable[from];
+    }
+    const nextFades = { ...state.bankDefaultFades };
+    if (from in nextFades) {
+      nextFades[to] = nextFades[from];
+      delete nextFades[from];
+    }
+
+    if (isTauriEnvironment()) {
+      set({
+        sceneBanks: nextBanks,
+        stackableBanks: nextStackable,
+        bankDefaultFades: nextFades,
+      });
+      const snap = await invoke<ShowSnapshotDto>("rename_scene_bank_command", {
+        oldName: from,
+        newName: to,
+      });
+      get().applyShowSnapshot(snap);
+      set((s) => ({
+        sceneBanks: Array.from(
+          new Set(
+            s.sceneBanks
+              .filter((b) => b !== from)
+              .concat(nextBanks.includes(to) ? [] : [to]),
+          ),
+        ),
+      }));
+      return;
+    }
+
+    const prevShow = state.showState;
+    const hasAffected = prevShow.scenes.some(
+      (s) => s.bank?.trim() === from,
+    );
+    if (!hasAffected) {
+      set({
+        sceneBanks: nextBanks,
+        stackableBanks: nextStackable,
+        bankDefaultFades: nextFades,
+      });
+      return;
+    }
+    const nextShow: ShowStateDto = {
+      ...prevShow,
+      scenes: prevShow.scenes.map((sc) =>
+        sc.bank?.trim() === from ? { ...sc, bank: to } : sc,
+      ),
+    };
+    const nextUndo = [...state._simUndo, { show: prevShow, coalesceKey: null }];
+    set({
+      showState: nextShow,
+      sceneBanks: nextBanks,
+      stackableBanks: nextStackable,
+      bankDefaultFades: nextFades,
+      _simUndo: nextUndo,
+      _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  deleteSceneBank: async (bankName) => {
+    const target = bankName.trim();
+    if (!target) return;
+    const state = get();
+    const remainingBanks = state.sceneBanks.filter((b) => b !== target);
+    const nextBanks = remainingBanks.length > 0 ? remainingBanks : ["Bank 1"];
+    const toRemove = state.showState.scenes.filter(
+      (s) => s.bank?.trim() === target,
+    );
+    for (const sc of toRemove) {
+      await get().deleteScene(sc.id);
+    }
+    set({
+      sceneBanks: nextBanks,
+    });
+  },
+
+  toggleBankStackable: (bankName) => {
+    const target = bankName.trim();
+    if (!target) return;
+    set((state) => ({
+      stackableBanks: {
+        ...state.stackableBanks,
+        [target]: !state.stackableBanks[target],
+      },
+    }));
+  },
+
+  releaseBankScenes: async (bankName, tSec) => {
+    const target = bankName.trim();
+    if (!target) return;
+    const scenesInBank = get().showState.scenes.filter(
+      (s) => s.bank === target,
+    );
+    for (const sc of scenesInBank) {
+      const isActive = get().activeScenes.some(
+        (a) => a.scene_id === sc.id && a.release_t_sec === null,
+      );
+      if (isActive) {
+        await get().releaseScene(sc.id, tSec);
+      }
+    }
+  },
+
+  toggleSelectFixtureInstance: (id, additive = true) => {
+    set((state) => {
+      if (!additive) {
+        return {
+          selectedFixtureIds: [id],
+          selectedFixtureInstanceId: id,
+        };
+      }
+      const exists = state.selectedFixtureIds.includes(id);
+      const nextIds = exists
+        ? state.selectedFixtureIds.filter((x) => x !== id)
+        : [...state.selectedFixtureIds, id];
+      return {
+        selectedFixtureIds: nextIds,
+        selectedFixtureInstanceId:
+          nextIds.length > 0 ? nextIds[nextIds.length - 1] : null,
+      };
+    });
+  },
+
+  setSelectedFixtureIds: (ids) =>
+    set({
+      selectedFixtureIds: ids,
+      selectedFixtureInstanceId: ids[0] ?? null,
+    }),
+
+  createGroupFromSelectedFixtures: async (groupName) => {
+    const state = get();
+    const clean = groupName.trim() || `Group ${state.showState.groups.length + 1}`;
+    const slugBase = `grp_${clean.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "group"}`;
+    let gid = slugBase;
+    let suffix = 2;
+    while (state.showState.groups.some((g) => g.id === gid)) {
+      gid = `${slugBase}_${suffix}`;
+      suffix += 1;
+    }
+
+    let targets: string[] = [];
+    if (state.selectedFixtureIds.length > 0) {
+      targets = [...state.selectedFixtureIds];
+    } else if (state.selectedCellIndices.length > 0) {
+      targets = Array.from(
+        new Set(
+          state.selectedCellIndices
+            .map((idx) => state.compiledCells[idx])
+            .filter((c): c is NonNullable<typeof c> => Boolean(c))
+            .map((c) => `${c.fixture_id}:${c.cell_index}`),
+        ),
+      );
+    } else if (state.selectedFixtureInstanceId) {
+      targets = [state.selectedFixtureInstanceId];
+    } else {
+      targets = state.showState.patch.map((f) => f.id);
+    }
+
+    await get().upsertGroup({
+      id: gid,
+      name: clean,
+      order: state.canvasOrderRule,
+      targets,
+    });
+    set({ activeGroupFilterId: gid });
+  },
+
+  createQuickSceneInBank: async (bank) => {
+    const state = get();
+    const normBank = bank && bank.trim() ? bank.trim() : null;
+    if (normBank && !state.sceneBanks.includes(normBank)) {
+      set({ sceneBanks: [...state.sceneBanks, normBank] });
+    }
+    const defaults = normBank
+      ? (state.bankDefaultFades[normBank] ?? { fadeInSec: 0, fadeOutSec: 0 })
+      : { fadeInSec: 0, fadeOutSec: 0 };
+
+    let seq = state.showState.scenes.length + 1;
+    while (state.showState.scenes.some((s) => s.id === `sc_scene_${seq}`)) {
+      seq += 1;
+    }
+    const sceneId = `sc_scene_${seq}`;
+    const sceneName = normBank ? `Scene ${seq}` : `Overlay ${seq}`;
+
+    const newScene: SceneDef = {
+      id: sceneId,
+      name: sceneName,
+      bank: normBank,
+      target_group: null,
+      priority: normBank ? 10 : 25,
+      fade_in_sec: defaults.fadeInSec,
+      fade_out_sec: defaults.fadeOutSec,
+      duration_value: 4,
+      duration_unit: "beats",
+      block_refs: [],
+    };
+
+    if (isTauriEnvironment()) {
+      await get().upsertScene(newScene);
+      set({
+        selectedSceneId: sceneId,
+        multiSelectedSceneIds: [sceneId],
+      });
+      return newScene;
+    }
+
+    const prevShow = structuredClone(state.showState);
+    const nextShow: ShowStateDto = {
+      ...prevShow,
+      scenes: [...prevShow.scenes, newScene],
+    };
+    const nextRev = state.showRevision + 1;
+    set({
+      showState: nextShow,
+      selectedSceneId: sceneId,
+      multiSelectedSceneIds: [sceneId],
+      patchToast: `Created ${sceneName}`,
+      showRevision: nextRev,
+      isDirty: nextRev !== state.savedRevision,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    return newScene;
+  },
+
+  duplicateScene: async (sceneId) => {
+    const state = get();
+    const src = state.showState.scenes.find((s) => s.id === sceneId);
+    if (!src) return null;
+    let suffix = 2;
+    while (state.showState.scenes.some((s) => s.id === `${src.id}_copy_${suffix}`)) {
+      suffix += 1;
+    }
+    const copy: SceneDef = {
+      ...structuredClone(src),
+      id: `${src.id}_copy_${suffix}`,
+      name: `${src.name} Copy`,
+    };
+    await get().upsertScene(copy);
+    set({
+      selectedSceneId: copy.id,
+      multiSelectedSceneIds: [copy.id],
+    });
+    return copy;
+  },
+
+  batchUpdateSelectedScenes: async (patch) => {
+    const state = get();
+    const ids = new Set(state.multiSelectedSceneIds);
+    if (ids.size === 0) return;
+
+    if (isTauriEnvironment()) {
+      for (const sc of state.showState.scenes) {
+        if (!ids.has(sc.id)) continue;
+        await get().upsertScene({
+          ...sc,
+          fade_in_sec: patch.fade_in_sec ?? sc.fade_in_sec,
+          fade_out_sec: patch.fade_out_sec ?? sc.fade_out_sec,
+          priority: patch.priority ?? sc.priority,
+          bank: patch.bank !== undefined ? patch.bank : sc.bank,
+        });
+      }
+      return;
+    }
+
+    const prevShow = structuredClone(state.showState);
+    const nextScenes = prevShow.scenes.map((sc) =>
+      ids.has(sc.id)
+        ? {
+            ...sc,
+            fade_in_sec:
+              patch.fade_in_sec !== undefined
+                ? Math.max(0, patch.fade_in_sec)
+                : sc.fade_in_sec,
+            fade_out_sec:
+              patch.fade_out_sec !== undefined
+                ? Math.max(0, patch.fade_out_sec)
+                : sc.fade_out_sec,
+            priority:
+              patch.priority !== undefined
+                ? Math.max(0, Math.round(patch.priority))
+                : sc.priority,
+            bank: patch.bank !== undefined ? patch.bank : sc.bank,
+          }
+        : sc,
+    );
+    set({
+      showState: { ...prevShow, scenes: nextScenes },
+      patchToast: `Updated ${ids.size} scene(s)`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  toggleSceneFlashMode: (sceneId) => {
+    set((state) => ({
+      flashSceneIds: {
+        ...state.flashSceneIds,
+        [sceneId]: !state.flashSceneIds[sceneId],
+      },
+    }));
+  },
+
+  makeFxBlockUniqueForScene: async (sceneId, blockId) => {
+    const state = get();
+    const scene = state.showState.scenes.find((s) => s.id === sceneId);
+    const block = state.showState.fx_library.find((b) => b.id === blockId);
+    if (!scene || !block) return null;
+
+    let idx = 2;
+    while (state.showState.fx_library.some((b) => b.id === `${block.id}_u${idx}`)) {
+      idx += 1;
+    }
+    const uniqueBlock: FxBlockDef = {
+      ...structuredClone(block),
+      id: `${block.id}_u${idx}`,
+      name: `${block.name} (Unique)`,
+    };
+    const updatedScene: SceneDef = {
+      ...scene,
+      block_refs: scene.block_refs.map((r) => (r === blockId ? uniqueBlock.id : r)),
+    };
+
+    if (isTauriEnvironment()) {
+      await get().upsertFxBlock(uniqueBlock);
+      await get().upsertScene(updatedScene);
+      return uniqueBlock;
+    }
+
+    const prevShow = structuredClone(state.showState);
+    const nextShow: ShowStateDto = {
+      ...prevShow,
+      fx_library: [...prevShow.fx_library, uniqueBlock],
+      scenes: prevShow.scenes.map((s) => (s.id === sceneId ? updatedScene : s)),
+    };
+    set({
+      showState: nextShow,
+      patchToast: `Created unique FX block ${uniqueBlock.name}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
+      canUndo: true,
+      canRedo: false,
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    return uniqueBlock;
+  },
+
+  updateGroupMixerStrip: (groupId, patch) => {
+    set((state) => {
+      const prev: GroupMixerStripState = state.groupMixerStrips[groupId] ?? {
+        dimmer: 1.0,
+        hueShiftDeg: 0,
+        saturation: 1.0,
+        strobeEnabled: false,
+        strobeHz: 8,
+        mode: "normal",
+        flashActive: false,
+        exclusiveFlashActive: false,
+      };
+      const nextStrips = { ...state.groupMixerStrips };
+      if (patch.exclusiveFlashActive) {
+        for (const key of Object.keys(nextStrips)) {
+          if (key !== groupId) {
+            nextStrips[key] = { ...nextStrips[key], exclusiveFlashActive: false };
+          }
+        }
+      }
+      if (patch.mode === "exclusive_full") {
+        for (const key of Object.keys(nextStrips)) {
+          if (key !== groupId && nextStrips[key].mode === "exclusive_full") {
+            nextStrips[key] = { ...nextStrips[key], mode: "normal" };
+          }
+        }
+      }
+      nextStrips[groupId] = { ...prev, ...patch };
+      return { groupMixerStrips: nextStrips };
+    });
+    if (!isTauriEnvironment()) {
+      get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    }
+  },
+
+  captureLiveSnapshotToScene: async (name, bank = null) => {
+    const state = get();
+    let seq = state.showState.scenes.length + 1;
+    while (state.showState.scenes.some((s) => s.id === `sc_snap_${seq}`)) {
+      seq += 1;
+    }
+    const sceneId = `sc_snap_${seq}`;
+    const sceneName = name?.trim() || `Live Snapshot ${seq}`;
+
+    // Gather active block refs or convert live layers into static elements
+    const activeBlockRefs: string[] = [];
+    for (const inst of state.activeScenes) {
+      if (inst.release_t_sec !== null) continue;
+      const sc = state.showState.scenes.find((s) => s.id === inst.scene_id);
+      if (sc) {
+        for (const br of sc.block_refs) {
+          if (!activeBlockRefs.includes(br)) activeBlockRefs.push(br);
+        }
+      }
+    }
+
+    let blkSeq = state.showState.fx_library.length + 1;
+    while (state.showState.fx_library.some((b) => b.id === `blk_snap_${blkSeq}`)) {
+      blkSeq += 1;
+    }
+    const snapBlockId = `blk_snap_${blkSeq}`;
+    const elementsFromLive: FxElementDef[] = [];
+
+    for (const layer of state.liveLayers) {
+      if (!layer.enabled || layer.alpha <= 0) continue;
+      const spec = layer.trait_spec;
+      if (spec.trait_kind === "dimmer") {
+        elementsFromLive.push({
+          kind: "static_trait",
+          trait: "dimmer",
+          op: spec.op,
+          palette_ref: spec.palette_ref,
+          value_start: spec.value_start,
+          value_end: spec.value_end,
+          order: layer.order_override,
+        });
+      } else if (spec.trait_kind === "color") {
+        elementsFromLive.push({
+          kind: "static_trait",
+          trait: "color",
+          op: spec.op,
+          palette_ref: spec.palette_ref,
+          value_start: 0,
+          value_end: 1,
+          order: layer.order_override,
+        });
+      } else if (spec.trait_kind === "master_dimmer") {
+        elementsFromLive.push({
+          kind: "static_trait",
+          trait: "master_dimmer",
+          op: spec.op,
+          palette_ref: null,
+          value_start: spec.value,
+          value_end: spec.value,
+          order: layer.order_override,
+        });
+      }
+    }
+
+    if (elementsFromLive.length === 0 && activeBlockRefs.length === 0) {
+      elementsFromLive.push({
+        kind: "static_trait",
+        trait: "dimmer",
+        op: "htp",
+        palette_ref: null,
+        value_start: 1,
+        value_end: 1,
+        order: null,
+      });
+    }
+
+    const addedBlocks: FxBlockDef[] = [];
+    if (elementsFromLive.length > 0) {
+      addedBlocks.push({
+        id: snapBlockId,
+        name: `${sceneName} Look`,
+        target_group: "all",
+        duration_beats: 4,
+        loop_block: true,
+        elements: elementsFromLive,
+      });
+      activeBlockRefs.push(snapBlockId);
+    }
+
+    const newScene: SceneDef = {
+      id: sceneId,
+      name: sceneName,
+      bank: bank && bank.trim() ? bank.trim() : null,
+      target_group: null,
+      priority: 20,
+      fade_in_sec: 0,
+      fade_out_sec: 0,
+      duration_value: 4,
+      duration_unit: "beats",
+      block_refs: activeBlockRefs,
+    };
+
+    if (isTauriEnvironment()) {
+      for (const blk of addedBlocks) await get().upsertFxBlock(blk);
+      await get().upsertScene(newScene);
+      set({ selectedSceneId: sceneId, multiSelectedSceneIds: [sceneId] });
+      return newScene;
+    }
+
+    const prevShow = structuredClone(state.showState);
+    set({
+      showState: {
+        ...prevShow,
+        fx_library: [...prevShow.fx_library, ...addedBlocks],
+        scenes: [...prevShow.scenes, newScene],
+      },
+      selectedSceneId: sceneId,
+      multiSelectedSceneIds: [sceneId],
+      patchToast: `Captured ${sceneName}`,
+      _simUndo: [...state._simUndo, { show: prevShow, coalesceKey: null }],
+      _simRedo: [],
+      showRevision: state.showRevision + 1,
+      isDirty: true,
+      canUndo: true,
+      canRedo: false,
+    });
+    return newScene;
+  },
+
+  setMappingOverlayMode: (mode) =>
+    set({ mappingOverlayMode: mode, selectedMappingTarget: null }),
+
+  setSelectedMappingTarget: (targetId) =>
+    set({ selectedMappingTarget: targetId }),
+
+  bindKeyToTarget: (targetId, key) =>
+    set((state) => ({
+      keyBindings: { ...state.keyBindings, [targetId]: key },
+      selectedMappingTarget: null,
+    })),
+
+  bindMidiToTarget: (targetId, midiLabel) =>
+    set((state) => ({
+      midiBindings: { ...state.midiBindings, [targetId]: midiLabel },
+      selectedMappingTarget: null,
+    })),
+
+  applyCellSelectionPattern: (pattern, groupFilterId) => {
+    const state = get();
+    const total = state.compiledCells.length;
+    if (total === 0) {
+      set({ selectedCellIndices: [] });
+      return;
+    }
+    const candidateIndices: number[] = [];
+    const targetGrp =
+      groupFilterId && groupFilterId !== "all"
+        ? state.showState.groups.find((g) => g.id === groupFilterId) ?? null
+        : null;
+    if (targetGrp) {
+      state.compiledCells.forEach((c, idx) => {
+        const matches = targetGrp.targets.some(
+          (t) => t === c.fixture_id || t.startsWith(`${c.fixture_id}:`),
+        );
+        if (matches) candidateIndices.push(idx);
+      });
+    } else {
+      for (let i = 0; i < total; i++) candidateIndices.push(i);
+    }
+
+    if (candidateIndices.length === 0) {
+      set({ selectedCellIndices: [] });
+      return;
+    }
+
+    let next: number[] = [];
+    if (pattern === "all") {
+      next = [...candidateIndices];
+    } else if (pattern === "1/2") {
+      next = candidateIndices.filter((_, pos) => pos % 2 === 0);
+    } else if (pattern === "1/3") {
+      next = candidateIndices.filter((_, pos) => pos % 3 === 0);
+    } else if (pattern === "1/4") {
+      next = candidateIndices.filter((_, pos) => pos % 4 === 0);
+    } else if (pattern === "invert") {
+      const curSet = new Set(state.selectedCellIndices);
+      next = candidateIndices.filter((idx) => !curSet.has(idx));
+    } else if (pattern === "shift_left" || pattern === "shift_right") {
+      const curSet = new Set(
+        state.selectedCellIndices.length > 0
+          ? state.selectedCellIndices
+          : [candidateIndices[0]],
+      );
+      const delta = pattern === "shift_right" ? 1 : -1;
+      const len = candidateIndices.length;
+      const shiftedPositions = new Set<number>();
+      candidateIndices.forEach((cellIdx, pos) => {
+        if (curSet.has(cellIdx)) {
+          shiftedPositions.add(((pos + delta) % len + len) % len);
+        }
+      });
+      next = candidateIndices.filter((_, pos) => shiftedPositions.has(pos));
+    }
+
+    set({ selectedCellIndices: next });
+  },
+
+  setSelectedCellIndices: (indices) => set({ selectedCellIndices: indices }),
+
+  setActiveGroupFilterId: (groupId) => set({ activeGroupFilterId: groupId }),
+
+  setCanvasOrderRule: (rule) => set({ canvasOrderRule: rule }),
+
+  setActiveShaderGizmoBlockId: (blockId) =>
+    set({ activeShaderGizmoBlockId: blockId }),
 
   dismissToast: () => set({ patchToast: null }),
 

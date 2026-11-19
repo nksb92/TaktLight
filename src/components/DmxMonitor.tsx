@@ -5,6 +5,7 @@ import {
   UniverseConfig,
   useTaktStore,
 } from "../store/useTaktStore";
+import { NumericSlider } from "./NumericSlider";
 
 const CHANNEL_INDICES = Array.from({ length: 512 }, (_, idx) => idx + 1);
 const QUICK_PRESETS = [0, 64, 128, 192, 255];
@@ -275,20 +276,22 @@ export function DmxMonitor() {
                   <span>PARK OVERRIDE (0 to 255)</span>
                   <span>{selectedParkedValue ?? selectedValue}</span>
                 </div>
-                <input
-                  aria-label="Park Channel Value"
-                  type="range"
+                <NumericSlider
+                  ariaLabel="Park Channel Value"
+                  value={selectedParkedValue ?? selectedValue}
+                  defaultValue={0}
                   min={0}
                   max={255}
-                  value={selectedParkedValue ?? selectedValue}
-                  onChange={(e) => {
+                  step={1}
+                  precision={0}
+                  onChange={(val) => {
                     void setChannelPark(
                       selectedUniverseId,
                       selectedChannel,
-                      Number(e.target.value),
+                      Math.round(val),
                     );
                   }}
-                  className="w-full accent-signal cursor-pointer"
+                  sliderClassName="accent-signal cursor-pointer"
                 />
               </div>
 
