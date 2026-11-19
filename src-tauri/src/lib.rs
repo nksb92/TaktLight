@@ -36,8 +36,8 @@ use taktlight_engine::show::patch::{
 use taktlight_engine::show::spatial::GridPos;
 use taktlight_engine::show::undo::{ShowCommand, UndoHistory};
 use taktlight_engine::show::xml::{
-    deserialize_show_xml, serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, FixtureGroupDef,
-    FxBlockDef, SceneDef, ShowState, TimelineDef,
+    deserialize_show_xml, serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, DurationUnit,
+    FixtureGroupDef, FxBlockDef, SceneDef, ShowState, TimelineDef,
 };
 use taktlight_engine::state::plan::{CompiledCell, RenderPlan, UniverseConfig};
 use taktlight_engine::state::runtime::RuntimeControl;
@@ -66,6 +66,7 @@ pub struct EngineSnapshotDto {
     pub interfaces: Vec<NetworkInterfaceInfo>,
     pub adapter_selection: AdapterSelection,
     pub is_offline: bool,
+    pub output_enabled: bool,
     pub discovery_available: bool,
     pub active_interface: Option<NetworkInterfaceInfo>,
     pub discovered_nodes: Vec<TrackedArtNetNode>,
@@ -107,6 +108,7 @@ pub struct AppState {
     pub show_state: RwLock<ShowState>,
     pub undo_history: Mutex<UndoHistory>,
     pub rollover_enabled: AtomicBool,
+    pub output_enabled: AtomicBool,
     pub app_epoch: Instant,
     pub audio_cache: Mutex<AudioAnalysisCache>,
     next_fixture_seq: AtomicU64,
@@ -151,6 +153,7 @@ impl AppState {
         let (frame_tx, frame_rx) = watch::channel(Vec::new());
         let telemetry = Arc::new(RwLock::new(EngineTelemetrySnapshot {
             is_offline: true,
+            output_enabled: false,
             ..Default::default()
         }));
         let adapter_selection = Arc::new(RwLock::new(AdapterSelection::Auto));
@@ -163,6 +166,7 @@ impl AppState {
                 frame_tx,
                 Arc::clone(&telemetry),
                 AdapterSelection::Auto,
+                false,
             ))
         } else {
             None
@@ -182,9 +186,117 @@ impl AppState {
             show_state,
             undo_history,
             rollover_enabled: AtomicBool::new(true),
+            output_enabled: AtomicBool::new(false),
             app_epoch: Instant::now(),
             audio_cache: Mutex::new(AudioAnalysisCache::new()),
             next_fixture_seq: AtomicU64::new(1),
+        }
+    }
+
+    pub fn default_color_palettes() -> Vec<ColorPaletteDef> {
+        let defs: [(&str, &str, &[&str]); 12] = [
+            (
+                "pal_rainbow",
+                "Rainbow",
+                &[
+                    "#FF0000", "#FF8800", "#FFFF00", "#00FF00", "#00CCFF", "#0044FF", "#AA00FF",
+                ],
+            ),
+            ("pal_cyber", "Cyberpunk Dual", &["#FF5500", "#2255AA"]),
+            (
+                "pal_warm",
+                "Warm Tungsten",
+                &["#FFCC66", "#FF8822", "#CC4400"],
+            ),
+            (
+                "pal_fire",
+                "Fire & Ember",
+                &["#FF1100", "#FF6600", "#FFCC00"],
+            ),
+            (
+                "pal_ocean",
+                "Ocean Ice",
+                &["#001F66", "#0077CC", "#00EEFF", "#CCF9FF"],
+            ),
+            (
+                "pal_synthwave",
+                "Neon Synthwave",
+                &["#FF00AA", "#8800FF", "#00E5FF"],
+            ),
+            (
+                "pal_sunset",
+                "Sunset Glow",
+                &["#FF2E63", "#FF7B25", "#FFD166", "#5E2BFF"],
+            ),
+            (
+                "pal_forest",
+                "Forest Emerald",
+                &["#004D25", "#00C853", "#AEEA00"],
+            ),
+            (
+                "pal_police",
+                "Emergency Red Blue",
+                &["#FF0000", "#0033FF"],
+            ),
+            (
+                "pal_uv",
+                "UV Violet",
+                &["#3A0088", "#9D00FF", "#FF4DFF"],
+            ),
+            (
+                "pal_rgb",
+                "RGB Primary",
+                &["#FF0000", "#00FF00", "#0000FF"],
+            ),
+            (
+                "pal_white_temp",
+                "Warm to Cool White",
+                &["#FFD28A", "#FFFFFF", "#B8DCFF"],
+            ),
+        ];
+        defs.into_iter()
+            .map(|(id, name, stops)| ColorPaletteDef {
+                id: id.into(),
+                name: name.into(),
+                hex_start: stops.first().copied().unwrap_or("#FFFFFF").into(),
+                hex_end: stops.last().copied().unwrap_or("#FFFFFF").into(),
+                colors: stops.iter().map(|s| (*s).into()).collect(),
+            })
+            .collect()
+    }
+
+    pub fn seed_default_studio_show(&self) {
+        let mut show = self.show_state.write();
+        if !show.scenes.is_empty() || !show.fx_library.is_empty() {
+            return;
+        }
+        if show.color_palettes.is_empty() {
+            show.color_palettes = Self::default_color_palettes();
+        }
+        if show.dimmer_palettes.is_empty() {
+            show.dimmer_palettes = vec![DimmerPaletteDef {
+                id: "dim_full".into(),
+                name: "Full Intensity".into(),
+                value_start: 1.0,
+                value_end: 1.0,
+            }];
+        }
+        show.scenes.push(SceneDef {
+            id: "sc_new_1".into(),
+            name: "New Scene".into(),
+            bank: Some("Bank 1".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: Vec::new(),
+        });
+        let lib = self.fixture_library.read();
+        let rev = self.undo_history.lock().revision();
+        if let Ok(compiled) = compile_render_plan(rev, &show, &lib) {
+            self.plan.store(Arc::new(compiled));
         }
     }
 
@@ -215,23 +327,32 @@ impl AppState {
             })
             .collect();
 
+        let t_now = self.app_epoch.elapsed().as_secs_f64();
+        let active_scenes = rt
+            .active_scenes
+            .iter()
+            .filter(|s| !s.is_finished(t_now))
+            .cloned()
+            .collect();
+
         EngineSnapshotDto {
             grand_master: rt.grand_master,
             blackout: rt.blackout,
             parked_channels,
             live_layers: rt.live_layers.clone(),
-            active_scenes: rt.active_scenes.clone(),
+            active_scenes,
             live_bpm: rt.beat_clock.bpm,
             active_timeline_id: rt.active_timeline_id.clone(),
             timeline_playing: rt.timeline_playing,
             timeline_playhead_sec: rt
-                .effective_timeline_playhead_sec(self.app_epoch.elapsed().as_secs_f64())
+                .effective_timeline_playhead_sec(t_now)
                 .unwrap_or(rt.timeline_playhead_sec),
             latency_offset_ms: rt.latency_offset_ms,
             universes: plan.universes.clone(),
             interfaces: enumerate_ipv4_interfaces(),
             adapter_selection: selection,
             is_offline: tel.is_offline,
+            output_enabled: self.output_enabled.load(Ordering::Acquire),
             discovery_available: tel.discovery_available,
             active_interface: tel.active_interface.clone(),
             discovered_nodes: tel.discovered_nodes.clone(),
@@ -768,14 +889,72 @@ impl AppState {
 
     pub fn release_scene(&self, scene_id: &str, t_sec: Option<f64>) -> EngineSnapshotDto {
         let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
-        self.update_runtime(|rt| rt.release_scene(scene_id, t_now));
+        self.update_runtime(|rt| {
+            rt.release_scene(scene_id, t_now);
+            rt.prune_finished_scenes(t_now);
+        });
         self.snapshot()
     }
 
     pub fn release_all_scenes(&self, t_sec: Option<f64>) -> EngineSnapshotDto {
         let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
-        self.update_runtime(|rt| rt.release_all_scenes(t_now));
+        self.update_runtime(|rt| {
+            rt.release_all_scenes(t_now);
+            rt.prune_finished_scenes(t_now);
+        });
         self.snapshot()
+    }
+
+    pub fn configure_universe(&self, config: UniverseConfig) -> Result<ShowSnapshotDto, String> {
+        let before = self
+            .show_state
+            .read()
+            .network_outputs
+            .universes
+            .iter()
+            .find(|u| u.id == config.id)
+            .cloned();
+        let uni_id = config.id;
+        self.execute_show_command(
+            ShowCommand::ConfigureUniverse {
+                before,
+                after: config,
+            },
+            Some(format!("Configured Universe {uni_id}")),
+            false,
+        )
+    }
+
+    pub fn rename_scene_bank(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<ShowSnapshotDto, String> {
+        let from = old_name.trim();
+        let to = new_name.trim();
+        if from.is_empty() || to.is_empty() || from == to {
+            return Ok(self.build_show_snapshot(None, false));
+        }
+        let affected_scene_ids: Vec<String> = self
+            .show_state
+            .read()
+            .scenes
+            .iter()
+            .filter(|s| s.bank.as_deref().map(str::trim) == Some(from))
+            .map(|s| s.id.clone())
+            .collect();
+        if affected_scene_ids.is_empty() {
+            return Ok(self.build_show_snapshot(None, false));
+        }
+        self.execute_show_command(
+            ShowCommand::RenameSceneBank {
+                old_name: from.to_string(),
+                new_name: to.to_string(),
+                affected_scene_ids,
+            },
+            Some(format!("Renamed bank {from} to {to}")),
+            false,
+        )
     }
 
     pub fn set_live_bpm(&self, bpm: f32, t_sec: Option<f64>) -> EngineSnapshotDto {
@@ -900,9 +1079,11 @@ fn subscribe_frames(
                 break;
             };
             if stream_gen.load(Ordering::Acquire) != my_gen {
+                gate.grant_credit();
                 break;
             }
             if channel.send(InvokeResponseBody::Raw(frame_bytes)).is_err() {
+                gate.grant_credit();
                 break;
             }
         }
@@ -961,6 +1142,35 @@ fn set_network_adapter(
         handle.set_adapter(selection)?;
     }
     Ok(state.snapshot())
+}
+
+#[tauri::command]
+fn set_output_enabled_command(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<EngineSnapshotDto, String> {
+    state.output_enabled.store(enabled, Ordering::Release);
+    if let Some(handle) = state.engine_handle.lock().as_ref() {
+        handle.set_output_enabled(enabled)?;
+    }
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+fn configure_universe_command(
+    state: State<'_, AppState>,
+    config: UniverseConfig,
+) -> Result<ShowSnapshotDto, String> {
+    state.configure_universe(config)
+}
+
+#[tauri::command]
+fn rename_scene_bank_command(
+    state: State<'_, AppState>,
+    old_name: String,
+    new_name: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.rename_scene_bank(&old_name, &new_name)
 }
 
 #[tauri::command]
@@ -1355,6 +1565,7 @@ fn resolve_split_fixtures_command(state: State<'_, AppState>) -> Result<ShowSnap
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
+    app_state.seed_default_studio_show();
 
     let app = tauri::Builder::default()
         .manage(app_state)
@@ -1367,6 +1578,9 @@ pub fn run() {
             set_grand_master,
             get_engine_snapshot,
             set_network_adapter,
+            set_output_enabled_command,
+            configure_universe_command,
+            rename_scene_bank_command,
             list_fixtures,
             get_fixture_detail,
             validate_fixture_json,
@@ -1559,6 +1773,7 @@ mod tests {
                 name: "Studio White".into(),
                 hex_start: "#FFFFFF".into(),
                 hex_end: "#FFFFFF".into(),
+                colors: Vec::new(),
             })
             .unwrap();
         assert_eq!(color_snap.show.color_palettes.len(), 1);
@@ -1680,6 +1895,7 @@ mod tests {
                 name: "Wave".into(),
                 target_group: Some("grp_fx".into()),
                 duration_beats: 4.0,
+                duration_sec: None,
                 loop_block: true,
                 elements: vec![FxElementDef::Curve1D {
                     trait_name: "dimmer".into(),
@@ -1689,8 +1905,17 @@ mod tests {
                     offset: 0.0,
                     rate_beats: Some(2.0),
                     speed_hz: None,
+                    rate_cycles: None,
+                    phase_deg: 0.0,
                     phase_spread_deg: 360.0,
                     duty: None,
+                    grayscale: false,
+                    color_width: 1.0,
+                    gradient: 1.0,
+                    angle_deg: 0.0,
+                    fx_kind_tag: None,
+                    inline_colors: Vec::new(),
+                    value_stops: Vec::new(),
                     palette_ref: None,
                     order: None,
                 }],
@@ -1706,6 +1931,8 @@ mod tests {
                 priority: 10,
                 fade_in_sec: 0.0,
                 fade_out_sec: 1.0,
+                duration_value: 4.0,
+                duration_unit: DurationUnit::Beats,
                 block_refs: vec!["blk_wave".into()],
             })
             .unwrap();
@@ -1718,6 +1945,8 @@ mod tests {
                 priority: 10,
                 fade_in_sec: 0.0,
                 fade_out_sec: 1.0,
+                duration_value: 4.0,
+                duration_unit: DurationUnit::Beats,
                 block_refs: vec!["blk_wave".into()],
             })
             .unwrap();
@@ -1773,6 +2002,8 @@ mod tests {
                                 palette_ref: None,
                                 value_start: Some(1.0),
                                 value_end: Some(1.0),
+                                hex_start: None,
+                                hex_end: None,
                                 order: None,
                             }],
                         }],
@@ -1801,5 +2032,22 @@ mod tests {
 
         state.undo().unwrap();
         assert!(state.show_state.read().timelines.is_empty());
+    }
+
+    #[test]
+    fn seed_default_studio_show_populates_single_bank_and_scene() {
+        let state = AppState::new(false);
+        assert!(!state.snapshot().output_enabled);
+        state.seed_default_studio_show();
+        let snap = state.build_show_snapshot(None, false);
+        assert_eq!(snap.show.scenes.len(), 1);
+        assert_eq!(snap.show.scenes[0].name, "New Scene");
+        assert_eq!(snap.show.scenes[0].bank.as_deref(), Some("Bank 1"));
+        assert_eq!(snap.show.scenes[0].fade_in_sec, 0.0);
+        assert_eq!(snap.show.scenes[0].fade_out_sec, 0.0);
+        assert!(snap.show.scenes[0].block_refs.is_empty());
+        assert!(snap.show.fx_library.is_empty());
+        assert_eq!(snap.show.color_palettes.len(), 12);
+        assert!(!snap.can_undo);
     }
 }
