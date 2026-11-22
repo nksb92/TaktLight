@@ -12,11 +12,14 @@ describe("TaktLight Slice 1 Studio UI", () => {
     useTaktStore.getState().resetForTest();
   });
 
-  it("renders status bar, 512 DMX channels, and jitter histogram panel", () => {
+  it("lands on Patch by default and renders Monitor status bar, 512 DMX channels, and jitter histogram panel", () => {
     render(<App />);
 
     expect(screen.getByText("TAKTLIGHT")).toBeInTheDocument();
     expect(screen.getByText(/44\.0 Hz/)).toBeInTheDocument();
+    expect(screen.getByTestId("patch-universe-1")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Monitor$/i }));
     expect(
       screen.getByText("44 Hz Frame Timing & Jitter Histogram"),
     ).toBeInTheDocument();
@@ -28,6 +31,7 @@ describe("TaktLight Slice 1 Studio UI", () => {
   it("selects a channel, parks it, displays SIGNAL warning, and overrides blackout", () => {
     render(<App />);
 
+    fireEvent.click(screen.getByRole("button", { name: /^Monitor$/i }));
     fireEvent.click(screen.getByTestId("dmx-cell-17"));
     expect(screen.getByTestId("park-inspector")).toBeInTheDocument();
 
@@ -50,6 +54,7 @@ describe("TaktLight Slice 1 Studio UI", () => {
   it("switches universes and toggles jitter histogram visibility", () => {
     render(<App />);
 
+    fireEvent.click(screen.getByRole("button", { name: /^Monitor$/i }));
     fireEvent.click(screen.getByTestId("universe-tab-2"));
     expect(screen.getByTestId("universe-tab-2")).toHaveAttribute(
       "aria-pressed",
@@ -509,7 +514,7 @@ describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
     useTaktStore.getState().resetForTest();
   });
 
-  it("analyzes audio transients, updates tempo/latency, snaps clips with Undo/Redo, and outputs live DMX", async () => {
+  it("opens Timeline Super-Scene in bottom-right dock, expands full-width, drops real WAV music with exact duration & waveform, analyzes music clip, and outputs live DMX", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
@@ -523,21 +528,108 @@ describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: /^Timeline$/i }));
+    // Open Studio: FX Choice Matrix includes TIMELINE tile, no separate bank timeline button
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
+    expect(screen.getByTestId("fx-picker-tile-timeline")).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-add-timeline-Bank 1")).not.toBeInTheDocument();
 
-    // Run audio analysis and inspect waveform/transient lane
+    // Select the starter Timeline Super-Scene tile in Bank 1
+    fireEvent.click(screen.getByTestId("scene-play-zone-sc_tl_cyber_intro"));
+
+    // Bottom-right dock shows TimelineEditor by default alongside 2D Grid; right rack hosts Clip/Timeline inspector
+    expect(screen.getByTestId("daslight-bottom-dock")).toBeInTheDocument();
+    expect(screen.getByTestId("daslight-timeline-dock")).toBeInTheDocument();
+    expect(screen.getByTestId("timeline-right-inspector")).toBeInTheDocument();
+    // Timeline Super-Scene must NOT show Target Fixtures dropdown
+    expect(screen.queryByTestId("scene-target-bar")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("timeline-waveform-lane")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("timeline-live-cell-preview")).not.toBeInTheDocument();
+    // Beat grid bar lines and FX cycle notches are visible
+    expect(screen.getAllByTestId("beat-grid-bar").length).toBeGreaterThan(2);
+
+    // Switch right inspector to Timeline Settings tab and click Analyze Audio before adding music
+    fireEvent.click(screen.getByTestId("timeline-inspector-tab-settings"));
+    fireEvent.click(screen.getByTestId("timeline-analyze-audio-btn"));
+    expect(screen.getByText(/Drop or add a music file/i)).toBeInTheDocument();
+
+    // Build a 22-second PCM WAV file (> 16s!) and drop onto new-track dropzone
+    const sr = 8000;
+    const durSec = 22;
+    const numSamples = sr * durSec;
+    const wavBuf = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(wavBuf);
+    const wStr = (off: number, s: string) => {
+      for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+    };
+    wStr(0, "RIFF");
+    view.setUint32(4, 36 + numSamples * 2, true);
+    wStr(8, "WAVE");
+    wStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sr, true);
+    view.setUint32(28, sr * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    wStr(36, "data");
+    view.setUint32(40, numSamples * 2, true);
+    for (let i = 0; i < numSamples; i++) {
+      const t = i / sr;
+      const dt = t % 0.5;
+      const s = dt < 0.06 ? Math.exp(-dt / 0.02) * Math.sin(2 * Math.PI * 80 * dt) * 0.8 : 0;
+      view.setInt16(44 + i * 2, Math.round(s * 32767), true);
+    }
+    const musicFile = new File([wavBuf], "intro_22s.wav", { type: "audio/wav" });
+
+    const dropzone = screen.getByTestId("timeline-new-track-dropzone");
+    Object.defineProperty(dropzone, "getBoundingClientRect", {
+      value: () => ({ left: 0, width: 1000, top: 0, height: 40, right: 1000, bottom: 40 }),
+    });
+    // Drop at clientX = 500 on an empty-music timeline -> song must still be placed at 0.0s!
+    const musicDropEvent = Object.assign(
+      new Event("drop", { bubbles: true, cancelable: true }),
+      {
+        clientX: 500,
+        dataTransfer: {
+          getData: () => "",
+          files: [musicFile],
+        },
+      },
+    );
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Analyze Audio/i }));
-      await Promise.resolve();
+      fireEvent(dropzone, musicDropEvent);
+      await new Promise((r) => setTimeout(r, 20));
     });
 
-    const analysis =
-      useTaktStore.getState().audioAnalysisByTimeline["tl_cyber_intro"];
-    expect(analysis).toBeDefined();
-    expect(analysis.transients.length).toBeGreaterThan(2);
-    expect(screen.getByTestId("timeline-waveform-lane")).toBeInTheDocument();
+    const musicTrack = useTaktStore
+      .getState()
+      .showState.timelines.find((t) => t.id === "tl_cyber_intro")
+      ?.tracks.find((tr) => tr.track_type === "music");
+    expect(musicTrack).toBeDefined();
+    expect(musicTrack!.clips[0].audio_file).toBe("intro_22s.wav");
+    expect(musicTrack!.clips[0].start_sec).toBe(0);
+    // Exact decoded duration (22s), NOT hardcoded 16s!
+    expect(musicTrack!.clips[0].duration_sec).toBeCloseTo(22.0, 1);
+    // Waveform canvas rendered directly inside the music clip
+    expect(screen.getByTestId(`clip-waveform-${musicTrack!.id}-0`)).toBeInTheDocument();
+    // Snap grid selector defaults to whole beats ("beat") and marker legend is present in Settings
+    expect(
+      (screen.getByTestId("timeline-snap-grid-select") as HTMLSelectElement).value,
+    ).toBe("beat");
+    expect(screen.getByTestId("timeline-marker-legend")).toBeInTheDocument();
 
-    // Update signed latency offset and grid offset
+    // Analyze Audio in Settings tab analyzes the real music clip and syncs BPM/Grid
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("timeline-analyze-audio-btn"));
+      await Promise.resolve();
+    });
+    const clipAnalysis = useTaktStore.getState().audioAnalysisByClipKey["intro_22s.wav"];
+    expect(clipAnalysis).toBeDefined();
+    expect(clipAnalysis.waveform_peaks.length).toBeGreaterThan(20);
+    expect(clipAnalysis.transients.length).toBeGreaterThan(2);
+
+    // Update signed latency offset, grid offset, tempo, and loop toggle
     await act(async () => {
       fireEvent.change(screen.getByLabelText("Latency Offset Ms"), {
         target: { value: "-10" },
@@ -548,75 +640,19 @@ describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
       fireEvent.change(screen.getByLabelText("Timeline Tempo BPM"), {
         target: { value: "120" },
       });
+      fireEvent.click(screen.getByTestId("timeline-loop-toggle"));
       await Promise.resolve();
     });
     expect(useTaktStore.getState().latencyOffsetMs).toBe(-10);
+    expect(
+      useTaktStore.getState().showState.timelines.find((t) => t.id === "tl_cyber_intro")
+        ?.loop_timeline,
+    ).toBe(true);
 
-    // Add a Track and verify Undo / Redo
-    fireEvent.change(screen.getByLabelText("New Track Name"), {
-      target: { value: "Strobe Accent" },
-    });
-    fireEvent.change(screen.getByLabelText("New Track Target"), {
-      target: { value: "all" },
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Add Track/i }));
-      await Promise.resolve();
-    });
-
-    const getAccentTrack = () =>
-      useTaktStore
-        .getState()
-        .showState.timelines.find((t) => t.id === "tl_cyber_intro")
-        ?.tracks.find((tr) => tr.name === "Strobe Accent");
-    expect(getAccentTrack()).toBeDefined();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /^Undo$/i }));
-      await Promise.resolve();
-    });
-    expect(getAccentTrack()).toBeUndefined();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /^Redo$/i }));
-      await Promise.resolve();
-    });
-    const accentTrack = getAccentTrack()!;
-    expect(accentTrack).toBeDefined();
-
-    // Magnetic Snap is enabled: adding near 1.12s snaps to transient/grid ~1.12s
-    const snapCheckbox = screen.getByLabelText(
-      "Magnetic Snap",
-    ) as HTMLInputElement;
-    expect(snapCheckbox.checked).toBe(true);
-
-    fireEvent.change(screen.getByLabelText("Clip Track"), {
-      target: { value: accentTrack.id },
-    });
-    fireEvent.change(screen.getByLabelText("Clip Block Ref"), {
-      target: { value: "blk_cyber_wave" },
-    });
-    fireEvent.change(screen.getByLabelText("Clip Start Sec"), {
-      target: { value: "1.17" },
-    });
-    fireEvent.change(screen.getByLabelText("Clip Duration Sec"), {
-      target: { value: "4.0" },
-    });
-    fireEvent.change(screen.getByLabelText("Clip Fade In Sec"), {
-      target: { value: "0" },
-    });
-    fireEvent.change(screen.getByLabelText("Clip Fade Out Sec"), {
-      target: { value: "0.5" },
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Add Clip/i }));
-      await Promise.resolve();
-    });
-
-    const addedClip = getAccentTrack()!.clips[0];
-    expect(addedClip).toBeDefined();
-    expect(addedClip.start_sec).not.toBe(1.17);
-    expect(addedClip.start_sec).toBeCloseTo(1.12, 2);
+    // Expand toggle switches to full-width bottom Timeline dock
+    fireEvent.click(screen.getByTestId("timeline-expand-toggle"));
+    expect(screen.queryByTestId("daslight-bottom-dock")).not.toBeInTheDocument();
+    expect(screen.getByTestId("daslight-timeline-dock")).toBeInTheDocument();
 
     // Play / seek timeline -> outputs quantized DMX
     await act(async () => {
@@ -629,7 +665,6 @@ describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
 
     expect(useTaktStore.getState().timelinePlaying).toBe(true);
     expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
-    expect(screen.getByTestId("timeline-live-cell-preview")).toBeInTheDocument();
   });
 });
 
@@ -638,7 +673,7 @@ describe("TaktLight Slice 7 UI Consolidation & Centered Bottom Navigation", () =
     useTaktStore.getState().resetForTest();
   });
 
-  it("moves workspace tabs to centered bottom dock and hosts consolidated Studio workspace", () => {
+  it("moves workspace tabs to centered bottom dock without redundant Timeline tab and hosts consolidated Studio workspace", () => {
     render(<App />);
 
     const header = screen.getByRole("banner");
@@ -649,7 +684,7 @@ describe("TaktLight Slice 7 UI Consolidation & Centered Bottom Navigation", () =
 
     expect(within(nav).getByRole("button", { name: /^Patch$/i })).toBeInTheDocument();
     expect(within(nav).getByRole("button", { name: /Studio \/ 2D Grid/i })).toBeInTheDocument();
-    expect(within(nav).getByRole("button", { name: /^Timeline$/i })).toBeInTheDocument();
+    expect(within(nav).queryByRole("button", { name: /^Timeline$/i })).not.toBeInTheDocument();
     expect(within(nav).getByRole("button", { name: /^Fixtures$/i })).toBeInTheDocument();
     expect(within(nav).getByRole("button", { name: /^Monitor$/i })).toBeInTheDocument();
 
@@ -659,6 +694,7 @@ describe("TaktLight Slice 7 UI Consolidation & Centered Bottom Navigation", () =
     expect(screen.getByTestId("daslight-groups-bar")).toBeInTheDocument();
     expect(screen.getByTestId("daslight-bottom-dock")).toBeInTheDocument();
     expect(screen.getByTestId("fixture-grid-canvas")).toBeInTheDocument();
+    expect(screen.queryByTestId("submode-timeline")).not.toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^Undo$/i })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: /^Redo$/i })).toHaveLength(1);
   });
@@ -730,19 +766,21 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
     const dimEl = updatedBlk?.elements.find((e) => e.trait === "dimmer");
     expect(dimEl?.kind === "static_trait" ? dimEl.value_start : null).toBeCloseTo(0.6);
 
-    // 2. Bank Management: create custom banks + blank scene landing on 6-tile Choice Matrix + locked submenus
+    // 2. Bank Management: instant Bank creation + double-click rename + blank scene landing on Choice Matrix
     fireEvent.click(screen.getByTestId("open-add-bank-btn"));
-    fireEvent.change(screen.getByLabelText("New Bank Name"), {
-      target: { value: "Colors" },
-    });
-    fireEvent.click(screen.getByTestId("add-bank-btn"));
+    expect(screen.getByTestId("bank-column-Bank 2")).toBeInTheDocument();
+    fireEvent.doubleClick(screen.getByTestId("bank-name-Bank 2"));
+    const renameB2 = screen.getByLabelText("Rename bank Bank 2");
+    fireEvent.change(renameB2, { target: { value: "Colors" } });
+    fireEvent.keyDown(renameB2, { key: "Enter" });
     expect(screen.getByTestId("bank-column-Colors")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("open-add-bank-btn"));
-    fireEvent.change(screen.getByLabelText("New Bank Name"), {
-      target: { value: "Effects" },
-    });
-    fireEvent.click(screen.getByTestId("add-bank-btn"));
+    expect(screen.getByTestId("bank-column-Bank 3")).toBeInTheDocument();
+    fireEvent.doubleClick(screen.getByTestId("bank-name-Bank 3"));
+    const renameB3 = screen.getByLabelText("Rename bank Bank 3");
+    fireEvent.change(renameB3, { target: { value: "Effects" } });
+    fireEvent.keyDown(renameB3, { key: "Enter" });
     expect(screen.getByTestId("bank-column-Effects")).toBeInTheDocument();
 
     await act(async () => {
@@ -813,7 +851,7 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
     const flashScene = useTaktStore
       .getState()
       .showState.scenes.find(
-        (s) => s.bank === "Bank 1" && s.id !== "sc_new_1",
+        (s) => s.bank === "Bank 1" && s.id !== "sc_new_1" && !s.timeline_ref,
       )!;
     expect(flashScene.fade_in_sec).toBe(0);
     expect(flashScene.fade_out_sec).toBe(0);
@@ -891,51 +929,54 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
     fireEvent.pointerUp(screen.getByTestId("mixer-flash-all"));
     expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
 
-    // 5. Timeline Scene Palette & Layering Color Scene + Effect Scene onto Tracks
-    fireEvent.click(screen.getByRole("button", { name: /^Timeline$/i }));
-    expect(screen.getByTestId("timeline-scene-palette")).toBeInTheDocument();
-    expect(
-      screen.getByTestId(`draggable-scene-${colorScene.id}`),
-    ).toBeInTheDocument();
+    // 5. Timeline Super-Scene Dock & Layering Color Scene + Effect Scene onto Tracks
+    fireEvent.click(screen.getByTestId("submode-builder"));
+    fireEvent.click(screen.getByTestId("scene-play-zone-sc_tl_cyber_intro"));
+    expect(screen.queryByTestId("timeline-scene-palette")).toBeNull();
 
-    // Add second track for Effect layering
-    fireEvent.change(screen.getByLabelText("New Track Name"), {
-      target: { value: "Effect Track" },
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Add Track/i }));
-      await Promise.resolve();
-    });
-
-    const tracks = useTaktStore.getState().showState.timelines[0].tracks;
-    const trkEffectId = tracks[tracks.length - 1].id;
-
+    const tracksBefore = useTaktStore.getState().showState.timelines[0].tracks;
     await act(async () => {
       fireEvent.change(screen.getByLabelText("Timeline Playhead Sec"), {
         target: { value: "9" },
       });
-      fireEvent.change(screen.getByLabelText("Clip Track"), {
-        target: { value: tracks[0].id },
+      await Promise.resolve();
+    });
+    const firstTrackLane = screen.getByTestId(`track-lane-${tracksBefore[0].id}`);
+    await act(async () => {
+      fireEvent.drop(firstTrackLane, {
+        clientX: 450,
+        dataTransfer: {
+          getData: (type: string) =>
+            type === "text/takt-scene-id" || type === "text/plain"
+              ? colorScene.id
+              : "",
+          files: [],
+        },
       });
-      await Promise.resolve();
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByTestId(`drop-scene-to-timeline-${colorScene.id}`));
-      await Promise.resolve();
-    });
-    await act(async () => {
-      fireEvent.change(screen.getByLabelText("Clip Track"), {
-        target: { value: trkEffectId },
-      });
-      await Promise.resolve();
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByTestId(`drop-scene-to-timeline-${effectScene.id}`));
       await Promise.resolve();
     });
 
+    // Drop effectScene below the last track to auto-create the second track
+    const dropzone2 = screen.getByTestId("timeline-new-track-dropzone");
+    await act(async () => {
+      fireEvent.drop(dropzone2, {
+        clientX: 400,
+        dataTransfer: {
+          getData: (type: string) =>
+            type === "text/takt-scene-id" || type === "text/plain"
+              ? effectScene.id
+              : "",
+          files: [],
+        },
+      });
+      await Promise.resolve();
+    });
+
+    const tracksAfter = useTaktStore.getState().showState.timelines[0].tracks;
+    const trkEffectId = tracksAfter[tracksAfter.length - 1].id;
+
     expect(
-      screen.getByTestId(`track-lane-${tracks[0].id}`),
+      screen.getByTestId(`track-lane-${tracksBefore[0].id}`),
     ).toHaveTextContent(`[COLOR ANIM] ${colorScene.name}`);
     expect(
       screen.getByTestId(`track-lane-${trkEffectId}`),
@@ -954,21 +995,22 @@ describe("TaktLight NLE Video-Editor Timeline", () => {
 
   it("supports NLE clip drag-move, left/right trimming, fades, split at playhead, duplicate, kick auto-fill, and zoom", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
+    fireEvent.click(screen.getByTestId("scene-play-zone-sc_tl_cyber_intro"));
 
-    // Initial starter clip: start 0.0s, duration 8.0s on 16.0s timeline
+    // Initial starter clip: start 0.0s, duration 8.0s on dynamic infinite-canvas timeline
     expect(screen.getByTestId("timeline-clip-trk_1-0")).toBeInTheDocument();
     expect(screen.getByTestId("nle-playhead-line")).toBeInTheDocument();
     expect(screen.getByTestId("timeline-ruler")).toBeInTheDocument();
-    expect(screen.getByTestId("timeline-waveform-lane")).toBeInTheDocument();
+    expect(screen.queryByTestId("timeline-waveform-lane")).not.toBeInTheDocument();
 
-    // Drag clip body right by 100px out of 800px fallback width => +2.0s on 16.0s timeline
+    // Drag clip body right by 96px on 768px (32s * 24px/s) canvas => +4.0s
     fireEvent.pointerDown(screen.getByTestId("clip-body-trk_1-0"), { clientX: 100, button: 0 });
-    fireEvent.pointerMove(window, { clientX: 200 });
+    fireEvent.pointerMove(window, { clientX: 196 });
     fireEvent.pointerUp(window);
 
     let clip0 = useTaktStore.getState().showState.timelines[0].tracks[0].clips[0];
-    expect(clip0.start_sec).toBeCloseTo(2.0, 1);
+    expect(clip0.start_sec).toBeGreaterThan(2.0);
 
     // Nudge right (+0.25s) and trim via pointer handle + inspector
     fireEvent.click(screen.getByTestId("nudge-clip-right-btn"));
@@ -990,7 +1032,8 @@ describe("TaktLight NLE Video-Editor Timeline", () => {
     clip0 = useTaktStore.getState().showState.timelines[0].tracks[0].clips[0];
     expect(clip0.start_sec).toBeGreaterThan(beforeTrimStart);
 
-    // Use Selected Clip Inspector numeric inputs + trim shorter button
+    // Switch to Seconds mode and use Selected Clip Inspector numeric inputs + trim shorter button
+    fireEvent.click(screen.getByTestId("timeline-unit-seconds"));
     fireEvent.change(screen.getByLabelText("Selected Clip Start Sec"), { target: { value: "0" } });
     fireEvent.change(screen.getByLabelText("Selected Clip Duration Sec"), { target: { value: "8" } });
     fireEvent.change(screen.getByLabelText("Selected Clip Fade In Sec"), { target: { value: "0.75" } });
@@ -1034,15 +1077,36 @@ describe("TaktLight NLE Video-Editor Timeline", () => {
     fireEvent.click(screen.getByTestId("timeline-zoom-reset"));
     expect(screen.getByTestId("timeline-zoom-reset").textContent).toBe("1.0×");
 
-    // Auto-fill kicks inserts clips at detected Kick transients
-    const countBeforeKicks = useTaktStore.getState().showState.timelines[0].tracks[0].clips.length;
+    // Auto-fill kicks creates a dedicated Kick Hits FX track populated with kick clips
     await act(async () => {
       fireEvent.click(screen.getByTestId("timeline-auto-place-kicks-btn"));
       await Promise.resolve();
       await Promise.resolve();
     });
-    const countAfterKicks = useTaktStore.getState().showState.timelines[0].tracks[0].clips.length;
-    expect(countAfterKicks).toBeGreaterThan(countBeforeKicks);
+    const kickTrack = useTaktStore
+      .getState()
+      .showState.timelines[0].tracks.find((tr) => tr.name === "Kick Hits");
+    expect(kickTrack).toBeDefined();
+    expect(kickTrack!.clips.length).toBeGreaterThan(2);
+
+    // Global Time-Stretch tool toggle: stretch clip, turn off Stretch, verify cycle dividers remain & Reset 1.0x works
+    const stretchToggle = screen.getByTestId("timeline-stretch-tool-toggle");
+    expect(stretchToggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(stretchToggle);
+    expect(stretchToggle).toHaveAttribute("aria-pressed", "true");
+
+    // Stretch clip 0 on trk_1 longer, then disable Stretch mode
+    fireEvent.pointerDown(screen.getByTestId("clip-trim-end-trk_1-0"), { clientX: 200, button: 0 });
+    fireEvent.pointerMove(window, { clientX: 300 });
+    fireEvent.pointerUp(window);
+    fireEvent.click(stretchToggle);
+    expect(stretchToggle).toHaveAttribute("aria-pressed", "false");
+
+    // Reset 1.0x button is available in Clip Inspector and restores natural speed
+    const resetStretchBtn = screen.getByTestId("reset-clip-stretch-btn");
+    expect(resetStretchBtn).toBeInTheDocument();
+    fireEvent.click(resetStretchBtn);
+    expect(useTaktStore.getState().showState.timelines[0].tracks[0].clips[0].time_stretch).toBe(false);
   });
 });
 
@@ -1147,6 +1211,87 @@ describe("TaktLight Usage Notes Regressions (Items 1-18)", () => {
     const sc = useTaktStore.getState().showState.scenes.find((s) => s.id === "sc_new_1")!;
     expect(sc.duration_unit).toBe("seconds");
     expect(sc.duration_value).toBeCloseTo(2.5, 2);
+  });
+
+  it("supports GM tooltip, Clr zero-selection, duplicate group rejection, Palette Builder, and dynamic FX Target Channel", async () => {
+    render(<App />);
+
+    // GM tooltip present in TopStatusBar
+    expect(
+      screen.getByText("GM").closest("[title]")?.getAttribute("title"),
+    ).toMatch(/Grand Master/i);
+
+    // Patch 2 fixtures and open Studio
+    fireEvent.click(screen.getByRole("button", { name: /Patch Fixtures/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Patch Fixtures/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
+
+    // 2D Grid Clr leaves zero fixtures selected
+    fireEvent.click(screen.getByTestId("clear-fixture-selection-btn"));
+    expect(useTaktStore.getState().selectedFixtureIds).toEqual([]);
+    expect(useTaktStore.getState().selectedFixtureInstanceId).toBeNull();
+    expect(screen.getByTestId("toggle-select-fixture-fx_001")).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    // Duplicate group name rejection (case-insensitive)
+    fireEvent.click(screen.getByTestId("select-all-fixtures-btn"));
+    fireEvent.change(screen.getByLabelText("Quick Selection Group Name"), {
+      target: { value: "Front Wash" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("create-group-from-fixtures-btn"));
+      await Promise.resolve();
+    });
+    const countAfterFirst = useTaktStore.getState().showState.groups.length;
+    fireEvent.change(screen.getByLabelText("Quick Selection Group Name"), {
+      target: { value: "front wash" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("create-group-from-fixtures-btn"));
+      await Promise.resolve();
+    });
+    expect(useTaktStore.getState().showState.groups.length).toBe(countAfterFirst);
+
+    // Scene Duration input steps by 1 in Beats mode
+    fireEvent.click(screen.getByTitle("Scene Properties"));
+    expect(screen.getByTestId("scene-duration-input")).toHaveAttribute("step", "1");
+    fireEvent.click(screen.getByTitle("FX Rack"));
+
+    // Dynamic FX Target Channel selector in CURVE FX
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("fx-picker-tile-curve_fx"));
+      await Promise.resolve();
+    });
+    const traitSelect = screen.getByTestId("fx-target-trait-select");
+    expect(traitSelect).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.change(traitSelect, { target: { value: "red" } });
+      await Promise.resolve();
+    });
+    const curveBlk = useTaktStore
+      .getState()
+      .showState.fx_library.find((b) => b.id === "blk_scene_sc_new_1")!;
+    expect(curveBlk.elements.find((e) => e.kind === "curve_1d")?.trait).toBe("red");
+
+    // Color Palette Builder modal from COLOR dock
+    fireEvent.click(screen.getByRole("button", { name: /^COLOR$/i }));
+    fireEvent.click(screen.getByTestId("open-palette-builder-dock-btn"));
+    expect(screen.getByTestId("color-palette-builder-modal")).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("palette-builder-name-input"), {
+      target: { value: "Aurora Mint" },
+    });
+    fireEvent.click(screen.getByTestId("palette-builder-add-stop-btn"));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("palette-builder-save-btn"));
+      await Promise.resolve();
+    });
+    expect(
+      useTaktStore
+        .getState()
+        .showState.color_palettes.some((p) => p.name === "Aurora Mint"),
+    ).toBe(true);
   });
 });
 

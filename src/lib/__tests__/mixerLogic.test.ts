@@ -304,7 +304,7 @@ describe("mixerLogic", () => {
     });
     expect(colorOnly.dmxByUniverse[0][0]).toBe(0);
 
-    // Effect scene alone -> half dimmer (~128) & White (255,255,255)
+    // Effect scene alone -> half dimmer (~128) & no implied white mix (0,0,0)
     const effOnly = evaluateSimulationLayersToDmx({
       show,
       fixtureDetailsCache: cache,
@@ -317,8 +317,8 @@ describe("mixerLogic", () => {
     });
     expect(effOnly.dmxByUniverse[0][0]).toBeGreaterThan(120);
     expect(effOnly.dmxByUniverse[0][0]).toBeLessThan(135);
-    expect(effOnly.dmxByUniverse[0][1]).toBe(255);
-    expect(effOnly.dmxByUniverse[0][3]).toBe(255);
+    expect(effOnly.dmxByUniverse[0][1]).toBe(0);
+    expect(effOnly.dmxByUniverse[0][3]).toBe(0);
 
     // Layered Color + Effect scenes -> half dimmer (~128) & Red (255,0,0)
     const layered = evaluateSimulationLayersToDmx({
@@ -565,5 +565,122 @@ describe("mixerLogic", () => {
     const midTri = sampleOklabStopsLinear(["#FF0000", "#00FF00", "#0000FF"], 0.5, 1, false, false);
     expect(midTri[1]).toBeGreaterThan(midTri[0]);
     expect(midTri[1]).toBeGreaterThan(midTri[2]);
+  });
+
+  it("strictly bounds spatial_shader_2d to its gizmo rectangle and supports scalar red trait", () => {
+    const cells = [{ cell_index: 0, pixel_key: "1", grid_xyz: [0, 0, 0] as [number, number, number], local_uv: [0.5, 0.5] as [number, number] }];
+    const channels = [
+      { dmx_offset: 0, channel_number: 1, name: "Master", default_value: 0, target: { scope: "fixture" as const }, role: { kind: "intensity" as const }, fine_channel_offset: null },
+      { dmx_offset: 1, channel_number: 2, name: "R1", default_value: 0, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, role: { kind: "color_intensity" as const, color: "Red" }, fine_channel_offset: null },
+      { dmx_offset: 2, channel_number: 3, name: "G1", default_value: 0, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, role: { kind: "color_intensity" as const, color: "Green" }, fine_channel_offset: null },
+      { dmx_offset: 3, channel_number: 4, name: "B1", default_value: 0, target: { scope: "cell" as const, cell_index: 0, pixel_key: "1" }, role: { kind: "color_intensity" as const, color: "Blue" }, fine_channel_offset: null },
+    ];
+    const cache = {
+      par1: {
+        summary: { id: "par1", name: "Par1", short_name: "Par1", origin: "age_built_in" as const, categories: ["Color Changer"], pixel_count: 1, modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cell_count: 1 }] },
+        raw_json: "",
+        expanded_modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cells, channels }],
+      },
+    };
+    const show = {
+      version: "1.0",
+      name: "Bounds Test",
+      bpm: 120,
+      read_only_newer_version: false,
+      network_outputs: {
+        frame_rate_hz: 44,
+        adapter: "auto",
+        subnet: null,
+        offline_fallback: true,
+        artsync: true,
+        universes: [],
+      },
+      patch: [
+        {
+          id: "fx_in",
+          name: "Inside Par",
+          profile: "par1",
+          mode: "4ch",
+          universe: 1,
+          address: 1,
+          channel_count: 4,
+          grid_pos: { x: 0.5, y: 0.5, rotation: 0, scale_x: 0.1, scale_y: 0.1 },
+          calibration: { gamma: 2.2, min_dimmer_dmx: 0, max_dimmer_dmx: 255, white_gain: 1, white_mode: "replace" as const },
+        },
+        {
+          id: "fx_out",
+          name: "Outside Par",
+          profile: "par1",
+          mode: "4ch",
+          universe: 1,
+          address: 50,
+          channel_count: 4,
+          grid_pos: { x: 0.95, y: 0.95, rotation: 0, scale_x: 0.05, scale_y: 0.05 },
+          calibration: { gamma: 2.2, min_dimmer_dmx: 0, max_dimmer_dmx: 255, white_gain: 1, white_mode: "replace" as const },
+        },
+      ],
+      color_palettes: DEFAULT_COLOR_PALETTES,
+      dimmer_palettes: [],
+      groups: [],
+      fx_library: [
+        {
+          id: "blk_bounded",
+          name: "Bounded Map",
+          target_group: "all",
+          duration_beats: 4,
+          loop_block: true,
+          elements: [
+            { kind: "static_trait" as const, trait: "master_dimmer", op: "ltp" as const, palette_ref: null, value_start: 1, value_end: 1, order: null },
+            { kind: "spatial_shader_2d" as const, trait: "color", op: "ltp" as const, shader: "linear_sweep" as const, palette_ref: "pal_fire", inline_colors: ["#FF0000", "#FF8800"], rate_beats: null, speed_hz: null, rate_cycles: 1, spatial_freq: 1, direction_deg: 0, center_x: 0.5, center_y: 0.5 },
+          ],
+        },
+        {
+          id: "blk_red_curve",
+          name: "Red Curve",
+          target_group: "fx_in",
+          duration_beats: 4,
+          loop_block: true,
+          elements: [
+            { kind: "static_trait" as const, trait: "master_dimmer", op: "ltp" as const, palette_ref: null, value_start: 1, value_end: 1, order: null },
+            { kind: "curve_1d" as const, trait: "red", op: "ltp" as const, waveform: "square" as const, amplitude: 1, offset: 0, rate_beats: null, speed_hz: null, rate_cycles: 1, phase_spread_deg: 0, duty: null, palette_ref: null, order: null },
+          ],
+        },
+      ],
+      scenes: [
+        { id: "sc_bounded", name: "Bounded", bank: "Bank 1", target_group: null, priority: 10, fade_in_sec: 0, fade_out_sec: 0, duration_value: 4, duration_unit: "beats" as const, block_refs: ["blk_bounded"] },
+        { id: "sc_red", name: "Red", bank: "Bank 1", target_group: null, priority: 10, fade_in_sec: 0, fade_out_sec: 0, duration_value: 4, duration_unit: "beats" as const, block_refs: ["blk_red_curve"] },
+      ],
+      timelines: [],
+    };
+    const uni = [{ id: 1, review_output: false, protocol: { protocol: "art_net" as const, mode: { mode: "broadcast" as const }, net: 0, subnet: 0, uni: 0 } }];
+    const out = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_bounded", bank: "Bank 1", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 0,
+    });
+    // Fixture inside gizmo [0.3..0.7] gets lit red; fixture at 0.95 stays dark
+    expect(out.dmxByUniverse[0][1]).toBeGreaterThan(0);
+    expect(out.dmxByUniverse[0][50]).toBe(0);
+    expect(out.dmxByUniverse[0][51]).toBe(0);
+
+    // Scalar "red" curve writes only to Red channel (not Green/Blue)
+    const redOut = evaluateSimulationLayersToDmx({
+      show,
+      fixtureDetailsCache: cache,
+      liveLayers: [],
+      activeScenes: [{ scene_id: "sc_red", bank: "Bank 1", trigger_t_sec: 0, trigger_beat: 0, trigger_order: 1, fade_in_sec: 0, fade_out_sec: 0, release_t_sec: null, release_start_alpha: 1 }],
+      universes: uni,
+      grandMaster: 1,
+      blackout: false,
+      tSec: 0,
+    });
+    expect(redOut.dmxByUniverse[0][1]).toBe(255);
+    expect(redOut.dmxByUniverse[0][2]).toBe(0);
+    expect(redOut.dmxByUniverse[0][3]).toBe(0);
   });
 });

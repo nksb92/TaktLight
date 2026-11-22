@@ -540,7 +540,7 @@ describe("useTaktStore", () => {
     expect(initial.outputEnabled).toBe(false);
     expect(initial.isDirty).toBe(false);
     expect(initial.showState.color_palettes.length).toBeGreaterThanOrEqual(12);
-    expect(initial.showState.scenes).toHaveLength(1);
+    expect(initial.showState.scenes).toHaveLength(2);
     expect(initial.showState.scenes[0]).toMatchObject({
       id: "sc_new_1",
       fade_in_sec: 0,
@@ -549,6 +549,21 @@ describe("useTaktStore", () => {
       duration_unit: "beats",
       block_refs: [],
     });
+    expect(initial.showState.scenes[1]).toMatchObject({
+      id: "sc_tl_cyber_intro",
+      timeline_ref: "tl_cyber_intro",
+    });
+
+    // Creating a Timeline Super-Scene in a bank adds both SceneDef(timeline_ref) and TimelineDef
+    const tlScene = await useTaktStore
+      .getState()
+      .createTimelineSceneInBank("Bank 1", "Intro Show");
+    expect(tlScene.timeline_ref).toBeTruthy();
+    await useTaktStore.getState().triggerScene(tlScene.id, 0);
+    expect(useTaktStore.getState().activeTimelineId).toBe(tlScene.timeline_ref);
+    expect(useTaktStore.getState().timelinePlaying).toBe(true);
+    await useTaktStore.getState().releaseScene(tlScene.id, 1);
+    expect(useTaktStore.getState().timelinePlaying).toBe(false);
 
     await initial.upsertScene({
       ...initial.showState.scenes[0],
