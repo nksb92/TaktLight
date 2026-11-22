@@ -292,6 +292,7 @@ impl AppState {
             duration_value: 4.0,
             duration_unit: DurationUnit::Beats,
             block_refs: Vec::new(),
+            timeline_ref: None,
         });
         let lib = self.fixture_library.read();
         let rev = self.undo_history.lock().revision();
@@ -1562,6 +1563,17 @@ fn resolve_split_fixtures_command(state: State<'_, AppState>) -> Result<ShowSnap
     state.resolve_split_fixtures()
 }
 
+#[tauri::command]
+fn close_splashscreen(app: tauri::AppHandle) {
+    if let Some(splash) = app.get_webview_window("splashscreen") {
+        let _ = splash.close();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState::new(true);
@@ -1569,6 +1581,19 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(app_state)
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(6));
+                if let Some(splash) = handle.get_webview_window("splashscreen") {
+                    let _ = splash.close();
+                }
+                if let Some(main) = handle.get_webview_window("main") {
+                    let _ = main.show();
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             subscribe_frames,
             ack_frame,
@@ -1620,6 +1645,7 @@ pub fn run() {
             set_latency_offset_ms_command,
             analyze_audio_command,
             resolve_split_fixtures_command,
+            close_splashscreen,
         ])
         .build(tauri::generate_context!())
         .expect("error while building TaktLight application");
@@ -1934,6 +1960,7 @@ mod tests {
                 duration_value: 4.0,
                 duration_unit: DurationUnit::Beats,
                 block_refs: vec!["blk_wave".into()],
+                timeline_ref: None,
             })
             .unwrap();
         state
@@ -1948,6 +1975,7 @@ mod tests {
                 duration_value: 4.0,
                 duration_unit: DurationUnit::Beats,
                 block_refs: vec!["blk_wave".into()],
+                timeline_ref: None,
             })
             .unwrap();
 
@@ -1986,6 +2014,7 @@ mod tests {
                         bpm: 128.0,
                     }],
                     audio_track: None,
+                    loop_timeline: false,
                     tracks: vec![TrackDef {
                         id: "trk_1".into(),
                         name: "Track 1".into(),
@@ -2006,7 +2035,9 @@ mod tests {
                                 hex_end: None,
                                 order: None,
                             }],
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
                 },
                 None,

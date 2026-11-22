@@ -12,11 +12,26 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "TaktLight Studio",
         "width": 1440,
         "height": 900,
         "minWidth": 1024,
         "minHeight": 700,
+        "backgroundColor": "#0A0F18",
+        "dragDropEnabled": false,
+        "visible": false
+      },
+      {
+        "label": "splashscreen",
+        "title": "TaktLight",
+        "url": "/splashscreen.html",
+        "width": 460,
+        "height": 280,
+        "resizable": false,
+        "decorations": false,
+        "center": true,
+        "alwaysOnTop": true,
         "backgroundColor": "#0A0F18"
       }
     ],
