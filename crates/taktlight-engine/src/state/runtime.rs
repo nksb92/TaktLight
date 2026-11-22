@@ -219,6 +219,9 @@ impl RuntimeControl {
             self.timeline_start_anchor_t_sec = clock_t_now_sec;
             return;
         }
+        if self.timeline_playing && playhead_sec.is_none() {
+            self.timeline_playhead_sec += (clock_t_now_sec - self.timeline_start_anchor_t_sec).max(0.0);
+        }
         if let Some(pos) = playhead_sec {
             if !pos.is_nan() {
                 self.timeline_playhead_sec = pos.max(0.0);

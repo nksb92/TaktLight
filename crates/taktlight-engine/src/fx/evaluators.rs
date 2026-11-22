@@ -255,30 +255,38 @@ pub fn evaluate_spatial_shader_2d_phase(
     center_y: f32,
     transform: Option<&str>,
 ) -> f32 {
-    let tx_xy = match transform {
-        Some("mirror_x") => [1.0 - norm_xy[0], norm_xy[1]],
-        Some("mirror_y") => [norm_xy[0], 1.0 - norm_xy[1]],
-        Some("invert") => [1.0 - norm_xy[0], 1.0 - norm_xy[1]],
-        _ => norm_xy,
-    };
+    let mut dx = norm_xy[0] - center_x;
+    let mut dy = norm_xy[1] - center_y;
+    match transform {
+        Some("mirror_x") => dx = -dx,
+        Some("mirror_y") => dy = -dy,
+        Some("invert") => {
+            dx = -dx;
+            dy = -dy;
+        }
+        _ => {}
+    }
     let phi = base_phase_cycles.rem_euclid(1.0) as f32;
-    let dx = tx_xy[0] - center_x;
-    let dy = tx_xy[1] - center_y;
     let k = spatial_freq / color_width.clamp(0.1, 4.0);
     let theta = direction_deg.to_radians();
 
     let s = match shader {
         Shader2DKind::LinearSweep => (k * (dx * theta.cos() + dy * theta.sin()) - phi).rem_euclid(1.0),
         Shader2DKind::RadialWave => {
-            0.5 + 0.5 * (TAU * (k * (dx * dx + dy * dy).sqrt() - phi)).sin()
+            let base = 0.5 + 0.5 * (TAU * (k * (dx * dx + dy * dy).sqrt() - phi)).sin();
+            if transform == Some("invert") {
+                1.0 - base
+            } else {
+                base
+            }
         }
         Shader2DKind::Pinwheel => {
             ((dy.atan2(dx) / TAU) * k.round().max(1.0) - phi).rem_euclid(1.0)
         }
         Shader2DKind::Plasma => {
             0.5 + 0.25
-                * ((TAU * (k * tx_xy[0] + phi)).sin()
-                    + (TAU * (k * tx_xy[1] - phi)).sin())
+                * ((TAU * (k * dx + phi)).sin()
+                    + (TAU * (k * dy - phi)).sin())
         }
     };
     s.clamp(0.0, 1.0)

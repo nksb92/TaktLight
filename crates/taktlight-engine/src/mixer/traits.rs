@@ -189,17 +189,11 @@ impl CellTraitState {
         let gm = grand_master.clamp(0.0, 1.0);
         if self.dimmer_touched {
             self.dimmer = (self.dimmer * gm).clamp(0.0, 1.0);
-            if !self.color_touched {
-                self.color = [1.0, 1.0, 1.0];
-            }
         } else if fx_state.master_dimmer_touched
             && !fx_state.any_cell_dimmer_touched
             && fx_state.master_dimmer > 0.0
         {
             self.dimmer = 1.0;
-            if !self.color_touched {
-                self.color = [1.0, 1.0, 1.0];
-            }
         } else {
             self.dimmer = 0.0;
         }
@@ -598,7 +592,7 @@ mod tests {
         color_with_master_cell.finalize_cell_state_with_fixture(&master_only, 0.5, false);
         assert!((color_with_master_cell.dimmer - 1.0).abs() < 1e-6);
 
-        // Segment dimmer only sets cell.color to white [1, 1, 1]
+        // Segment dimmer only keeps cell.color at [0, 0, 0] (no implied white mix)
         let mut dim_only_cell = CellTraitState {
             dimmer: 0.6,
             dimmer_touched: true,
@@ -607,7 +601,7 @@ mod tests {
         };
         dim_only_cell.finalize_cell_state_with_fixture(&untouched, 0.5, false);
         assert!((dim_only_cell.dimmer - 0.3).abs() < 1e-6);
-        assert_eq!(dim_only_cell.color, [1.0, 1.0, 1.0]);
+        assert_eq!(dim_only_cell.color, [0.0, 0.0, 0.0]);
     }
 
     #[test]

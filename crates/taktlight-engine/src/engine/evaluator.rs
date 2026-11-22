@@ -482,6 +482,7 @@ mod tests {
             duration_value: 4.0,
             duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_cyber_wave".into()],
+            timeline_ref: None,
         };
         show.scenes.push(scene.clone());
 
@@ -684,6 +685,7 @@ mod tests {
             duration_value: 4.0,
             duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_blue".into()],
+            timeline_ref: None,
         });
         show.timelines.push(TimelineDef {
             id: "tl_main".into(),
@@ -695,6 +697,7 @@ mod tests {
                 bpm: 120.0,
             }],
             audio_track: None,
+            loop_timeline: false,
             tracks: vec![
                 TrackDef {
                     id: "trk_1".into(),
@@ -707,7 +710,9 @@ mod tests {
                         fade_in_sec: 0.0,
                         fade_out_sec: 0.0,
                         inline_fx: Vec::new(),
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 },
                 TrackDef {
                     id: "trk_2".into(),
@@ -741,7 +746,9 @@ mod tests {
                                 order: None,
                             },
                         ],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 },
             ],
         });
@@ -870,6 +877,7 @@ mod tests {
             duration_value: 4.0,
             duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_o".into()],
+            timeline_ref: None,
         };
         show.scenes.push(sc.clone());
 
@@ -956,6 +964,7 @@ mod tests {
             duration_value: 4.0,
             duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_col_only".into()],
+            timeline_ref: None,
         };
         show.scenes.push(sc_col.clone());
 
@@ -988,6 +997,7 @@ mod tests {
             duration_value: 4.0,
             duration_unit: DurationUnit::Beats,
             block_refs: vec!["blk_master".into()],
+            timeline_ref: None,
         };
         show.scenes.push(sc_master.clone());
 
@@ -1060,28 +1070,40 @@ mod tests {
             duration_beats: 4.0,
             duration_sec: None,
             loop_block: true,
-            elements: vec![FxElementDef::Curve1D {
-                trait_name: "dimmer".into(),
-                op: "ltp".into(),
-                waveform: "saw".into(),
-                amplitude: 1.0,
-                offset: 0.0,
-                rate_beats: None,
-                speed_hz: None,
-                rate_cycles: Some(1.0),
-                phase_deg: 0.0,
-                phase_spread_deg: 0.0,
-                duty: None,
-                grayscale: false,
-                color_width: 1.0,
-                gradient: 1.0,
-                angle_deg: 0.0,
-                fx_kind_tag: Some("curve_fx".into()),
-                inline_colors: Vec::new(),
-                value_stops: Vec::new(),
-                palette_ref: None,
-                order: None,
-            }],
+            elements: vec![
+                FxElementDef::StaticTrait {
+                    trait_name: "color".into(),
+                    op: "ltp".into(),
+                    palette_ref: None,
+                    value_start: None,
+                    value_end: None,
+                    hex_start: Some("#FFFFFF".into()),
+                    hex_end: Some("#FFFFFF".into()),
+                    order: None,
+                },
+                FxElementDef::Curve1D {
+                    trait_name: "dimmer".into(),
+                    op: "ltp".into(),
+                    waveform: "saw".into(),
+                    amplitude: 1.0,
+                    offset: 0.0,
+                    rate_beats: None,
+                    speed_hz: None,
+                    rate_cycles: Some(1.0),
+                    phase_deg: 0.0,
+                    phase_spread_deg: 0.0,
+                    duty: None,
+                    grayscale: false,
+                    color_width: 1.0,
+                    gradient: 1.0,
+                    angle_deg: 0.0,
+                    fx_kind_tag: Some("curve_fx".into()),
+                    inline_colors: Vec::new(),
+                    value_stops: Vec::new(),
+                    palette_ref: None,
+                    order: None,
+                },
+            ],
         });
         let sc_sec = SceneDef {
             id: "sc_sec".into(),
@@ -1094,6 +1116,7 @@ mod tests {
             duration_value: 2.0,
             duration_unit: DurationUnit::Seconds,
             block_refs: vec!["blk_saw".into()],
+            timeline_ref: None,
         };
         show.scenes.push(sc_sec.clone());
 
@@ -1127,5 +1150,442 @@ mod tests {
             &mut q,
         );
         assert!((f_three_quarter.universes[0].dmx[2] as i16 - 191).abs() <= 2);
+    }
+
+    #[test]
+    fn all_six_fx_scene_types_adapt_parameters_and_produce_plausible_dmx() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::{GridPos, OrderRule};
+        use crate::show::xml::{DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState};
+
+        let lib = FixtureLibrary::load(None);
+        let eval_elements = |elements: Vec<FxElementDef>, t_sec: f64| -> EvaluatedFrame {
+            let mut show = ShowState::default();
+            show.bpm = 120.0;
+            show.patch.push(FixtureInstance {
+                id: "fx_tube".into(),
+                profile: "age/rlcv3_8_segment_tube.json".into(),
+                mode: "34ch Pixel Mode".into(),
+                name: "Tube".into(),
+                universe: 1,
+                address: 1,
+                channel_count: 34,
+                grid_pos: GridPos {
+                    x: 0.5,
+                    y: 0.5,
+                    rotation: 0.0,
+                    scale_x: 0.3,
+                    scale_y: 0.05,
+                },
+                calibration: FixtureCalibration {
+                    gamma: 1.0,
+                    min_dimmer_dmx: 0,
+                    max_dimmer_dmx: 255,
+                    white_mode: WhiteMode::Off,
+                    white_gain: 1.0,
+                },
+            });
+            show.fx_library.push(FxBlockDef {
+                id: "blk_test".into(),
+                name: "Test".into(),
+                target_group: Some("all".into()),
+                duration_beats: 4.0,
+                duration_sec: None,
+                loop_block: true,
+                elements,
+            });
+            let sc = SceneDef {
+                id: "sc_test".into(),
+                name: "Test".into(),
+                bank: Some("Bank 1".into()),
+                target_group: None,
+                priority: 10,
+                fade_in_sec: 0.0,
+                fade_out_sec: 0.0,
+                duration_value: 4.0,
+                duration_unit: DurationUnit::Beats,
+                block_refs: vec!["blk_test".into()],
+                timeline_ref: None,
+            };
+            show.scenes.push(sc.clone());
+            let plan = compile_render_plan(1, &show, &lib).unwrap();
+            let mut rt = RuntimeControl::new();
+            rt.trigger_scene(&sc, 0.0);
+            let mut q = QuantizerState::default();
+            Engine::evaluate_frame(
+                &plan,
+                &ClockInput {
+                    t_sec,
+                    frame_index: 1,
+                },
+                &rt,
+                &mut q,
+            )
+        };
+
+        let static_dim = FxElementDef::StaticTrait {
+            trait_name: "dimmer".into(),
+            op: "ltp".into(),
+            palette_ref: None,
+            value_start: Some(1.0),
+            value_end: Some(1.0),
+            hex_start: None,
+            hex_end: None,
+            order: None,
+        };
+        let static_white = FxElementDef::StaticTrait {
+            trait_name: "color".into(),
+            op: "ltp".into(),
+            palette_ref: None,
+            value_start: Some(0.0),
+            value_end: Some(1.0),
+            hex_start: Some("#FFFFFF".into()),
+            hex_end: Some("#FFFFFF".into()),
+            order: None,
+        };
+        let cell_rgb = |f: &EvaluatedFrame, idx: usize| -> [u8; 3] {
+            let b = 2 + idx * 4;
+            [
+                f.universes[0].dmx[b],
+                f.universes[0].dmx[b + 1],
+                f.universes[0].dmx[b + 2],
+            ]
+        };
+
+        // 1. FX-01: color_fx (color spread, time evolution, grayscale, direction reversal)
+        let color_fx = FxElementDef::Curve1D {
+            trait_name: "color".into(),
+            op: "ltp".into(),
+            waveform: "saw".into(),
+            amplitude: 1.0,
+            offset: 0.0,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            phase_deg: 0.0,
+            phase_spread_deg: 360.0,
+            duty: None,
+            grayscale: false,
+            color_width: 1.0,
+            gradient: 1.0,
+            angle_deg: 0.0,
+            fx_kind_tag: Some("color_fx".into()),
+            inline_colors: vec!["#FF0000".into(), "#00FF00".into(), "#0000FF".into()],
+            value_stops: Vec::new(),
+            palette_ref: None,
+            order: Some(OrderRule::Linear),
+        };
+        let f_cfx0 = eval_elements(vec![static_dim.clone(), color_fx.clone()], 0.0);
+        let f_cfx1 = eval_elements(vec![static_dim.clone(), color_fx.clone()], 0.5);
+        assert_ne!(cell_rgb(&f_cfx0, 0), cell_rgb(&f_cfx0, 3));
+        assert_ne!(f_cfx0.universes[0].dmx[2..34], f_cfx1.universes[0].dmx[2..34]);
+
+        let mut color_fx_gray = color_fx.clone();
+        if let FxElementDef::Curve1D {
+            ref mut grayscale, ..
+        } = color_fx_gray
+        {
+            *grayscale = true;
+        }
+        let f_gray = eval_elements(vec![static_dim.clone(), color_fx_gray], 0.25);
+        for i in 0..8 {
+            let [r, g, b] = cell_rgb(&f_gray, i);
+            assert!((r as i16 - g as i16).abs() <= 2);
+            assert!((g as i16 - b as i16).abs() <= 2);
+            assert!(r > 0);
+        }
+
+        // 2. FX-02: color_mappings (all 4 shaders, gizmo bounding box, mirror_x)
+        for shader in ["linear_sweep", "radial_wave", "pinwheel", "plasma"] {
+            let cmap = FxElementDef::SpatialShader2D {
+                trait_name: "color".into(),
+                op: "ltp".into(),
+                shader: shader.into(),
+                palette_ref: None,
+                rate_beats: None,
+                speed_hz: None,
+                rate_cycles: Some(1.0),
+                spatial_freq: 1.0,
+                color_width: 1.0,
+                gradient: 1.0,
+                grayscale: false,
+                transform: None,
+                inline_colors: vec!["#FF0000".into(), "#00FF00".into(), "#0000FF".into()],
+                value_stops: Vec::new(),
+                direction_deg: 0.0,
+                center_x: 0.5,
+                center_y: 0.5,
+            };
+            let f0 = eval_elements(vec![static_dim.clone(), cmap.clone()], 0.0);
+            let f1 = eval_elements(vec![static_dim.clone(), cmap], 0.5);
+            assert!(f0.universes[0].dmx[2..34].iter().any(|&v| v > 0));
+            assert_ne!(f0.universes[0].dmx[2..34], f1.universes[0].dmx[2..34]);
+        }
+        let cmap_oob = FxElementDef::SpatialShader2D {
+            trait_name: "color".into(),
+            op: "ltp".into(),
+            shader: "linear_sweep".into(),
+            palette_ref: None,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            spatial_freq: 1.0,
+            color_width: 1.0,
+            gradient: 1.0,
+            grayscale: false,
+            transform: None,
+            inline_colors: vec!["#FF0000".into(), "#0000FF".into()],
+            value_stops: Vec::new(),
+            direction_deg: 0.0,
+            center_x: 0.99,
+            center_y: 0.99,
+        };
+        let f_oob = eval_elements(vec![static_dim.clone(), cmap_oob], 0.0);
+        assert!(f_oob.universes[0].dmx[2..34].iter().all(|&v| v == 0));
+
+        // 3. FX-03: chaser_fx (pixels_on, one_way bounce, fade, reverse order)
+        let make_chase = |pixels_on: u16, one_way: bool, fade: f32, order: OrderRule| {
+            FxElementDef::StepChase {
+                trait_name: "dimmer".into(),
+                op: "ltp".into(),
+                step_beats: None,
+                speed_hz: None,
+                rate_cycles: Some(1.0),
+                one_way,
+                pixels_on: Some(pixels_on),
+                active_ratio: None,
+                fade,
+                amplitude: 1.0,
+                palette_ref: None,
+                order: Some(order),
+            }
+        };
+        let f_c1 = eval_elements(
+            vec![
+                static_white.clone(),
+                make_chase(1, true, 0.0, OrderRule::Linear),
+            ],
+            0.5,
+        );
+        let f_c3 = eval_elements(
+            vec![
+                static_white.clone(),
+                make_chase(3, true, 0.0, OrderRule::Linear),
+            ],
+            0.5,
+        );
+        let lit_c1 = (0..8).filter(|&i| cell_rgb(&f_c1, i)[0] > 0).count();
+        let lit_c3 = (0..8).filter(|&i| cell_rgb(&f_c3, i)[0] > 0).count();
+        assert!(lit_c1 >= 1 && lit_c3 > lit_c1);
+
+        let f_b_q1 = eval_elements(
+            vec![
+                static_white.clone(),
+                make_chase(2, false, 0.0, OrderRule::Linear),
+            ],
+            0.5,
+        );
+        let f_b_q3 = eval_elements(
+            vec![
+                static_white.clone(),
+                make_chase(2, false, 0.0, OrderRule::Linear),
+            ],
+            1.5,
+        );
+        assert_eq!(
+            f_b_q1.universes[0].dmx[2..34],
+            f_b_q3.universes[0].dmx[2..34]
+        );
+
+        // 4. FX-04: value_fx (value_stops, phase_spread_deg=0 sync, gradient=0 stepped)
+        let make_val = |stops: Vec<f32>, spread: f32, grad: f32| FxElementDef::Curve1D {
+            trait_name: "dimmer".into(),
+            op: "ltp".into(),
+            waveform: "saw".into(),
+            amplitude: 1.0,
+            offset: 0.0,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            phase_deg: 0.0,
+            phase_spread_deg: spread,
+            duty: None,
+            grayscale: false,
+            color_width: 1.0,
+            gradient: grad,
+            angle_deg: 0.0,
+            fx_kind_tag: Some("value_fx".into()),
+            inline_colors: Vec::new(),
+            value_stops: stops,
+            palette_ref: None,
+            order: Some(OrderRule::Linear),
+        };
+        let f_vsync = eval_elements(
+            vec![static_white.clone(), make_val(vec![1.0, 0.5, 0.0], 0.0, 1.0)],
+            0.0,
+        );
+        let r0 = cell_rgb(&f_vsync, 0)[0];
+        assert!(r0 > 200);
+        assert!((0..8).all(|i| cell_rgb(&f_vsync, i)[0] == r0));
+
+        let f_vstep = eval_elements(
+            vec![static_white.clone(), make_val(vec![1.0, 0.0], 360.0, 0.0)],
+            0.0,
+        );
+        assert!((0..8).all(|i| {
+            let v = cell_rgb(&f_vstep, i)[0];
+            v == 0 || v == 255
+        }));
+
+        // 5. FX-05: curve_fx (pulse duty adaptation & amplitude/offset range)
+        let make_pulse = |duty: f32| FxElementDef::Curve1D {
+            trait_name: "dimmer".into(),
+            op: "ltp".into(),
+            waveform: "pulse".into(),
+            amplitude: 1.0,
+            offset: 0.0,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            phase_deg: 0.0,
+            phase_spread_deg: 0.0,
+            duty: Some(duty),
+            grayscale: false,
+            color_width: 1.0,
+            gradient: 1.0,
+            angle_deg: 0.0,
+            fx_kind_tag: Some("curve_fx".into()),
+            inline_colors: Vec::new(),
+            value_stops: Vec::new(),
+            palette_ref: None,
+            order: Some(OrderRule::Linear),
+        };
+        let f_narrow = eval_elements(vec![static_white.clone(), make_pulse(0.25)], 1.0);
+        let f_wide = eval_elements(vec![static_white.clone(), make_pulse(0.75)], 1.0);
+        assert_eq!(cell_rgb(&f_narrow, 0)[0], 0);
+        assert_eq!(cell_rgb(&f_wide, 0)[0], 255);
+
+        // 6. FX-06: mappings (dimmer spatial_shader_2d with value_stops, mirror_x, bounds)
+        let make_dim_map = |stops: Vec<f32>, transform: Option<&str>, cx: f32| {
+            FxElementDef::SpatialShader2D {
+                trait_name: "dimmer".into(),
+                op: "ltp".into(),
+                shader: "linear_sweep".into(),
+                palette_ref: None,
+                rate_beats: None,
+                speed_hz: None,
+                rate_cycles: Some(1.0),
+                spatial_freq: 1.0,
+                color_width: 1.0,
+                gradient: 1.0,
+                grayscale: false,
+                transform: transform.map(str::to_string),
+                inline_colors: Vec::new(),
+                value_stops: stops,
+                direction_deg: 0.0,
+                center_x: cx,
+                center_y: 0.5,
+            }
+        };
+        let f_mhalf = eval_elements(
+            vec![static_white.clone(), make_dim_map(vec![0.5, 0.5], None, 0.5)],
+            0.0,
+        );
+        for i in 0..8 {
+            let v = cell_rgb(&f_mhalf, i)[0];
+            assert!((v as i16 - 128).abs() <= 3, "expected ~128, got {v}");
+        }
+        let f_mnorm = eval_elements(
+            vec![
+                static_white.clone(),
+                make_dim_map(vec![1.0, 0.2, 0.0], None, 0.5),
+            ],
+            0.0,
+        );
+        let f_mmirr = eval_elements(
+            vec![
+                static_white.clone(),
+                make_dim_map(vec![1.0, 0.2, 0.0], Some("mirror_x"), 0.5),
+            ],
+            0.0,
+        );
+        assert_ne!(cell_rgb(&f_mnorm, 0)[0], cell_rgb(&f_mmirr, 0)[0]);
+        let f_moob = eval_elements(
+            vec![static_white, make_dim_map(vec![1.0, 0.0], None, 0.99)],
+            0.0,
+        );
+        assert!(f_moob.universes[0].dmx[2..34].iter().all(|&v| v == 0));
+
+        // 7. Scalar channel traits (red/green/blue) + master_dimmer parity with TS mixer
+        let static_master = FxElementDef::StaticTrait {
+            trait_name: "master_dimmer".into(),
+            op: "ltp".into(),
+            palette_ref: None,
+            value_start: Some(1.0),
+            value_end: Some(1.0),
+            hex_start: None,
+            hex_end: None,
+            order: None,
+        };
+        let red_curve = FxElementDef::Curve1D {
+            trait_name: "red".into(),
+            op: "ltp".into(),
+            waveform: "square".into(),
+            amplitude: 1.0,
+            offset: 0.0,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            phase_deg: 0.0,
+            phase_spread_deg: 0.0,
+            duty: Some(0.5),
+            grayscale: false,
+            color_width: 1.0,
+            gradient: 1.0,
+            angle_deg: 0.0,
+            fx_kind_tag: Some("curve_fx".into()),
+            inline_colors: Vec::new(),
+            value_stops: Vec::new(),
+            palette_ref: None,
+            order: Some(OrderRule::Linear),
+        };
+        let f_red = eval_elements(vec![static_master.clone(), red_curve], 0.0);
+        assert_eq!(cell_rgb(&f_red, 0), [255, 0, 0]);
+
+        let blue_chase = FxElementDef::StepChase {
+            trait_name: "blue".into(),
+            op: "ltp".into(),
+            step_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            one_way: true,
+            pixels_on: Some(8),
+            active_ratio: None,
+            fade: 0.0,
+            amplitude: 1.0,
+            palette_ref: None,
+            order: Some(OrderRule::Linear),
+        };
+        let f_blue = eval_elements(vec![static_master, blue_chase], 0.0);
+        assert_eq!(cell_rgb(&f_blue, 0), [0, 0, 255]);
+
+        let master_chase = FxElementDef::StepChase {
+            trait_name: "master_dimmer".into(),
+            op: "ltp".into(),
+            step_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            one_way: true,
+            pixels_on: Some(1),
+            active_ratio: None,
+            fade: 0.0,
+            amplitude: 1.0,
+            palette_ref: None,
+            order: Some(OrderRule::Linear),
+        };
+        let f_mchase = eval_elements(vec![master_chase], 0.0);
+        assert_eq!(f_mchase.universes[0].dmx[0], 255);
     }
 }

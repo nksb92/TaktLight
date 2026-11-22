@@ -240,6 +240,8 @@ pub struct SceneDef {
     pub duration_unit: DurationUnit,
     #[serde(default)]
     pub block_refs: Vec<String>,
+    #[serde(default)]
+    pub timeline_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -265,7 +267,16 @@ fn default_sensitivity() -> f32 {
     0.65
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackType {
+    #[default]
+    Untyped,
+    Effect,
+    Music,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ClipDef {
     #[serde(default)]
     pub ref_block: Option<String>,
@@ -277,12 +288,20 @@ pub struct ClipDef {
     pub fade_out_sec: f32,
     #[serde(default)]
     pub inline_fx: Vec<FxElementDef>,
+    #[serde(default)]
+    pub audio_file: Option<String>,
+    #[serde(default)]
+    pub time_stretch: bool,
+    #[serde(default)]
+    pub source_duration_sec: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TrackDef {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub track_type: TrackType,
     #[serde(default)]
     pub target_group: Option<String>,
     #[serde(default)]
@@ -300,6 +319,8 @@ pub struct TimelineDef {
     pub tempo_map: Vec<TempoPointDef>,
     #[serde(default)]
     pub audio_track: Option<AudioTrackDef>,
+    #[serde(default)]
+    pub loop_timeline: bool,
     #[serde(default)]
     pub tracks: Vec<TrackDef>,
 }
@@ -903,6 +924,12 @@ struct SceneXml {
         skip_serializing_if = "Option::is_none"
     )]
     duration_unit: Option<String>,
+    #[serde(
+        rename = "@timeline_ref",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    timeline_ref: Option<String>,
     #[serde(rename = "BlockRef", default)]
     block_refs: Vec<BlockRefXml>,
 }
@@ -929,6 +956,8 @@ struct TimelineXml {
     duration_sec: f64,
     #[serde(rename = "@grid_offset_sec", default)]
     grid_offset_sec: f64,
+    #[serde(rename = "@loop_timeline", default, skip_serializing_if = "is_false")]
+    loop_timeline: bool,
     #[serde(rename = "TempoMap", default)]
     tempo_map: TempoMapXml,
     #[serde(
@@ -980,6 +1009,12 @@ struct TrackXml {
     #[serde(rename = "@name")]
     name: String,
     #[serde(
+        rename = "@track_type",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    track_type: Option<String>,
+    #[serde(
         rename = "@target_group",
         default,
         skip_serializing_if = "Option::is_none"
@@ -1005,6 +1040,20 @@ struct ClipXml {
     fade_in_sec: f32,
     #[serde(rename = "@fade_out_sec", default)]
     fade_out_sec: f32,
+    #[serde(
+        rename = "@audio_file",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    audio_file: Option<String>,
+    #[serde(rename = "@time_stretch", default)]
+    time_stretch: bool,
+    #[serde(
+        rename = "@source_duration_sec",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    source_duration_sec: Option<f64>,
     #[serde(rename = "$value", default)]
     elements: Vec<FxElementXml>,
 }
@@ -1519,6 +1568,7 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
                 DurationUnit::Beats => "beats".to_string(),
                 DurationUnit::Seconds => "seconds".to_string(),
             }),
+            timeline_ref: s.timeline_ref.clone(),
             block_refs: s
                 .block_refs
                 .iter()
@@ -1535,6 +1585,7 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
             name: tl.name.clone(),
             duration_sec: tl.duration_sec,
             grid_offset_sec: tl.grid_offset_sec,
+            loop_timeline: tl.loop_timeline,
             tempo_map: TempoMapXml {
                 tempos: tl
                     .tempo_map
@@ -1558,6 +1609,11 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
                 .map(|tr| TrackXml {
                     id: tr.id.clone(),
                     name: tr.name.clone(),
+                    track_type: Some(match tr.track_type {
+                        TrackType::Untyped => "untyped".to_string(),
+                        TrackType::Effect => "effect".to_string(),
+                        TrackType::Music => "music".to_string(),
+                    }),
                     target_group: tr.target_group.clone(),
                     clips: tr
                         .clips
@@ -1568,6 +1624,9 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
                             duration_sec: c.duration_sec,
                             fade_in_sec: c.fade_in_sec,
                             fade_out_sec: c.fade_out_sec,
+                            audio_file: c.audio_file.clone(),
+                            time_stretch: c.time_stretch,
+                            source_duration_sec: c.source_duration_sec,
                             elements: c.inline_fx.iter().map(fx_to_xml).collect(),
                         })
                         .collect(),
@@ -1818,6 +1877,7 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
             duration_value: s.duration_value.max(0.05),
             duration_unit,
             block_refs: refs,
+            timeline_ref: s.timeline_ref,
         });
     }
 
@@ -1854,11 +1914,29 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
                     fade_in_sec: c.fade_in_sec,
                     fade_out_sec: c.fade_out_sec,
                     inline_fx,
+                    audio_file: c.audio_file,
+                    time_stretch: c.time_stretch,
+                    source_duration_sec: c.source_duration_sec,
                 });
             }
+            let inferred_type = match tr.track_type.as_deref() {
+                Some("music") => TrackType::Music,
+                Some("effect") => TrackType::Effect,
+                Some("untyped") => TrackType::Untyped,
+                _ => {
+                    if clips.iter().any(|c| c.audio_file.is_some()) {
+                        TrackType::Music
+                    } else if !clips.is_empty() {
+                        TrackType::Effect
+                    } else {
+                        TrackType::Untyped
+                    }
+                }
+            };
             tracks.push(TrackDef {
                 id: tr.id,
                 name: tr.name,
+                track_type: inferred_type,
                 target_group: tr.target_group,
                 clips,
             });
@@ -1885,6 +1963,7 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
                 offset_sec: a.offset_sec,
                 transient_sensitivity: a.transient_sensitivity,
             }),
+            loop_timeline: tl.loop_timeline,
             tracks,
         });
     }
@@ -2246,6 +2325,7 @@ mod tests {
             duration_value: 2.5,
             duration_unit: DurationUnit::Seconds,
             block_refs: vec!["blk_fx".into()],
+            timeline_ref: None,
         });
 
         let xml_out = serialize_show_xml(&show).expect("serialize");

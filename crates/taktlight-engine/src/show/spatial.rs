@@ -115,7 +115,7 @@ impl GridPos {
         let (sin_r, cos_r) = self.rotation.to_radians().sin_cos();
         let rx = sx * cos_r - sy * sin_r;
         let ry = sx * sin_r + sy * cos_r;
-        [(self.x + rx).clamp(0.0, 1.0), (self.y + ry).clamp(0.0, 1.0)]
+        [self.x + rx, self.y + ry]
     }
 }
 
