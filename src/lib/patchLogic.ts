@@ -487,8 +487,5 @@ export function transformCellUv(
   const cosR = Math.cos(rad);
   const rx = sx * cosR - sy * sinR;
   const ry = sx * sinR + sy * cosR;
-  return [
-    Math.max(0, Math.min(1, gridPos.x + rx)),
-    Math.max(0, Math.min(1, gridPos.y + ry)),
-  ];
+  return [gridPos.x + rx, gridPos.y + ry];
 }

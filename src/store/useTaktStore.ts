@@ -40,8 +40,10 @@ import {
   type TempoPointDef,
   type TimelineDef,
   type TrackDef,
+  type TrackType,
   type Waveform1D,
 } from "../lib/mixerLogic";
+import { computeTimelineContentDurationSec } from "../lib/timelineLogic";
 import {
   CompiledCell,
   defaultCalibration,
@@ -58,7 +60,7 @@ import {
 
 export type DisplayFormat = "DEC" | "HEX" | "PCT";
 export type StudioOutputMode = "edit_preview" | "blind" | "live";
-export type StudioSubMode = "builder" | "live_busking";
+export type StudioSubMode = "builder" | "live_busking" | "timeline";
 export type MappingOverlayMode = "off" | "key" | "midi";
 
 export interface BankDefaultFade {
@@ -318,6 +320,19 @@ function createInitialShowState(): ShowStateDto {
         duration_unit: "beats",
         block_refs: [],
       },
+      {
+        id: "sc_tl_cyber_intro",
+        name: "Cyber Intro",
+        bank: "Bank 1",
+        target_group: null,
+        priority: 10,
+        fade_in_sec: 0,
+        fade_out_sec: 0,
+        duration_value: 16,
+        duration_unit: "seconds",
+        block_refs: [],
+        timeline_ref: "tl_cyber_intro",
+      },
     ],
     timelines: [
       {
@@ -326,17 +341,13 @@ function createInitialShowState(): ShowStateDto {
         duration_sec: 16.0,
         grid_offset_sec: 0.0,
         tempo_map: [{ at_sec: 0.0, bpm: 120.0 }],
-        audio_track: {
-          file: "audio/cyber_intro.wav",
-          abs_fallback: null,
-          sha256: null,
-          offset_sec: 0.0,
-          transient_sensitivity: 0.65,
-        },
+        audio_track: null,
+        loop_timeline: false,
         tracks: [
           {
             id: "trk_1",
             name: "Tube Wave",
+            track_type: "effect",
             target_group: "all",
             clips: [
               {
@@ -397,7 +408,7 @@ function createInitialState() {
   }
 
   return {
-    activeTab: "monitor" as WorkspaceTab,
+    activeTab: "patch" as WorkspaceTab,
     selectedUniverseId: 1,
     universes: DEFAULT_UNIVERSES,
     dmxByUniverse: createInitialDmxMap(DEFAULT_UNIVERSES),
@@ -436,9 +447,16 @@ function createInitialState() {
     activeTimelineId: null as string | null,
     timelinePlaying: false,
     timelinePlayheadSec: 0,
+    timelinePlayheadAnchorMs: typeof performance !== "undefined" ? performance.now() : 0,
     latencyOffsetMs: 0,
     _simTimelineAnchorTSec: 0,
     audioAnalysisByTimeline: {} as Record<string, AudioAnalysisResult>,
+    audioAnalysisByClipKey: {} as Record<string, AudioAnalysisResult>,
+    selectedTimelineClip: null as { trackId: string; clipIndex: number } | null,
+    timelineTimeUnit: "beats" as "beats" | "seconds",
+    timelineSensitivity: 0.65,
+    timelineShowTransients: true,
+    timelineProjectTransients: false,
     compiledCells: [] as CompiledCell[],
     cellPreviewRgbd: new Uint8Array(0),
     canUndo: false,
@@ -474,6 +492,7 @@ function createInitialState() {
     activeGroupFilterId: "all",
     canvasOrderRule: "linear" as OrderRuleStr,
     activeShaderGizmoBlockId: null as string | null,
+  draggingSceneId: null as string | null,
 
     _simUndo: [] as SimUndoEntry[],
     _simRedo: [] as SimUndoEntry[],
@@ -1025,10 +1044,11 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
       const tg = sc.target_group ? ` target_group="${esc(sc.target_group)}"` : "";
       const dv = sc.duration_value ?? 4;
       const du = sc.duration_unit ?? "beats";
+      const tr = sc.timeline_ref ? ` timeline_ref="${esc(sc.timeline_ref)}"` : "";
       const refs = sc.block_refs
         .map((r) => `      <BlockRef ref="${esc(r)}" />`)
         .join("\n");
-      return `    <Scene id="${esc(sc.id)}" name="${esc(sc.name)}"${bStr}${tg} priority="${sc.priority}" fade_in_sec="${sc.fade_in_sec}" fade_out_sec="${sc.fade_out_sec}" duration_value="${dv}" duration_unit="${du}">\n${refs}\n    </Scene>`;
+      return `    <Scene id="${esc(sc.id)}" name="${esc(sc.name)}"${bStr}${tg} priority="${sc.priority}" fade_in_sec="${sc.fade_in_sec}" fade_out_sec="${sc.fade_out_sec}" duration_value="${dv}" duration_unit="${du}"${tr}>\n${refs}\n    </Scene>`;
     })
     .join("\n");
 
@@ -1043,20 +1063,23 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
       const trackLines = tl.tracks
         .map((trk) => {
           const tg = trk.target_group ? ` target_group="${esc(trk.target_group)}"` : "";
+          const tt = trk.track_type ? ` track_type="${esc(trk.track_type)}"` : "";
           const clipLines = trk.clips
             .map((clip) => {
               const rb = clip.ref_block ? ` ref_block="${esc(clip.ref_block)}"` : "";
+              const af = clip.audio_file ? ` audio_file="${esc(clip.audio_file)}"` : "";
               if (clip.inline_fx.length === 0) {
-                return `        <Clip${rb} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}" />`;
+                return `        <Clip${rb}${af} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}" />`;
               }
               const inlineXml = serializeFxElementsXml(clip.inline_fx, "          ", esc);
-              return `        <Clip${rb} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}">\n${inlineXml}\n        </Clip>`;
+              return `        <Clip${rb}${af} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}">\n${inlineXml}\n        </Clip>`;
             })
             .join("\n");
-          return `      <Track id="${esc(trk.id)}" name="${esc(trk.name)}"${tg}>\n${clipLines}\n      </Track>`;
+          return `      <Track id="${esc(trk.id)}" name="${esc(trk.name)}"${tt}${tg}>\n${clipLines}\n      </Track>`;
         })
         .join("\n");
-      return `    <Timeline id="${esc(tl.id)}" name="${esc(tl.name)}" duration_sec="${tl.duration_sec}" grid_offset_sec="${tl.grid_offset_sec}">\n      <TempoMap>\n${tempoLines}\n      </TempoMap>\n${audioLine}${trackLines}\n    </Timeline>`;
+      const lp = tl.loop_timeline ? ` loop_timeline="true"` : "";
+      return `    <Timeline id="${esc(tl.id)}" name="${esc(tl.name)}" duration_sec="${tl.duration_sec}" grid_offset_sec="${tl.grid_offset_sec}"${lp}>\n      <TempoMap>\n${tempoLines}\n      </TempoMap>\n${audioLine}${trackLines}\n    </Timeline>`;
     })
     .join("\n");
 
@@ -1389,6 +1412,7 @@ function parseShowXmlLocally(
       duration_value: Number(el.getAttribute("duration_value") ?? 4),
       duration_unit,
       block_refs,
+      timeline_ref: el.getAttribute("timeline_ref") || null,
     });
   });
 
@@ -1425,11 +1449,13 @@ function parseShowXmlLocally(
           fade_in_sec: Number(cEl.getAttribute("fade_in_sec") ?? 0),
           fade_out_sec: Number(cEl.getAttribute("fade_out_sec") ?? 0),
           inline_fx: parseFxElementsXml(cEl),
+          audio_file: cEl.getAttribute("audio_file") || null,
         });
       });
       tracks.push({
         id: trkEl.getAttribute("id") ?? `trk_${tracks.length + 1}`,
         name: trkEl.getAttribute("name") ?? "Track",
+        track_type: (trkEl.getAttribute("track_type") as TrackType) ?? undefined,
         target_group: trkEl.getAttribute("target_group"),
         clips,
       });
@@ -1442,6 +1468,7 @@ function parseShowXmlLocally(
       grid_offset_sec: Number(el.getAttribute("grid_offset_sec") ?? 0),
       tempo_map,
       audio_track,
+      loop_timeline: el.getAttribute("loop_timeline") === "true",
       tracks,
     });
   });
@@ -1500,9 +1527,16 @@ export interface TaktStoreState {
   activeTimelineId: string | null;
   timelinePlaying: boolean;
   timelinePlayheadSec: number;
+  timelinePlayheadAnchorMs: number;
   latencyOffsetMs: number;
   _simTimelineAnchorTSec: number;
   audioAnalysisByTimeline: Record<string, AudioAnalysisResult>;
+  audioAnalysisByClipKey: Record<string, AudioAnalysisResult>;
+  selectedTimelineClip: { trackId: string; clipIndex: number } | null;
+  timelineTimeUnit: "beats" | "seconds";
+  timelineSensitivity: number;
+  timelineShowTransients: boolean;
+  timelineProjectTransients: boolean;
   compiledCells: CompiledCell[];
   cellPreviewRgbd: Uint8Array;
   canUndo: boolean;
@@ -1535,6 +1569,7 @@ export interface TaktStoreState {
   activeGroupFilterId: string;
   canvasOrderRule: OrderRuleStr;
   activeShaderGizmoBlockId: string | null;
+  draggingSceneId: string | null;
   _simUndo: SimUndoEntry[];
   _simRedo: SimUndoEntry[];
   _simNextSeq: number;
@@ -1644,6 +1679,23 @@ export interface TaktStoreState {
     durationSec?: number,
     sensitivity?: number,
   ) => Promise<AudioAnalysisResult>;
+  setClipAudioAnalysis: (
+    clipKey: string,
+    result: AudioAnalysisResult,
+    timelineId?: string,
+  ) => void;
+  createTimelineSceneInBank: (
+    bank: string | null,
+    name?: string,
+  ) => Promise<SceneDef>;
+  convertSceneToTimeline: (sceneId: string) => Promise<string | null>;
+  setSelectedTimelineClip: (
+    clip: { trackId: string; clipIndex: number } | null,
+  ) => void;
+  setTimelineTimeUnit: (unit: "beats" | "seconds") => void;
+  setTimelineSensitivity: (sens: number) => void;
+  setTimelineShowTransients: (enabled: boolean) => void;
+  setTimelineProjectTransients: (enabled: boolean) => void;
   resolveSplitFixtures: () => Promise<void>;
   selectFixtureInstance: (id: string | null) => void;
   setFocusedPatchUniverse: (universeId: number) => void;
@@ -1699,6 +1751,7 @@ export interface TaktStoreState {
   setActiveGroupFilterId: (groupId: string) => void;
   setCanvasOrderRule: (rule: OrderRuleStr) => void;
   setActiveShaderGizmoBlockId: (blockId: string | null) => void;
+  setDraggingSceneId: (sceneId: string | null) => void;
   dismissToast: () => void;
   resetForTest: () => void;
 }
@@ -1706,7 +1759,31 @@ export interface TaktStoreState {
 export const useTaktStore = create<TaktStoreState>((set, get) => ({
   ...createInitialState(),
 
-  setActiveTab: (tab) => set({ activeTab: tab }),
+  setActiveTab: (tab) =>
+    set((state) => {
+      if (tab === "timeline") {
+        const tlScene = state.showState.scenes.find((s) => Boolean(s.timeline_ref));
+        return {
+          activeTab: "studio",
+          studioSubMode: "builder",
+          ...(tlScene
+            ? {
+                selectedSceneId: tlScene.id,
+                multiSelectedSceneIds: [tlScene.id],
+                activeTimelineId: tlScene.timeline_ref ?? state.activeTimelineId,
+              }
+            : {}),
+        };
+      }
+      return {
+        activeTab: tab,
+        studioSubMode:
+          state.studioSubMode === "timeline" &&
+          (tab === "studio" || tab === "scenes" || tab === "grid" || tab === "palettes")
+            ? "builder"
+            : state.studioSubMode,
+      };
+    }),
 
   applyBinaryFrame: (buffer) => {
     const decoded = decodeBinaryFrame(buffer);
@@ -1771,10 +1848,35 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
           snapshot.timeline_playing !== undefined
             ? snapshot.timeline_playing
             : state.timelinePlaying,
-        timelinePlayheadSec:
-          snapshot.timeline_playhead_sec !== undefined
-            ? snapshot.timeline_playhead_sec
-            : state.timelinePlayheadSec,
+        ...(() => {
+          const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+          const nextPlaying =
+            snapshot.timeline_playing !== undefined
+              ? snapshot.timeline_playing
+              : state.timelinePlaying;
+          const snapHead = snapshot.timeline_playhead_sec;
+          if (snapHead === undefined) {
+            return {
+              timelinePlayheadSec: state.timelinePlayheadSec,
+              timelinePlayheadAnchorMs: state.timelinePlayheadAnchorMs,
+            };
+          }
+          if (nextPlaying && state.timelinePlaying) {
+            const predicted =
+              state.timelinePlayheadSec +
+              Math.max(0, (nowMs - state.timelinePlayheadAnchorMs) / 1000);
+            if (Math.abs(predicted - snapHead) < 0.12) {
+              return {
+                timelinePlayheadSec: state.timelinePlayheadSec,
+                timelinePlayheadAnchorMs: state.timelinePlayheadAnchorMs,
+              };
+            }
+          }
+          return {
+            timelinePlayheadSec: snapHead,
+            timelinePlayheadAnchorMs: nowMs,
+          };
+        })(),
         latencyOffsetMs:
           snapshot.latency_offset_ms !== undefined
             ? snapshot.latency_offset_ms
@@ -2123,7 +2225,43 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         state.jitterSamplesUs.length >= 256
           ? [...state.jitterSamplesUs.slice(1), sample]
           : [...state.jitterSamplesUs, sample];
-      set({ jitterSamplesUs: nextSamples });
+
+      if (state.timelinePlaying && state.activeTimelineId) {
+        const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+        const tl = state.showState.timelines.find((t) => t.id === state.activeTimelineId);
+        const contentDur = tl ? computeTimelineContentDurationSec(tl.tracks) : 0;
+        const elapsed = Math.max(0, (nowMs - state.timelinePlayheadAnchorMs) / 1000);
+        const rawHead = state.timelinePlayheadSec + elapsed;
+        if (contentDur > 0 && rawHead >= contentDur) {
+          if (tl?.loop_timeline) {
+            const wrapped = rawHead % contentDur;
+            set({
+              jitterSamplesUs: nextSamples,
+              timelinePlayheadSec: wrapped,
+              timelinePlayheadAnchorMs: nowMs,
+              _simTimelineAnchorTSec: state.telemetry.tSec,
+            });
+          } else {
+            const ownerScene = state.showState.scenes.find(
+              (s) => s.timeline_ref === state.activeTimelineId,
+            );
+            set({
+              jitterSamplesUs: nextSamples,
+              timelinePlaying: false,
+              timelinePlayheadSec: contentDur,
+              timelinePlayheadAnchorMs: nowMs,
+              activeScenes: ownerScene
+                ? state.activeScenes.filter((a) => a.scene_id !== ownerScene.id)
+                : state.activeScenes,
+            });
+          }
+        } else {
+          set({ jitterSamplesUs: nextSamples });
+        }
+      } else {
+        set({ jitterSamplesUs: nextSamples });
+      }
+
       get().applyBinaryFrame(
         synthesizeSimulationBuffer({
           ...get(),
@@ -2863,6 +3001,19 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   },
 
   upsertGroup: async (group) => {
+    const cleanName = group.name.trim();
+    const existingGroups = get().showState.groups;
+    const duplicate = existingGroups.find(
+      (g) =>
+        g.id !== group.id &&
+        g.name.trim().toLowerCase() === cleanName.toLowerCase(),
+    );
+    if (duplicate) {
+      set({
+        patchToast: `Group "${cleanName}" already exists. Choose a unique group name.`,
+      });
+      return;
+    }
     if (isTauriEnvironment()) {
       const snapshot = await invoke<ShowSnapshotDto>("upsert_group_command", {
         group,
@@ -3045,12 +3196,17 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   },
 
   triggerScene: async (sceneId, tSec) => {
+    const stateBefore = get();
+    const targetScene = stateBefore.showState.scenes.find((s) => s.id === sceneId);
     if (isTauriEnvironment()) {
       const snap = await invoke<EngineSnapshotDto>("trigger_scene_command", {
         sceneId,
         tSec: tSec ?? null,
       });
       get().applyEngineSnapshot(snap);
+      if (targetScene?.timeline_ref) {
+        await get().setTimelineTransport(targetScene.timeline_ref, true, 0, tSec);
+      }
       return;
     }
     const state = get();
@@ -3060,6 +3216,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     const normBank = scene.bank?.trim() ? scene.bank.trim() : null;
     const isStackable = Boolean(normBank && state.stackableBanks[normBank]);
 
+    let releasedTimelineRef: string | null = null;
     const remaining = state.activeScenes
       .filter((inst) => {
         const a = computeSceneAlphaAt(inst, tNow);
@@ -3073,6 +3230,10 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
           inst.bank === normBank &&
           inst.release_t_sec === null
         ) {
+          const prevScene = state.showState.scenes.find((s) => s.id === inst.scene_id);
+          if (prevScene?.timeline_ref) {
+            releasedTimelineRef = prevScene.timeline_ref;
+          }
           return {
             ...inst,
             release_start_alpha: computeSceneAlphaAt(inst, tNow),
@@ -3096,20 +3257,44 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       release_start_alpha: 1,
     };
 
-    set({
-      activeScenes: [...remaining, nextInst],
-      _simSceneSeq: seq + 1,
-    });
+    const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (scene.timeline_ref) {
+      set({
+        activeScenes: [...remaining, nextInst],
+        _simSceneSeq: seq + 1,
+        activeTimelineId: scene.timeline_ref,
+        timelinePlaying: true,
+        timelinePlayheadSec: 0,
+        timelinePlayheadAnchorMs: nowMs,
+        _simTimelineAnchorTSec: tNow,
+      });
+    } else if (releasedTimelineRef && state.activeTimelineId === releasedTimelineRef) {
+      set({
+        activeScenes: [...remaining, nextInst],
+        _simSceneSeq: seq + 1,
+        timelinePlaying: false,
+        timelinePlayheadAnchorMs: nowMs,
+      });
+    } else {
+      set({
+        activeScenes: [...remaining, nextInst],
+        _simSceneSeq: seq + 1,
+      });
+    }
     get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
   },
 
   releaseScene: async (sceneId, tSec) => {
+    const targetScene = get().showState.scenes.find((s) => s.id === sceneId);
     if (isTauriEnvironment()) {
       const snap = await invoke<EngineSnapshotDto>("release_scene_command", {
         sceneId,
         tSec: tSec ?? null,
       });
       get().applyEngineSnapshot(snap);
+      if (targetScene?.timeline_ref && get().activeTimelineId === targetScene.timeline_ref) {
+        await get().setTimelineTransport(targetScene.timeline_ref, false, undefined, tSec);
+      }
       return;
     }
     const state = get();
@@ -3128,7 +3313,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         (inst) =>
           !(inst.release_t_sec !== null && computeSceneAlphaAt(inst, tNow) <= 1e-6),
       );
-    set({ activeScenes: updated });
+    const stopTl = Boolean(
+      targetScene?.timeline_ref && state.activeTimelineId === targetScene.timeline_ref,
+    );
+    set({
+      activeScenes: updated,
+      ...(stopTl ? { timelinePlaying: false } : {}),
+    });
     get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
   },
 
@@ -3139,6 +3330,9 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         { tSec: tSec ?? null },
       );
       get().applyEngineSnapshot(snap);
+      if (get().timelinePlaying) {
+        await get().setTimelineTransport(get().activeTimelineId, false, undefined, tSec);
+      }
       return;
     }
     const state = get();
@@ -3157,7 +3351,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         (inst) =>
           !(inst.release_t_sec !== null && computeSceneAlphaAt(inst, tNow) <= 1e-6),
       );
-    set({ activeScenes: updated });
+    set({ activeScenes: updated, timelinePlaying: false });
     get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
   },
 
@@ -3346,6 +3540,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   },
 
   setTimelineTransport: async (timelineId, playing, playheadSec, tSec) => {
+    const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (isTauriEnvironment()) {
       const snap = await invoke<EngineSnapshotDto>(
         "set_timeline_transport_command",
@@ -3357,6 +3552,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         },
       );
       get().applyEngineSnapshot(snap);
+      set({ timelinePlayheadAnchorMs: nowMs });
       return;
     }
     const state = get();
@@ -3367,17 +3563,23 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         activeTimelineId: null,
         timelinePlaying: false,
         timelinePlayheadSec: 0,
+        timelinePlayheadAnchorMs: nowMs,
         _simTimelineAnchorTSec: tNow,
       });
     } else {
+      const currentEffectiveHead = state.timelinePlaying
+        ? state.timelinePlayheadSec +
+          Math.max(0, (nowMs - state.timelinePlayheadAnchorMs) / 1000)
+        : state.timelinePlayheadSec;
       const nextHead =
         playheadSec !== undefined && !Number.isNaN(playheadSec)
           ? Math.max(0, playheadSec)
-          : state.timelinePlayheadSec;
+          : currentEffectiveHead;
       set({
         activeTimelineId: normId,
         timelinePlaying: playing,
         timelinePlayheadSec: nextHead,
+        timelinePlayheadAnchorMs: nowMs,
         _simTimelineAnchorTSec: tNow,
       });
     }
@@ -3438,6 +3640,145 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     return result;
   },
 
+  setClipAudioAnalysis: (clipKey, result, timelineId) => {
+    set((state) => ({
+      audioAnalysisByClipKey: {
+        ...state.audioAnalysisByClipKey,
+        [clipKey]: result,
+      },
+      ...(timelineId
+        ? {
+            audioAnalysisByTimeline: {
+              ...state.audioAnalysisByTimeline,
+              [timelineId]: result,
+            },
+          }
+        : {}),
+    }));
+  },
+
+  createTimelineSceneInBank: async (bank, customName) => {
+    const state = get();
+    const normBank = bank && bank.trim() ? bank.trim() : null;
+    if (normBank && !state.sceneBanks.includes(normBank)) {
+      set({ sceneBanks: [...state.sceneBanks, normBank] });
+    }
+    const defaults = normBank
+      ? (state.bankDefaultFades[normBank] ?? { fadeInSec: 0, fadeOutSec: 0 })
+      : { fadeInSec: 0, fadeOutSec: 0 };
+
+    let seq = state.showState.timelines.length + 1;
+    while (
+      state.showState.timelines.some((t) => t.id === `tl_show_${seq}`) ||
+      state.showState.scenes.some((s) => s.id === `sc_tl_${seq}`)
+    ) {
+      seq += 1;
+    }
+    const timelineId = `tl_show_${seq}`;
+    const sceneId = `sc_tl_${seq}`;
+    const tlName = customName?.trim() || `Timeline ${seq}`;
+
+    const newTimeline: TimelineDef = {
+      id: timelineId,
+      name: tlName,
+      duration_sec: 32,
+      grid_offset_sec: 0,
+      tempo_map: [{ at_sec: 0, bpm: state.showState.bpm || 120 }],
+      audio_track: null,
+      loop_timeline: false,
+      tracks: [
+        {
+          id: "trk_1",
+          name: "Track 1",
+          track_type: "untyped",
+          target_group: "all",
+          clips: [],
+        },
+      ],
+    };
+
+    const newScene: SceneDef = {
+      id: sceneId,
+      name: tlName,
+      bank: normBank,
+      target_group: null,
+      priority: normBank ? 10 : 25,
+      fade_in_sec: defaults.fadeInSec,
+      fade_out_sec: defaults.fadeOutSec,
+      duration_value: 32,
+      duration_unit: "seconds",
+      block_refs: [],
+      timeline_ref: timelineId,
+    };
+
+    await get().upsertTimeline(newTimeline);
+    await get().upsertScene(newScene);
+    set({
+      selectedSceneId: sceneId,
+      multiSelectedSceneIds: [sceneId],
+      activeTimelineId: timelineId,
+      studioSubMode: "builder",
+    });
+    return newScene;
+  },
+
+  convertSceneToTimeline: async (sceneId) => {
+    const state = get();
+    const scene = state.showState.scenes.find((s) => s.id === sceneId);
+    if (!scene) return null;
+    if (scene.timeline_ref) {
+      set({ activeTimelineId: scene.timeline_ref, studioSubMode: "builder" });
+      return scene.timeline_ref;
+    }
+
+    let seq = state.showState.timelines.length + 1;
+    while (state.showState.timelines.some((t) => t.id === `tl_show_${seq}`)) {
+      seq += 1;
+    }
+    const timelineId = `tl_show_${seq}`;
+    const newTimeline: TimelineDef = {
+      id: timelineId,
+      name: scene.name,
+      duration_sec: 32,
+      grid_offset_sec: 0,
+      tempo_map: [{ at_sec: 0, bpm: state.showState.bpm || 120 }],
+      audio_track: null,
+      loop_timeline: false,
+      tracks: [
+        {
+          id: "trk_1",
+          name: "Track 1",
+          track_type: "untyped",
+          target_group: "all",
+          clips: [],
+        },
+      ],
+    };
+
+    await get().upsertTimeline(newTimeline);
+    await get().upsertScene({
+      ...scene,
+      block_refs: [],
+      timeline_ref: timelineId,
+    });
+    set({
+      selectedSceneId: scene.id,
+      multiSelectedSceneIds: [scene.id],
+      activeTimelineId: timelineId,
+      studioSubMode: "builder",
+    });
+    return timelineId;
+  },
+
+  setSelectedTimelineClip: (clip) => set({ selectedTimelineClip: clip }),
+  setTimelineTimeUnit: (unit) => set({ timelineTimeUnit: unit }),
+  setTimelineSensitivity: (sens) =>
+    set({ timelineSensitivity: Math.max(0, Math.min(1, sens)) }),
+  setTimelineShowTransients: (enabled) =>
+    set({ timelineShowTransients: enabled }),
+  setTimelineProjectTransients: (enabled) =>
+    set({ timelineProjectTransients: enabled }),
+
   setFocusedPatchUniverse: (universeId) =>
     set({ focusedPatchUniverse: Math.max(1, universeId) }),
 
@@ -3451,11 +3792,26 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   setStudioSubMode: (mode) => set({ studioSubMode: mode }),
 
   selectSceneForEdit: (sceneId, multiSelect = false) => {
+    const prev = get();
+    const target = sceneId
+      ? prev.showState.scenes.find((s) => s.id === sceneId) ?? null
+      : null;
+    const clearingPausedTimeline =
+      Boolean(prev.activeTimelineId) &&
+      !prev.timelinePlaying &&
+      !target?.timeline_ref;
+
     set((state) => {
+      const nextTimelineId = target?.timeline_ref
+        ? target.timeline_ref
+        : clearingPausedTimeline
+          ? null
+          : state.activeTimelineId;
       if (!multiSelect || !sceneId) {
         return {
           selectedSceneId: sceneId,
           multiSelectedSceneIds: sceneId ? [sceneId] : [],
+          activeTimelineId: nextTimelineId,
         };
       }
       const exists = state.multiSelectedSceneIds.includes(sceneId);
@@ -3465,8 +3821,12 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       return {
         selectedSceneId: sceneId,
         multiSelectedSceneIds: nextMulti,
+        activeTimelineId: nextTimelineId,
       };
     });
+    if (clearingPausedTimeline && isTauriEnvironment()) {
+      void get().setTimelineTransport(null, false, 0);
+    }
     if (!isTauriEnvironment()) {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
@@ -3644,6 +4004,15 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   createGroupFromSelectedFixtures: async (groupName) => {
     const state = get();
     const clean = groupName.trim() || `Group ${state.showState.groups.length + 1}`;
+    const duplicate = state.showState.groups.find(
+      (g) => g.name.trim().toLowerCase() === clean.toLowerCase(),
+    );
+    if (duplicate) {
+      set({
+        patchToast: `Group "${clean}" already exists. Choose a unique group name.`,
+      });
+      return;
+    }
     const slugBase = `grp_${clean.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "group"}`;
     let gid = slugBase;
     let suffix = 2;
@@ -3709,8 +4078,14 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       block_refs: [],
     };
 
+    const shouldClearTimeline =
+      Boolean(state.activeTimelineId) && !state.timelinePlaying;
+
     if (isTauriEnvironment()) {
       await get().upsertScene(newScene);
+      if (shouldClearTimeline) {
+        await get().setTimelineTransport(null, false, 0);
+      }
       set({
         selectedSceneId: sceneId,
         multiSelectedSceneIds: [sceneId],
@@ -3726,6 +4101,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     const nextRev = state.showRevision + 1;
     set({
       showState: nextShow,
+      ...(shouldClearTimeline ? { activeTimelineId: null } : {}),
       selectedSceneId: sceneId,
       multiSelectedSceneIds: [sceneId],
       patchToast: `Created ${sceneName}`,
@@ -4119,6 +4495,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   setActiveShaderGizmoBlockId: (blockId) =>
     set({ activeShaderGizmoBlockId: blockId }),
+  setDraggingSceneId: (sceneId) => set({ draggingSceneId: sceneId }),
 
   dismissToast: () => set({ patchToast: null }),
 

@@ -197,6 +197,67 @@ export function sanitizeSlug(raw: string): string {
     .replace(/^_+|_+$/g, "");
 }
 
+export function parseOflJsonToDraft(rawJson: string): FixtureBuilderDraft | null {
+  try {
+    const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return null;
+    const base = createDefaultBuilderDraft();
+    const avail = (parsed.availableChannels ?? {}) as Record<string, Record<string, unknown>>;
+    const tmpl = (parsed.templateChannels ?? {}) as Record<string, Record<string, unknown>>;
+    const modes = Array.isArray(parsed.modes)
+      ? (parsed.modes as { name?: string; channels?: unknown[] }[])
+      : [];
+    const matrix = parsed.matrix as { pixelCount?: number[] } | undefined;
+    const pixelCount = Array.isArray(matrix?.pixelCount) ? matrix.pixelCount : null;
+    const isMatrix = Boolean(pixelCount && pixelCount.length >= 2);
+
+    const allChKeys = [...Object.keys(avail), ...Object.keys(tmpl)].map((k) =>
+      k.toLowerCase(),
+    );
+    const hasWhite = allChKeys.some((k) => k.includes("white"));
+    const hasWheel = allChKeys.some((k) => k.includes("wheel"));
+    const colorMode: FixtureBuilderDraft["colorMode"] = hasWheel
+      ? "wheel"
+      : hasWhite
+        ? "rgbw"
+        : "rgb";
+
+    const includeMasterDimmer = Object.keys(avail).some((k) =>
+      k.toLowerCase().includes("dimmer"),
+    );
+    const includeStrobe = Object.keys(avail).some(
+      (k) => k.toLowerCase().includes("strobe") || k.toLowerCase().includes("shutter"),
+    );
+
+    const categories = Array.isArray(parsed.categories) ? parsed.categories : [];
+    const meta = parsed.meta as { authors?: string[] } | undefined;
+
+    return {
+      ...base,
+      name: typeof parsed.name === "string" && parsed.name.trim() ? parsed.name : base.name,
+      shortName:
+        typeof parsed.shortName === "string" && parsed.shortName.trim()
+          ? parsed.shortName
+          : base.shortName,
+      category: typeof categories[0] === "string" ? categories[0] : base.category,
+      author:
+        Array.isArray(meta?.authors) && typeof meta.authors[0] === "string"
+          ? meta.authors[0]
+          : base.author,
+      modeName: modes[0]?.name ?? base.modeName,
+      includeMasterDimmer,
+      includeStrobe,
+      colorMode,
+      isMatrix,
+      pixelCountX: isMatrix && pixelCount ? Math.max(1, Number(pixelCount[0]) || 1) : 1,
+      pixelCountY: isMatrix && pixelCount ? Math.max(1, Number(pixelCount[1]) || 1) : 1,
+      pixelCountZ: isMatrix && pixelCount ? Math.max(1, Number(pixelCount[2]) || 1) : 1,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function buildStrobeCapabilities(
   minHz: number,
   maxHz: number,

@@ -110,6 +110,7 @@ export interface SceneDef {
   duration_value?: number;
   duration_unit?: DurationUnit;
   block_refs: string[];
+  timeline_ref?: string | null;
 }
 
 export interface BeatClockAnchor {
@@ -143,6 +144,8 @@ export interface AudioTrackDef {
   transient_sensitivity: number;
 }
 
+export type TrackType = "untyped" | "effect" | "music";
+
 export interface ClipDef {
   ref_block: string | null;
   start_sec: number;
@@ -150,11 +153,15 @@ export interface ClipDef {
   fade_in_sec: number;
   fade_out_sec: number;
   inline_fx: FxElementDef[];
+  audio_file?: string | null;
+  time_stretch?: boolean;
+  source_duration_sec?: number | null;
 }
 
 export interface TrackDef {
   id: string;
   name: string;
+  track_type?: TrackType;
   target_group: string | null;
   clips: ClipDef[];
 }
@@ -166,6 +173,7 @@ export interface TimelineDef {
   grid_offset_sec: number;
   tempo_map: TempoPointDef[];
   audio_track: AudioTrackDef | null;
+  loop_timeline?: boolean;
   tracks: TrackDef[];
 }
 
@@ -952,17 +960,17 @@ export function evaluateSpatialShader2DPhase(args: {
     centerY,
     transform,
   } = args;
-  let txX = normXy[0];
-  let txY = normXy[1];
-  if (transform === "mirror_x") txX = 1 - txX;
-  else if (transform === "mirror_y") txY = 1 - txY;
-  else if (transform === "invert") {
-    txX = 1 - txX;
-    txY = 1 - txY;
+  let dx = normXy[0] - centerX;
+  let dy = normXy[1] - centerY;
+  if (transform === "mirror_x") {
+    dx = -dx;
+  } else if (transform === "mirror_y") {
+    dy = -dy;
+  } else if (transform === "invert") {
+    dx = -dx;
+    dy = -dy;
   }
   const phi = remEuclid(basePhaseCycles, 1);
-  const dx = txX - centerX;
-  const dy = txY - centerY;
   const k = spatialFreq / Math.max(0.1, Math.min(4, colorWidth || 1));
   const theta = (directionDeg * Math.PI) / 180;
 
@@ -970,9 +978,9 @@ export function evaluateSpatialShader2DPhase(args: {
     return clamp01(remEuclid(k * (dx * Math.cos(theta) + dy * Math.sin(theta)) - phi, 1));
   }
   if (shader === "radial_wave") {
-    return clamp01(
-      0.5 + 0.5 * Math.sin(Math.PI * 2 * (k * Math.hypot(dx, dy) - phi)),
-    );
+    const base =
+      0.5 + 0.5 * Math.sin(Math.PI * 2 * (k * Math.hypot(dx, dy) - phi));
+    return clamp01(transform === "invert" ? 1 - base : base);
   }
   if (shader === "pinwheel") {
     return clamp01(
@@ -985,8 +993,8 @@ export function evaluateSpatialShader2DPhase(args: {
   return clamp01(
     0.5 +
       0.25 *
-        (Math.sin(Math.PI * 2 * (k * txX + phi)) +
-          Math.sin(Math.PI * 2 * (k * txY - phi))),
+        (Math.sin(Math.PI * 2 * (k * dx + phi)) +
+          Math.sin(Math.PI * 2 * (k * dy - phi))),
   );
 }
 
@@ -1483,6 +1491,7 @@ export function evaluateSimulationLayersToDmx(args: {
     anyCellTouched: false,
     anyCellDimmerTouched: false,
     shutter: { kind: "open" } as ShutterState,
+    customChannels: {} as Record<string, number>,
   }));
   const cellStates = Array.from({ length: totalCells }, () => ({
     dimmer: 0,
@@ -1529,6 +1538,79 @@ export function evaluateSimulationLayersToDmx(args: {
     if (speedHz && speedHz > 0) return tLocal * speedHz;
     if (legacyBeats && legacyBeats > 0) return bBlock / legacyBeats;
     return cycleCycles * Math.max(1e-4, rateCycles ?? 1);
+  };
+
+  const applyScalarTraitToCell = (
+    trait: string,
+    op: MergeOp,
+    cellIdx: number,
+    scalar: number,
+    alpha: number,
+  ) => {
+    const fxIdx = cellToFixture[cellIdx];
+    const t = trait.toLowerCase();
+    if (t === "red") {
+      cellStates[cellIdx].color[0] = applyScalarMerge(
+        op,
+        cellStates[cellIdx].color[0],
+        scalar,
+        alpha,
+      );
+      cellStates[cellIdx].colorTouched = true;
+      fxStates[fxIdx].anyCellTouched = true;
+    } else if (t === "green") {
+      cellStates[cellIdx].color[1] = applyScalarMerge(
+        op,
+        cellStates[cellIdx].color[1],
+        scalar,
+        alpha,
+      );
+      cellStates[cellIdx].colorTouched = true;
+      fxStates[fxIdx].anyCellTouched = true;
+    } else if (t === "blue") {
+      cellStates[cellIdx].color[2] = applyScalarMerge(
+        op,
+        cellStates[cellIdx].color[2],
+        scalar,
+        alpha,
+      );
+      cellStates[cellIdx].colorTouched = true;
+      fxStates[fxIdx].anyCellTouched = true;
+    } else if (t === "white") {
+      cellStates[cellIdx].color = [
+        applyScalarMerge(op, cellStates[cellIdx].color[0], scalar, alpha),
+        applyScalarMerge(op, cellStates[cellIdx].color[1], scalar, alpha),
+        applyScalarMerge(op, cellStates[cellIdx].color[2], scalar, alpha),
+      ];
+      cellStates[cellIdx].colorTouched = true;
+      fxStates[fxIdx].anyCellTouched = true;
+    } else if (t === "strobe") {
+      if (alpha > 0.1) {
+        fxStates[fxIdx].shutter =
+          scalar > 0.05
+            ? { kind: "strobe_hz", hz: 1 + clamp01(scalar) * 19 }
+            : { kind: "open" };
+      }
+    } else if (t === "pan" || t === "tilt" || t.startsWith("channel:")) {
+      const key = t.startsWith("channel:") ? t.slice("channel:".length) : t;
+      const cur = fxStates[fxIdx].customChannels[key] ?? 0;
+      fxStates[fxIdx].customChannels[key] = applyScalarMerge(
+        op,
+        cur,
+        scalar,
+        alpha,
+      );
+    } else {
+      cellStates[cellIdx].dimmer = applyScalarMerge(
+        op,
+        cellStates[cellIdx].dimmer,
+        scalar,
+        alpha,
+      );
+      cellStates[cellIdx].dimmerTouched = true;
+      fxStates[fxIdx].anyCellTouched = true;
+      fxStates[fxIdx].anyCellDimmerTouched = true;
+    }
   };
 
   const foldFxBlock = (
@@ -1744,15 +1826,7 @@ export function evaluateSimulationLayersToDmx(args: {
                   offset: elem.offset,
                   isBipolarAddDimmer: elem.op === "add",
                 });
-            cellStates[cellIdx].dimmer = applyScalarMerge(
-              elem.op,
-              cellStates[cellIdx].dimmer,
-              scalar,
-              alpha,
-            );
-            cellStates[cellIdx].dimmerTouched = true;
-            fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
-            fxStates[cellToFixture[cellIdx]].anyCellDimmerTouched = true;
+            applyScalarTraitToCell(elem.trait, elem.op, cellIdx, scalar, alpha);
           }
         }
       } else if (elem.kind === "step_chase") {
@@ -1765,36 +1839,51 @@ export function evaluateSimulationLayersToDmx(args: {
           elem.speed_hz,
           elem.rate_cycles,
         );
-        for (const [cellIdx, u] of cells) {
+        if (elem.trait === "master_dimmer") {
           const val = evaluateStepChasePhase({
             basePhaseCycles: basePhase,
-            u,
-            cellCount: cells.length,
+            u: 0,
+            cellCount: Math.max(1, fixtures.length),
             activeRatio: elem.active_ratio,
             pixelsOn: elem.pixels_on,
             oneWay: elem.one_way ?? true,
             fade: elem.fade,
             amplitude: elem.amplitude,
           });
-          if (isColor) {
-            const rgb = sampleColorPal(elem.palette_ref, val);
-            cellStates[cellIdx].color = [
-              applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
-              applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
-              applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
-            ];
-            cellStates[cellIdx].colorTouched = true;
-          } else {
-            cellStates[cellIdx].dimmer = applyScalarMerge(
+          for (const fxIdx of fixtures) {
+            fxStates[fxIdx].masterDimmer = applyScalarMerge(
               elem.op,
-              cellStates[cellIdx].dimmer,
+              fxStates[fxIdx].masterDimmer,
               val,
               alpha,
             );
-            cellStates[cellIdx].dimmerTouched = true;
-            fxStates[cellToFixture[cellIdx]].anyCellDimmerTouched = true;
+            fxStates[fxIdx].masterTouched = true;
           }
-          fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+        } else {
+          for (const [cellIdx, u] of cells) {
+            const val = evaluateStepChasePhase({
+              basePhaseCycles: basePhase,
+              u,
+              cellCount: cells.length,
+              activeRatio: elem.active_ratio,
+              pixelsOn: elem.pixels_on,
+              oneWay: elem.one_way ?? true,
+              fade: elem.fade,
+              amplitude: elem.amplitude,
+            });
+            if (isColor) {
+              const rgb = sampleColorPal(elem.palette_ref, val);
+              cellStates[cellIdx].color = [
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[0], rgb[0], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[1], rgb[1], alpha),
+                applyScalarMerge(elem.op, cellStates[cellIdx].color[2], rgb[2], alpha),
+              ];
+              cellStates[cellIdx].colorTouched = true;
+              fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
+            } else {
+              applyScalarTraitToCell(elem.trait, elem.op, cellIdx, val, alpha);
+            }
+          }
         }
       } else if (elem.kind === "spatial_shader_2d") {
         const isColor = elem.trait === "color";
@@ -1809,28 +1898,20 @@ export function evaluateSimulationLayersToDmx(args: {
         const gradient = elem.gradient ?? 1;
         const grayscale = elem.grayscale ?? false;
         const colorWidth = elem.color_width ?? 1;
-
-        let minX = Infinity;
-        let maxX = -Infinity;
-        let minY = Infinity;
-        let maxY = -Infinity;
-        for (const [cellIdx] of cells) {
-          const xy = cellCanvasXy[cellIdx] ?? [0.5, 0.5];
-          if (xy[0] < minX) minX = xy[0];
-          if (xy[0] > maxX) maxX = xy[0];
-          if (xy[1] < minY) minY = xy[1];
-          if (xy[1] > maxY) maxY = xy[1];
-        }
-        const spanX = maxX - minX;
-        const spanY = maxY - minY;
+        const patternScale = spatialFreqToPatternScale(elem.spatial_freq);
+        const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
 
         for (const [cellIdx] of cells) {
           const xy = cellCanvasXy[cellIdx] ?? [0.5, 0.5];
-          const nx = spanX > 1e-4 ? (xy[0] - minX) / spanX : 0.5;
-          const ny = spanY > 1e-4 ? (xy[1] - minY) / spanY : 0.5;
+          if (
+            Math.abs(xy[0] - elem.center_x) > boxHalfNorm + 1e-6 ||
+            Math.abs(xy[1] - elem.center_y) > boxHalfNorm + 1e-6
+          ) {
+            continue;
+          }
           const s = evaluateSpatialShader2DPhase({
             shader: elem.shader,
-            normXy: [nx, ny],
+            normXy: [xy[0], xy[1]],
             basePhaseCycles: basePhase,
             spatialFreq: elem.spatial_freq,
             colorWidth,
@@ -1861,14 +1942,18 @@ export function evaluateSimulationLayersToDmx(args: {
                 : gradient < 0.01
                   ? Math.floor(s * 4) / 4
                   : s;
-            cellStates[cellIdx].dimmer = applyScalarMerge(
-              elem.op,
-              cellStates[cellIdx].dimmer,
-              val,
-              alpha,
-            );
-            cellStates[cellIdx].dimmerTouched = true;
-            fxStates[cellToFixture[cellIdx]].anyCellDimmerTouched = true;
+            if (elem.trait === "master_dimmer") {
+              const fxIdx = cellToFixture[cellIdx];
+              fxStates[fxIdx].masterDimmer = applyScalarMerge(
+                elem.op,
+                fxStates[fxIdx].masterDimmer,
+                val,
+                alpha,
+              );
+              fxStates[fxIdx].masterTouched = true;
+            } else {
+              applyScalarTraitToCell(elem.trait, elem.op, cellIdx, val, alpha);
+            }
           }
           fxStates[cellToFixture[cellIdx]].anyCellTouched = true;
         }
@@ -1895,7 +1980,23 @@ export function evaluateSimulationLayersToDmx(args: {
           if (!block) continue;
           const targetGroup = trackTarget || block.target_group?.trim() || "";
           if (!targetGroup) continue;
-          foldFxBlock(block, targetGroup, clipAlpha, tLocal, bLocal);
+          const phaseScale =
+            clip.time_stretch && clip.duration_sec > 1e-6
+              ? Math.max(
+                  0.01,
+                  (clip.source_duration_sec ??
+                    block.duration_sec ??
+                    Math.max(0.25, block.duration_beats) *
+                      (60 / Math.max(1, show.bpm || 120))) / clip.duration_sec,
+                )
+              : 1;
+          foldFxBlock(
+            block,
+            targetGroup,
+            clipAlpha,
+            tLocal * phaseScale,
+            bLocal * phaseScale,
+          );
         } else if (clip.inline_fx.length > 0) {
           const targetGroup = trackTarget || "all";
           const clipBeats = Math.max(
@@ -2028,9 +2129,6 @@ export function evaluateSimulationLayersToDmx(args: {
     const fxSt = fxStates[cellToFixture[cellIdx]];
     if (cellSt.dimmerTouched) {
       cellSt.dimmer = clamp01(cellSt.dimmer * gmClamped);
-      if (!cellSt.colorTouched) {
-        cellSt.color = [1, 1, 1];
-      }
     } else if (
       fxSt &&
       fxSt.masterTouched &&
@@ -2038,9 +2136,6 @@ export function evaluateSimulationLayersToDmx(args: {
       fxSt.masterDimmer > 0
     ) {
       cellSt.dimmer = 1.0;
-      if (!cellSt.colorTouched) {
-        cellSt.color = [1, 1, 1];
-      }
     } else {
       cellSt.dimmer = 0;
     }
@@ -2081,7 +2176,15 @@ export function evaluateSimulationLayersToDmx(args: {
 
       if (ch.role.kind === "fine_alias") continue;
       if (ch.role.kind === "unmapped") {
-        buf[addr - 1] = ch.default_value;
+        const lowerName = ch.name.toLowerCase();
+        const customVal =
+          fxSt.customChannels[lowerName] ??
+          (lowerName.includes("pan") ? fxSt.customChannels["pan"] : undefined) ??
+          (lowerName.includes("tilt") ? fxSt.customChannels["tilt"] : undefined);
+        buf[addr - 1] =
+          customVal !== undefined
+            ? Math.round(clamp01(customVal) * 255)
+            : ch.default_value;
         continue;
       }
       if (ch.role.kind === "shutter_strobe") {
