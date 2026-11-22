@@ -6,6 +6,8 @@ Cargo.lock
 node_modules/
 dist/
 .vite/
+test-results/
+playwright-report/
 
 # OS / IDE
 .DS_Store

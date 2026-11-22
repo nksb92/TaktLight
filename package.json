@@ -5,8 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:debug": "node scripts/launch-tauri-cdp.mjs",
+    "dev:debug:prebuilt": "node scripts/launch-tauri-cdp.mjs --prebuilt",
     "build": "tsc --noEmit && vite build",
     "test": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:tauri": "playwright test --config=playwright.tauri.config.ts",
+    "test:dmx-sniff": "node scripts/dmx-sniffer-cli.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -19,6 +24,7 @@
     "zustand": "^5.0.2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",
     "@types/react": "^18.3.18",
