@@ -19,6 +19,7 @@ import { useTaktStore } from "../store/useTaktStore";
 import { FixtureGrid2D } from "./FixtureGrid2D";
 import { PalettesAndControls } from "./PalettesAndControls";
 import { SceneAndFxManager } from "./SceneAndFxManager";
+import { TimelineEditor } from "./TimelineEditor";
 
 function slugGroupId(name: string, existingIds: string[]): string {
   const clean = name
@@ -69,6 +70,7 @@ export function StudioWorkspace() {
 
   const [showInspector, setShowInspector] = useState(true);
   const [showBottomDock, setShowBottomDock] = useState(true);
+  const [timelineExpanded, setTimelineExpanded] = useState(false);
   const [groupName, setGroupName] = useState("Stage Front");
   const [groupOrder, setGroupOrder] = useState<OrderRuleStr>("center_out");
   const [groupTargets, setGroupTargets] = useState(
@@ -168,6 +170,9 @@ export function StudioWorkspace() {
     showState.scenes.find((s) => s.id === selectedSceneId) ??
     showState.scenes[0] ??
     null;
+  const isTimelineScene = Boolean(activeScene?.timeline_ref);
+  const isTimelineFullWidth =
+    studioSubMode !== "live_busking" && isTimelineScene && timelineExpanded;
 
   return (
     <div className="flex-1 min-h-0 flex flex-col gap-1.5">
@@ -367,15 +372,31 @@ export function StudioWorkspace() {
         </div>
       )}
 
-      {/* Upper Daslight Split: Left = Banks & Scenes, Right = FX Inspector */}
-      <div className="flex-1 min-h-0 flex flex-col">
-        <SceneAndFxManager
-          hideUndoRedo
-          daslightUpper
-          showInspector={showInspector}
-          liveBuskingMode={studioSubMode === "live_busking"}
-        />
-      </div>
+      {/* Upper Daslight Split: When Timeline is expanded full-width, show Scene Library + 2D Grid side-by-side; otherwise Banks & Scenes + FX Inspector */}
+      {isTimelineFullWidth ? (
+        <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-1.5">
+          <div className="lg:col-span-6 min-h-0 flex flex-col">
+            <SceneAndFxManager
+              hideUndoRedo
+              daslightUpper
+              showInspector={false}
+              liveBuskingMode={false}
+            />
+          </div>
+          <div className="lg:col-span-6 min-h-0">
+            <FixtureGrid2D hideUndoRedo compact />
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 min-h-0 flex flex-col">
+          <SceneAndFxManager
+            hideUndoRedo
+            daslightUpper
+            showInspector={showInspector}
+            liveBuskingMode={studioSubMode === "live_busking"}
+          />
+        </div>
+      )}
 
       {/* Middle Horizontal GROUPS + Bottom Dock Tab Bar */}
       <section
@@ -515,25 +536,49 @@ export function StudioWorkspace() {
         </div>
       </section>
 
-      {/* Bottom Split Dock: Left = 2D Grid + Selections, Right = EDIT / LIVE Trait & Mixer Dock */}
-      {showBottomDock && (
-        <div
-          data-testid="daslight-bottom-dock"
-          className="h-[43%] min-h-[250px] shrink-0 grid grid-cols-1 lg:grid-cols-12 gap-1.5 min-h-0"
-        >
-          <div className="lg:col-span-6 h-full min-h-0">
-            <FixtureGrid2D hideUndoRedo compact />
-          </div>
-          <div className="lg:col-span-6 h-full min-h-0">
-            <PalettesAndControls
+      {/* Bottom Split Dock: Full-width Expanded Timeline OR Left = 2D Grid, Right = Timeline / EDIT / MIXER */}
+      {showBottomDock &&
+        (isTimelineFullWidth ? (
+          <div
+            data-testid="daslight-timeline-dock"
+            className="h-[48%] min-h-[270px] shrink-0 min-h-0 overflow-y-auto"
+          >
+            <TimelineEditor
               hideUndoRedo
-              hideGroups
-              daslightDock
-              forceLiveMixer={studioSubMode === "live_busking"}
+              timelineId={activeScene?.timeline_ref ?? undefined}
+              expanded={timelineExpanded}
+              onToggleExpand={() => setTimelineExpanded((v) => !v)}
             />
           </div>
-        </div>
-      )}
+        ) : (
+          <div
+            data-testid="daslight-bottom-dock"
+            className="h-[43%] min-h-[250px] shrink-0 grid grid-cols-1 lg:grid-cols-12 gap-1.5 min-h-0"
+          >
+            <div className="lg:col-span-6 h-full min-h-0">
+              <FixtureGrid2D hideUndoRedo compact />
+            </div>
+            <div className="lg:col-span-6 h-full min-h-0 overflow-y-auto">
+              {studioSubMode !== "live_busking" && isTimelineScene ? (
+                <div data-testid="daslight-timeline-dock" className="h-full min-h-0">
+                  <TimelineEditor
+                    hideUndoRedo
+                    timelineId={activeScene?.timeline_ref ?? undefined}
+                    expanded={timelineExpanded}
+                    onToggleExpand={() => setTimelineExpanded((v) => !v)}
+                  />
+                </div>
+              ) : (
+                <PalettesAndControls
+                  hideUndoRedo
+                  hideGroups
+                  daslightDock
+                  forceLiveMixer={studioSubMode === "live_busking"}
+                />
+              )}
+            </div>
+          </div>
+        ))}
 
       {groupContextMenu && (
         <div

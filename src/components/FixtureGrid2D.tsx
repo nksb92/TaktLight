@@ -1,5 +1,6 @@
 import {
   Crosshair,
+  Magnet,
   Plus,
   Redo2,
   RotateCcw,
@@ -8,9 +9,14 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { type PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type PointerEvent, type WheelEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  DEFAULT_COLOR_PALETTES,
+  evaluateSpatialShader2DPhase,
+  getPaletteColors,
+  linearRgbToSrgbHex,
   patternScaleToSpatialFreq,
+  sampleOklabStopsLinear,
   spatialFreqToPatternScale,
 } from "../lib/mixerLogic";
 import {
@@ -19,12 +25,14 @@ import {
   type GridPos,
   type OrderRuleStr,
 } from "../lib/patchLogic";
+import { registerCanvasGeometry } from "../lib/testBridge";
 import { type CellSelectionPattern, useTaktStore } from "../store/useTaktStore";
 import { NumericSlider } from "./NumericSlider";
 
-const CANVAS_WIDTH = 720;
-const CANVAS_HEIGHT = 420;
-const ROTATION_HANDLE_NORM_RADIUS = 0.065;
+const CANVAS_WIDTH = 840;
+const CANVAS_HEIGHT = 480;
+const VIEW_FIT = 0.84;
+const ROTATION_HANDLE_NORM_RADIUS = 0.115;
 
 const PATTERN_FILTERS: Array<{
   pattern: CellSelectionPattern;
@@ -61,6 +69,7 @@ export function FixtureGrid2D({
   const activeShaderGizmoBlockId = useTaktStore(
     (s) => s.activeShaderGizmoBlockId,
   );
+  const activeScenes = useTaktStore((s) => s.activeScenes);
   const canUndo = useTaktStore((s) => s.canUndo);
   const canRedo = useTaktStore((s) => s.canRedo);
 
@@ -82,8 +91,13 @@ export function FixtureGrid2D({
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [zoom, setZoom] = useState<number>(1.0);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [snapToGrid, setSnapToGrid] = useState<boolean>(true);
   const [shaderGizmoActive, setShaderGizmoActive] = useState<boolean>(false);
   const [quickGroupName, setQuickGroupName] = useState<string>("Stage Group");
+  const [dragRenderTick, setDragRenderTick] = useState<number>(0);
+  const dragOverridesRef = useRef<Record<string, GridPos>>({});
+  const rafIdRef = useRef<number | null>(null);
   const [marqueeRect, setMarqueeRect] = useState<{
     x0: number;
     y0: number;
@@ -107,7 +121,13 @@ export function FixtureGrid2D({
     | {
         fixtureId: string;
         mode: "move" | "rotate";
-        lastPos: { x: number; y: number };
+        startPos: { x: number; y: number };
+        initialGridPositions: Record<string, GridPos>;
+      }
+    | {
+        mode: "pan";
+        startClient: { x: number; y: number };
+        startPan: { x: number; y: number };
       }
     | { mode: "marquee"; startPos: { x: number; y: number } }
     | { mode: "shader_center" | "shader_angle" | "shader_scale" }
@@ -115,19 +135,42 @@ export function FixtureGrid2D({
   >(null);
 
   const activeShaderBlock = useMemo(() => {
+    const hasShader = (b: { elements: { kind: string }[] } | undefined | null) =>
+      Boolean(b && b.elements.some((el) => el.kind === "spatial_shader_2d"));
     if (activeShaderGizmoBlockId) {
       const found = showState.fx_library.find(
         (b) => b.id === activeShaderGizmoBlockId,
       );
-      if (found) return found;
+      if (hasShader(found)) return found!;
+    }
+    if (selectedSceneId) {
+      const selScene = showState.scenes.find((s) => s.id === selectedSceneId);
+      for (const refId of selScene?.block_refs ?? []) {
+        const blk = showState.fx_library.find((b) => b.id === refId);
+        if (hasShader(blk)) return blk!;
+      }
+    }
+    for (const inst of activeScenes) {
+      const actScene = showState.scenes.find((s) => s.id === inst.scene_id);
+      for (const refId of actScene?.block_refs ?? []) {
+        const blk = showState.fx_library.find((b) => b.id === refId);
+        if (hasShader(blk)) return blk!;
+      }
     }
     return (
       showState.fx_library.find((b) =>
         b.elements.some((el) => el.kind === "spatial_shader_2d"),
       ) ?? null
     );
-  }, [activeShaderGizmoBlockId, showState.fx_library]);
+  }, [
+    activeScenes,
+    activeShaderGizmoBlockId,
+    selectedSceneId,
+    showState.fx_library,
+    showState.scenes,
+  ]);
 
+  const lastAutoGizmoBlockIdRef = useRef<string | null>(null);
   useEffect(() => {
     const shaderEl = activeShaderBlock?.elements.find(
       (el) => el.kind === "spatial_shader_2d",
@@ -139,16 +182,34 @@ export function FixtureGrid2D({
         directionDeg: shaderEl.direction_deg,
         spatialFreq: shaderEl.spatial_freq,
       });
+      if (activeShaderBlock && lastAutoGizmoBlockIdRef.current !== activeShaderBlock.id) {
+        lastAutoGizmoBlockIdRef.current = activeShaderBlock.id;
+        setShaderGizmoActive(true);
+      }
+    } else {
+      lastAutoGizmoBlockIdRef.current = null;
     }
   }, [activeShaderBlock]);
 
   const selectedFixture = useMemo(
     () =>
       showState.patch.find((f) => f.id === selectedFixtureInstanceId) ??
-      showState.patch[0] ??
       null,
     [selectedFixtureInstanceId, showState.patch],
   );
+
+  const fixtureHasColorById = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const fx of showState.patch) {
+      const detail = fixtureDetailsCache[fx.profile];
+      const mode = detail?.expanded_modes.find((m) => m.name === fx.mode);
+      const hasColorCh = mode
+        ? mode.channels.some((ch) => ch.role.kind === "color_intensity")
+        : true;
+      map.set(fx.id, hasColorCh);
+    }
+    return map;
+  }, [fixtureDetailsCache, showState.patch]);
 
   const selectedFixtureSet = useMemo(
     () => new Set(selectedFixtureIds),
@@ -183,8 +244,8 @@ export function FixtureGrid2D({
   }, [fixtureDetailsCache, hasCustomTargetRef, selectedFixture]);
 
   const toScreenPx = (nx: number, ny: number, w: number, h: number) => ({
-    sx: ((nx - 0.5) * zoom + 0.5) * w,
-    sy: ((ny - 0.5) * zoom + 0.5) * h,
+    sx: ((nx - 0.5 - pan.x) * zoom * VIEW_FIT + 0.5) * w,
+    sy: ((ny - 0.5 - pan.y) * zoom * VIEW_FIT + 0.5) * h,
   });
 
   const activeGroupCellKeys = useMemo(() => {
@@ -295,22 +356,37 @@ export function FixtureGrid2D({
     ctx.fillStyle = "#0A0F18";
     ctx.fillRect(0, 0, w, h);
 
-    // 10x10 Grid
-    ctx.strokeStyle = "#1F2A3C";
+    // Extended 0.1-step grid including negative & >1 space
+    ctx.strokeStyle = "#162030";
     ctx.lineWidth = 1;
-    for (let i = 1; i < 10; i++) {
+    for (let i = -20; i <= 30; i++) {
       const pX = toScreenPx(i / 10, 0, w, h).sx;
       const pY = toScreenPx(0, i / 10, w, h).sy;
-      ctx.beginPath();
-      ctx.moveTo(pX, 0);
-      ctx.lineTo(pX, h);
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.moveTo(0, pY);
-      ctx.lineTo(w, pY);
-      ctx.stroke();
+      if (pX >= 0 && pX <= w) {
+        ctx.beginPath();
+        ctx.moveTo(pX, 0);
+        ctx.lineTo(pX, h);
+        ctx.stroke();
+      }
+      if (pY >= 0 && pY <= h) {
+        ctx.beginPath();
+        ctx.moveTo(0, pY);
+        ctx.lineTo(w, pY);
+        ctx.stroke();
+      }
     }
+
+    // [0..1] Stage Boundary Box
+    const stageTL = toScreenPx(0, 0, w, h);
+    const stageBR = toScreenPx(1, 1, w, h);
+    ctx.strokeStyle = "#2A3A4E";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(
+      stageTL.sx,
+      stageTL.sy,
+      stageBR.sx - stageTL.sx,
+      stageBR.sy - stageTL.sy,
+    );
 
     const centerPx = toScreenPx(0.5, 0.5, w, h);
     ctx.strokeStyle = "#2A374C";
@@ -324,15 +400,135 @@ export function FixtureGrid2D({
     ctx.setLineDash([]);
 
     const selectedCellSet = new Set(selectedCellIndices);
+    const overrides = dragOverridesRef.current;
+    const fxPatchById = new Map(showState.patch.map((f) => [f.id, f]));
+
+    // Live semi-transparent animated 2D shader preview directly inside the gizmo rectangle (behind fixtures)
+    if (shaderGizmoActive && activeShaderBlock) {
+      const shaderEl = activeShaderBlock.elements.find(
+        (el) => el.kind === "spatial_shader_2d",
+      );
+      if (shaderEl && shaderEl.kind === "spatial_shader_2d") {
+        const patternScale = spatialFreqToPatternScale(gizmoState.spatialFreq);
+        const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
+        const minNx = gizmoState.centerX - boxHalfNorm;
+        const minNy = gizmoState.centerY - boxHalfNorm;
+        const boxSpan = boxHalfNorm * 2;
+        const gridRes = 18;
+        const activePal = showState.color_palettes.find(
+          (p) => p.id === shaderEl.palette_ref,
+        );
+        const stops =
+          shaderEl.inline_colors && shaderEl.inline_colors.length > 0
+            ? shaderEl.inline_colors
+            : activePal
+              ? getPaletteColors(activePal)
+              : getPaletteColors(DEFAULT_COLOR_PALETTES[0]);
+        const isColor = shaderEl.trait === "color";
+        const nowSec = performance.now() / 1000;
+        const bpm = showState.bpm || 120;
+        const rateBeats = shaderEl.rate_beats ?? 4;
+        const basePhaseCycles =
+          shaderEl.speed_hz && shaderEl.speed_hz > 0
+            ? nowSec * shaderEl.speed_hz
+            : ((nowSec * bpm) / 60) / Math.max(0.1, rateBeats);
+
+        ctx.save();
+        ctx.globalAlpha = 0.34;
+        for (let gy = 0; gy < gridRes; gy++) {
+          for (let gx = 0; gx < gridRes; gx++) {
+            const nx0 = minNx + (gx / gridRes) * boxSpan;
+            const ny0 = minNy + (gy / gridRes) * boxSpan;
+            const nx1 = minNx + ((gx + 1) / gridRes) * boxSpan;
+            const ny1 = minNy + ((gy + 1) / gridRes) * boxSpan;
+            const sampleNx = (nx0 + nx1) * 0.5;
+            const sampleNy = (ny0 + ny1) * 0.5;
+            const s = evaluateSpatialShader2DPhase({
+              shader: shaderEl.shader,
+              normXy: [sampleNx, sampleNy],
+              basePhaseCycles,
+              spatialFreq: gizmoState.spatialFreq,
+              colorWidth: shaderEl.color_width ?? 1,
+              directionDeg: gizmoState.directionDeg,
+              centerX: gizmoState.centerX,
+              centerY: gizmoState.centerY,
+              transform: shaderEl.transform,
+            });
+            if (isColor) {
+              const linRgb = sampleOklabStopsLinear(
+                stops,
+                s,
+                shaderEl.gradient ?? 1,
+                shaderEl.grayscale ?? false,
+                true,
+              );
+              ctx.fillStyle = linearRgbToSrgbHex(linRgb);
+            } else {
+              const v = Math.round(Math.max(0, Math.min(1, s)) * 235);
+              ctx.fillStyle = `rgb(${v}, ${v}, ${v})`;
+            }
+            const p0 = toScreenPx(nx0, ny0, w, h);
+            const p1 = toScreenPx(nx1, ny1, w, h);
+            ctx.fillRect(
+              p0.sx,
+              p0.sy,
+              Math.max(1, p1.sx - p0.sx + 0.5),
+              Math.max(1, p1.sy - p0.sy + 0.5),
+            );
+          }
+        }
+        ctx.restore();
+      }
+    }
+
+    // Compute per-fixture adaptive cell size so multi-segment tubes never appear cramped
+    const defaultCellSize = Math.round(16 * Math.min(1.5, Math.max(0.75, zoom)));
+    const fixtureScreenCoords = new Map<string, Array<[number, number]>>();
+    const cellScreenCoords: Array<[number, number]> = compiledCells.map((cell) => {
+      const baseFx = fxPatchById.get(cell.fixture_id);
+      const ov = overrides[cell.fixture_id];
+      let cellX = cell.canvas_xy[0];
+      let cellY = cell.canvas_xy[1];
+      if (baseFx && ov) {
+        if (ov.rotation !== baseFx.grid_pos.rotation) {
+          const dx = cellX - baseFx.grid_pos.x;
+          const dy = cellY - baseFx.grid_pos.y;
+          const dRad = ((ov.rotation - baseFx.grid_pos.rotation) * Math.PI) / 180;
+          const cosD = Math.cos(dRad);
+          const sinD = Math.sin(dRad);
+          cellX = ov.x + (dx * cosD - dy * sinD);
+          cellY = ov.y + (dx * sinD + dy * cosD);
+        } else {
+          cellX += ov.x - baseFx.grid_pos.x;
+          cellY += ov.y - baseFx.grid_pos.y;
+        }
+      }
+      const { sx, sy } = toScreenPx(cellX, cellY, w, h);
+      const list = fixtureScreenCoords.get(cell.fixture_id);
+      if (list) list.push([sx, sy]);
+      else fixtureScreenCoords.set(cell.fixture_id, [[sx, sy]]);
+      return [sx, sy];
+    });
+    const fixtureCellSizeById = new Map<string, number>();
+    for (const [fxId, pts] of fixtureScreenCoords.entries()) {
+      if (pts.length < 2) {
+        fixtureCellSizeById.set(fxId, defaultCellSize);
+        continue;
+      }
+      let minDist = Infinity;
+      for (let i = 1; i < pts.length; i++) {
+        const dist = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+        if (dist > 0.5 && dist < minDist) minDist = dist;
+      }
+      const adaptive = Number.isFinite(minDist)
+        ? Math.max(9, Math.min(defaultCellSize, Math.floor(minDist - 3)))
+        : defaultCellSize;
+      fixtureCellSizeById.set(fxId, adaptive);
+    }
 
     // Draw lighting cells as crisp Daslight-style numbered squares
     compiledCells.forEach((cell, idx) => {
-      const { sx: cx, sy: cy } = toScreenPx(
-        cell.canvas_xy[0],
-        cell.canvas_xy[1],
-        w,
-        h,
-      );
+      const [cx, cy] = cellScreenCoords[idx];
       const base = idx * 4;
       const r = cellPreviewRgbd[base] ?? 0;
       const g = cellPreviewRgbd[base + 1] ?? 0;
@@ -340,10 +536,26 @@ export function FixtureGrid2D({
       const d = cellPreviewRgbd[base + 3] ?? 0;
 
       const scale = d / 255;
-      const litR = Math.round(r * scale);
-      const litG = Math.round(g * scale);
-      const litB = Math.round(b * scale);
-      const hasOutput = litR + litG + litB > 0;
+      const hasColor = r + g + b > 0;
+      const isColorCapable = fixtureHasColorById.get(cell.fixture_id) ?? true;
+      const litR = hasColor
+        ? Math.round(r * scale)
+        : !isColorCapable
+          ? Math.round(210 * scale)
+          : 0;
+      const litG = hasColor
+        ? Math.round(g * scale)
+        : !isColorCapable
+          ? Math.round(218 * scale)
+          : 0;
+      const litB = hasColor
+        ? Math.round(b * scale)
+        : !isColorCapable
+          ? Math.round(228 * scale)
+          : 0;
+      const hasOutput = hasColor
+        ? litR + litG + litB > 0
+        : !isColorCapable && d > 0;
       const isSelected =
         selectedFixture?.id === cell.fixture_id ||
         selectedFixtureSet.has(cell.fixture_id);
@@ -354,7 +566,7 @@ export function FixtureGrid2D({
       const isSceneTargeted =
         sceneAffected.isSubset &&
         sceneAffected.cellKeys.has(`${cell.fixture_id}:${cell.cell_index}`);
-      const cellSize = Math.round(16 * Math.min(1.5, Math.max(0.75, zoom)));
+      const cellSize = fixtureCellSizeById.get(cell.fixture_id) ?? defaultCellSize;
       const half = cellSize / 2;
 
       if (isGroupHighlighted || isSceneTargeted) {
@@ -381,23 +593,21 @@ export function FixtureGrid2D({
           : "#8898A8";
       ctx.strokeRect(cx - half, cy - half, cellSize, cellSize);
 
-      const badgeNum = cellBadgeNumbers[idx] ?? idx + 1;
-      const luminance = 0.299 * litR + 0.587 * litG + 0.114 * litB;
-      ctx.font = "9px monospace";
-      ctx.fillStyle = hasOutput && luminance > 140 ? "#0A0F18" : "#F2F6FB";
-      ctx.textAlign = "center";
-      ctx.fillText(String(badgeNum), cx, cy + 3);
-      ctx.textAlign = "left";
+      if (cellSize >= 14) {
+        const badgeNum = cellBadgeNumbers[idx] ?? idx + 1;
+        const luminance = 0.299 * litR + 0.587 * litG + 0.114 * litB;
+        ctx.font = "9px monospace";
+        ctx.fillStyle = hasOutput && luminance > 140 ? "#0A0F18" : "#F2F6FB";
+        ctx.textAlign = "center";
+        ctx.fillText(String(badgeNum), cx, cy + 3);
+        ctx.textAlign = "left";
+      }
     });
 
     // Draw fixture anchors & selection rings
     for (const fx of showState.patch) {
-      const { sx: fxX, sy: fxY } = toScreenPx(
-        fx.grid_pos.x,
-        fx.grid_pos.y,
-        w,
-        h,
-      );
+      const effPos = overrides[fx.id] ?? fx.grid_pos;
+      const { sx: fxX, sy: fxY } = toScreenPx(effPos.x, effPos.y, w, h);
       const isPrimary = selectedFixture?.id === fx.id;
       const isMulti = selectedFixtureSet.has(fx.id);
 
@@ -415,11 +625,11 @@ export function FixtureGrid2D({
       ctx.fill();
 
       if (isPrimary) {
-        const rad = (fx.grid_pos.rotation * Math.PI) / 180;
+        const rad = (effPos.rotation * Math.PI) / 180;
         const hx =
-          fxX + Math.cos(rad) * (ROTATION_HANDLE_NORM_RADIUS * zoom * w);
+          fxX + Math.cos(rad) * (ROTATION_HANDLE_NORM_RADIUS * zoom * VIEW_FIT * w);
         const hy =
-          fxY + Math.sin(rad) * (ROTATION_HANDLE_NORM_RADIUS * zoom * h);
+          fxY + Math.sin(rad) * (ROTATION_HANDLE_NORM_RADIUS * zoom * VIEW_FIT * h);
         ctx.strokeStyle = "#FF5500";
         ctx.lineWidth = 1.5;
         ctx.beginPath();
@@ -505,9 +715,11 @@ export function FixtureGrid2D({
     }
   }, [
     activeGroupCellKeys,
+    activeShaderBlock,
     cellBadgeNumbers,
     cellPreviewRgbd,
     compiledCells,
+    fixtureHasColorById,
     gizmoState,
     marqueeRect,
     sceneAffected,
@@ -515,9 +727,104 @@ export function FixtureGrid2D({
     selectedFixture,
     selectedFixtureSet,
     shaderGizmoActive,
+    showState.bpm,
+    showState.color_palettes,
     showState.patch,
     zoom,
+    pan,
+    dragRenderTick,
   ]);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    registerCanvasGeometry(() => {
+      const canvas = canvasRef.current;
+      if (!canvas) return null;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+
+      const toClient = (nx: number, ny: number) => ({
+        x: Number(
+          (
+            rect.left +
+            ((nx - 0.5 - pan.x) * zoom * VIEW_FIT + 0.5) * rect.width
+          ).toFixed(1),
+        ),
+        y: Number(
+          (
+            rect.top +
+            ((ny - 0.5 - pan.y) * zoom * VIEW_FIT + 0.5) * rect.height
+          ).toFixed(1),
+        ),
+      });
+
+      const overrides = dragOverridesRef.current;
+      const fixtures = showState.patch.map((fx) => {
+        const eff = overrides[fx.id] ?? fx.grid_pos;
+        const center = toClient(eff.x, eff.y);
+        const rad = (eff.rotation * Math.PI) / 180;
+        const handle = toClient(
+          eff.x + Math.cos(rad) * ROTATION_HANDLE_NORM_RADIUS,
+          eff.y + Math.sin(rad) * ROTATION_HANDLE_NORM_RADIUS,
+        );
+        return {
+          id: fx.id,
+          name: fx.name,
+          gridX: eff.x,
+          gridY: eff.y,
+          rotation: eff.rotation,
+          clientX: center.x,
+          clientY: center.y,
+          rotationHandleX: handle.x,
+          rotationHandleY: handle.y,
+        };
+      });
+
+      let shaderGizmo = null;
+      if (shaderGizmoActive) {
+        const patternScale = spatialFreqToPatternScale(gizmoState.spatialFreq);
+        const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
+        const center = toClient(gizmoState.centerX, gizmoState.centerY);
+        const scaleHandle = toClient(
+          gizmoState.centerX + boxHalfNorm,
+          gizmoState.centerY + boxHalfNorm,
+        );
+        const angRad = (gizmoState.directionDeg * Math.PI) / 180;
+        const angleHandle = toClient(
+          gizmoState.centerX + (Math.cos(angRad) * 42) / (CANVAS_WIDTH * zoom),
+          gizmoState.centerY + (Math.sin(angRad) * 42) / (CANVAS_HEIGHT * zoom),
+        );
+        shaderGizmo = {
+          active: true,
+          blockId: activeShaderBlock?.id ?? null,
+          centerNormX: gizmoState.centerX,
+          centerNormY: gizmoState.centerY,
+          directionDeg: gizmoState.directionDeg,
+          spatialFreq: gizmoState.spatialFreq,
+          centerClientX: center.x,
+          centerClientY: center.y,
+          angleHandleClientX: angleHandle.x,
+          angleHandleClientY: angleHandle.y,
+          scaleHandleClientX: scaleHandle.x,
+          scaleHandleClientY: scaleHandle.y,
+        };
+      }
+
+      return {
+        canvasRect: {
+          left: Number(rect.left.toFixed(1)),
+          top: Number(rect.top.toFixed(1)),
+          width: Number(rect.width.toFixed(1)),
+          height: Number(rect.height.toFixed(1)),
+        },
+        zoom,
+        pan: { ...pan },
+        fixtures,
+        shaderGizmo,
+      };
+    });
+    return () => registerCanvasGeometry(null);
+  }, [activeShaderBlock, gizmoState, pan, shaderGizmoActive, showState.patch, zoom]);
 
   const toNormalizedCanvasPos = (
     e: PointerEvent<HTMLCanvasElement>,
@@ -526,8 +833,8 @@ export function FixtureGrid2D({
     if (rect.width <= 0 || rect.height <= 0) return { x: 0.5, y: 0.5 };
     const viewX = (e.clientX - rect.left) / rect.width;
     const viewY = (e.clientY - rect.top) / rect.height;
-    const nx = Math.max(0, Math.min(1, (viewX - 0.5) / zoom + 0.5));
-    const ny = Math.max(0, Math.min(1, (viewY - 0.5) / zoom + 0.5));
+    const nx = (viewX - 0.5) / (zoom * VIEW_FIT) + 0.5 + pan.x;
+    const ny = (viewY - 0.5) / (zoom * VIEW_FIT) + 0.5 + pan.y;
     return { x: Number(nx.toFixed(3)), y: Number(ny.toFixed(3)) };
   };
 
@@ -549,6 +856,17 @@ export function FixtureGrid2D({
   };
 
   const handlePointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
+    if (e.button === 1 || (e.button === 0 && e.altKey)) {
+      e.preventDefault();
+      setDragState({
+        mode: "pan",
+        startClient: { x: e.clientX, y: e.clientY },
+        startPan: { ...pan },
+      });
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      return;
+    }
+
     const pos = toNormalizedCanvasPos(e);
 
     if (shaderGizmoActive) {
@@ -590,11 +908,14 @@ export function FixtureGrid2D({
       const hy =
         selectedFixture.grid_pos.y +
         Math.sin(rad) * ROTATION_HANDLE_NORM_RADIUS;
-      if (Math.hypot(hx - pos.x, hy - pos.y) < 0.05) {
+      if (Math.hypot(hx - pos.x, hy - pos.y) < 0.028) {
         setDragState({
           fixtureId: selectedFixture.id,
           mode: "rotate",
-          lastPos: pos,
+          startPos: pos,
+          initialGridPositions: {
+            [selectedFixture.id]: { ...selectedFixture.grid_pos },
+          },
         });
         e.currentTarget.setPointerCapture?.(e.pointerId);
         return;
@@ -626,13 +947,27 @@ export function FixtureGrid2D({
 
     if (closestId) {
       const additive = e.shiftKey || e.ctrlKey || e.metaKey;
-      // Preserve multi-selection when grabbing an already-selected fixture cleanly
-      if (!additive && selectedFixtureSet.has(closestId) && selectedFixtureSet.size > 1) {
-        setDragState({ fixtureId: closestId, mode: "move", lastPos: pos });
-      } else {
+      const moveIds =
+        !additive && selectedFixtureSet.has(closestId) && selectedFixtureSet.size > 1
+          ? Array.from(selectedFixtureSet)
+          : additive
+            ? Array.from(new Set([...selectedFixtureIds, closestId]))
+            : [closestId];
+      if (!(!additive && selectedFixtureSet.has(closestId) && selectedFixtureSet.size > 1)) {
         toggleSelectFixtureInstance(closestId, additive);
-        setDragState({ fixtureId: closestId, mode: "move", lastPos: pos });
       }
+      const initialGridPositions: Record<string, GridPos> = {};
+      for (const fx of showState.patch) {
+        if (moveIds.includes(fx.id)) {
+          initialGridPositions[fx.id] = { ...fx.grid_pos };
+        }
+      }
+      setDragState({
+        fixtureId: closestId,
+        mode: "move",
+        startPos: pos,
+        initialGridPositions,
+      });
       e.currentTarget.setPointerCapture?.(e.pointerId);
     } else {
       setDragState({ mode: "marquee", startPos: pos });
@@ -643,6 +978,20 @@ export function FixtureGrid2D({
 
   const handlePointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
     if (!dragState) return;
+
+    if (dragState.mode === "pan") {
+      const rect = e.currentTarget.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        const dxNorm = (e.clientX - dragState.startClient.x) / (rect.width * zoom * VIEW_FIT);
+        const dyNorm = (e.clientY - dragState.startClient.y) / (rect.height * zoom * VIEW_FIT);
+        setPan({
+          x: Number((dragState.startPan.x - dxNorm).toFixed(3)),
+          y: Number((dragState.startPan.y - dyNorm).toFixed(3)),
+        });
+      }
+      return;
+    }
+
     const pos = toNormalizedCanvasPos(e);
 
     if (dragState.mode === "marquee") {
@@ -723,51 +1072,75 @@ export function FixtureGrid2D({
 
     if (!("fixtureId" in dragState)) return;
     const fxId = dragState.fixtureId;
-    const fx = showState.patch.find((f) => f.id === fxId);
-    if (!fx) return;
+    const initPos = dragState.initialGridPositions[fxId];
+    if (!initPos) return;
+
+    const scheduleRafRender = () => {
+      if (rafIdRef.current !== null) return;
+      rafIdRef.current = requestAnimationFrame(() => {
+        rafIdRef.current = null;
+        setDragRenderTick((t) => t + 1);
+      });
+    };
 
     if (dragState.mode === "rotate") {
       const rawDeg =
-        (Math.atan2(pos.y - fx.grid_pos.y, pos.x - fx.grid_pos.x) * 180) /
-        Math.PI;
-      const normalizedDeg = Math.round(((rawDeg % 360) + 360) % 360);
-      void updateFixtureGridPos(
-        fx.id,
-        { ...fx.grid_pos, rotation: normalizedDeg },
-        `grid_${fx.id}`,
-      );
+        (Math.atan2(pos.y - initPos.y, pos.x - initPos.x) * 180) / Math.PI;
+      const unwrappedDeg = ((rawDeg % 360) + 360) % 360;
+      const normalizedDeg = snapToGrid
+        ? Number(((Math.round(unwrappedDeg / 22.5) * 22.5) % 360).toFixed(1))
+        : Math.round(unwrappedDeg);
+      dragOverridesRef.current[fxId] = {
+        ...initPos,
+        rotation: normalizedDeg,
+      };
+      scheduleRafRender();
       return;
     }
 
-    // Move all selected fixtures together when multi-selected
-    const dx = pos.x - dragState.lastPos.x;
-    const dy = pos.y - dragState.lastPos.y;
-    const targets =
-      selectedFixtureIds.length > 1 && selectedFixtureIds.includes(fxId)
-        ? showState.patch.filter((f) => selectedFixtureIds.includes(f.id))
-        : [fx];
+    const dx = pos.x - dragState.startPos.x;
+    const dy = pos.y - dragState.startPos.y;
+    const snapVal = (v: number) =>
+      snapToGrid ? Number((Math.round(v / 0.05) * 0.05).toFixed(3)) : Number(v.toFixed(3));
 
-    for (const targetFx of targets) {
-      void updateFixtureGridPos(
-        targetFx.id,
-        {
-          ...targetFx.grid_pos,
-          x: Number(
-            Math.max(0, Math.min(1, targetFx.grid_pos.x + dx)).toFixed(3),
-          ),
-          y: Number(
-            Math.max(0, Math.min(1, targetFx.grid_pos.y + dy)).toFixed(3),
-          ),
-        },
-        targets.length > 1 ? "grid_multi" : `grid_${targetFx.id}`,
-      );
+    for (const [id, basePos] of Object.entries(dragState.initialGridPositions)) {
+      dragOverridesRef.current[id] = {
+        ...basePos,
+        x: snapVal(basePos.x + dx),
+        y: snapVal(basePos.y + dy),
+      };
     }
-    setDragState({ ...dragState, lastPos: pos });
+    scheduleRafRender();
   };
 
   const handlePointerUp = () => {
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    const pending = dragOverridesRef.current;
+    const entries = Object.entries(pending);
+    dragOverridesRef.current = {};
+    if (entries.length > 0) {
+      const multi = entries.length > 1;
+      for (const [fxId, nextPos] of entries) {
+        void updateFixtureGridPos(
+          fxId,
+          nextPos,
+          multi ? "grid_multi" : `grid_${fxId}`,
+        );
+      }
+      setDragRenderTick((t) => t + 1);
+    }
     setDragState(null);
     setMarqueeRect(null);
+  };
+
+  const handleCanvasWheel = (e: WheelEvent<HTMLCanvasElement>) => {
+    if (!e.ctrlKey && !e.metaKey && Math.abs(e.deltaY) < 1) return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    setZoom((z) => Math.max(0.3, Math.min(4.0, Number((z * factor).toFixed(2)))));
   };
 
   const updateGridField = (patch: Partial<GridPos>) => {
@@ -863,8 +1236,11 @@ export function FixtureGrid2D({
               <button
                 type="button"
                 data-testid="grid-zoom-reset"
-                onClick={() => setZoom(1.0)}
-                title="Reset Zoom 100%"
+                onClick={() => {
+                  setZoom(1.0);
+                  setPan({ x: 0, y: 0 });
+                }}
+                title="Reset Zoom & Pan (100%)"
                 className="px-1 text-frost hover:text-ember"
               >
                 <span data-testid="grid-zoom-value">
@@ -875,7 +1251,7 @@ export function FixtureGrid2D({
                 type="button"
                 data-testid="grid-zoom-in"
                 onClick={() =>
-                  setZoom((z) => Math.min(2.5, Number((z + 0.25).toFixed(2))))
+                  setZoom((z) => Math.min(4.0, Number((z + 0.25).toFixed(2))))
                 }
                 title="Zoom In"
                 className="p-0.5 text-mist hover:text-ember"
@@ -886,6 +1262,21 @@ export function FixtureGrid2D({
           </div>
 
           <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              data-testid="toggle-2d-snap-grid"
+              aria-pressed={snapToGrid}
+              onClick={() => setSnapToGrid((v) => !v)}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded border font-mono text-[10px] transition-colors ${
+                snapToGrid
+                  ? "bg-cobalt/30 border-cobalt text-frost font-semibold"
+                  : "bg-ink border-steel text-fog hover:text-mist"
+              }`}
+              title="Snap fixtures to 0.05 grid when dragging"
+            >
+              <Magnet className="w-3 h-3" />
+              <span>Snap</span>
+            </button>
             <button
               type="button"
               data-testid="toggle-2d-shader-gizmo"
@@ -921,19 +1312,16 @@ export function FixtureGrid2D({
                     id="grid-x"
                     aria-label="Grid X"
                     type="number"
-                    min={0}
-                    max={1}
+                    min={-4}
+                    max={5}
                     step={0.01}
                     value={selectedFixture.grid_pos.x}
                     onChange={(e) =>
                       updateGridField({
-                        x: Math.max(
-                          0,
-                          Math.min(1, Number(e.target.value) || 0),
-                        ),
+                        x: Number((Number(e.target.value) || 0).toFixed(3)),
                       })
                     }
-                    className="w-12 bg-pitch border border-steel rounded px-1 py-0.2 text-[10px] text-frost"
+                    className="w-14 bg-pitch border border-steel rounded px-1 py-0.2 text-[10px] text-frost"
                   />
                 </label>
                 <label className="flex items-center gap-0.5 text-fog">
@@ -942,19 +1330,16 @@ export function FixtureGrid2D({
                     id="grid-y"
                     aria-label="Grid Y"
                     type="number"
-                    min={0}
-                    max={1}
+                    min={-4}
+                    max={5}
                     step={0.01}
                     value={selectedFixture.grid_pos.y}
                     onChange={(e) =>
                       updateGridField({
-                        y: Math.max(
-                          0,
-                          Math.min(1, Number(e.target.value) || 0),
-                        ),
+                        y: Number((Number(e.target.value) || 0).toFixed(3)),
                       })
                     }
-                    className="w-12 bg-pitch border border-steel rounded px-1 py-0.2 text-[10px] text-frost"
+                    className="w-14 bg-pitch border border-steel rounded px-1 py-0.2 text-[10px] text-frost"
                   />
                 </label>
                 <label className="flex items-center gap-0.5 text-fog">
@@ -1065,6 +1450,7 @@ export function FixtureGrid2D({
               onPointerDown={handlePointerDown}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
+              onWheel={handleCanvasWheel}
               className="w-full h-full object-contain cursor-crosshair"
             />
           </div>

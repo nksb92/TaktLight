@@ -18,6 +18,7 @@ import {
   createDefaultBuilderDraft,
   FixtureBuilderDraft,
   FixtureValidationResult,
+  parseOflJsonToDraft,
   sanitizeSlug,
 } from "../lib/oflBuilder";
 import { useTaktStore } from "../store/useTaktStore";
@@ -110,10 +111,16 @@ export function FixtureBuilder() {
     const detail = await selectFixture(id);
     if (detail) {
       setRawJson(detail.raw_json);
+      const parsedDraft = parseOflJsonToDraft(detail.raw_json);
+      if (parsedDraft) {
+        setDraft(parsedDraft);
+        setEditorMode("builder");
+      } else {
+        setEditorMode("raw");
+      }
       setSelectedModeIdx(0);
       setSaveSlug(sanitizeSlug(detail.summary.name) || "custom_fixture");
       setStatusMessage(null);
-      setEditorMode("raw");
     }
   };
 
@@ -125,6 +132,30 @@ export function FixtureBuilder() {
     setSelectedModeIdx(0);
     setEditorMode("builder");
     setStatusMessage(null);
+  };
+
+  const handleAddMode = () => {
+    try {
+      const parsed = JSON.parse(rawJson) as {
+        availableChannels?: Record<string, unknown>;
+        modes?: { name: string; shortName?: string; channels: unknown[] }[];
+      };
+      const modes = Array.isArray(parsed.modes) ? [...parsed.modes] : [];
+      const availKeys = Object.keys(parsed.availableChannels ?? {});
+      const nextIndex = modes.length + 1;
+      const defaultChannels = availKeys.length > 0 ? [availKeys[0]] : [];
+      modes.push({
+        name: `Mode ${nextIndex}`,
+        shortName: `M${nextIndex}`,
+        channels: defaultChannels,
+      });
+      parsed.modes = modes;
+      setRawJson(JSON.stringify(parsed, null, 2));
+      setSelectedModeIdx(modes.length - 1);
+      setStatusMessage(`Added Mode ${nextIndex}`);
+    } catch {
+      setStatusMessage("Cannot add mode: fix JSON syntax first");
+    }
   };
 
   const handleImportFile = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -172,6 +203,56 @@ export function FixtureBuilder() {
     anchor.download = `${saveSlug || "fixture"}.json`;
     anchor.click();
     URL.revokeObjectURL(url);
+  };
+
+  const parsedRawOfl = (() => {
+    try {
+      return JSON.parse(rawJson) as {
+        availableChannels?: Record<string, unknown>;
+        templateChannels?: Record<string, unknown>;
+        modes?: { name: string; shortName?: string; channels: unknown[] }[];
+      };
+    } catch {
+      return null;
+    }
+  })();
+
+  const availableChannelNames = Object.keys(parsedRawOfl?.availableChannels ?? {});
+  const selectedRawMode = parsedRawOfl?.modes?.[selectedModeIdx] ?? null;
+
+  const updateSelectedMode = (
+    updater: (mode: { name: string; shortName?: string; channels: unknown[] }) => {
+      name: string;
+      shortName?: string;
+      channels: unknown[];
+    },
+  ) => {
+    try {
+      const parsed = JSON.parse(rawJson) as {
+        modes?: { name: string; shortName?: string; channels: unknown[] }[];
+      };
+      if (!Array.isArray(parsed.modes) || !parsed.modes[selectedModeIdx]) return;
+      parsed.modes[selectedModeIdx] = updater({ ...parsed.modes[selectedModeIdx] });
+      setRawJson(JSON.stringify(parsed, null, 2));
+      setStatusMessage(null);
+    } catch {
+      // Ignore if raw JSON is currently invalid
+    }
+  };
+
+  const handleDeleteSelectedMode = () => {
+    try {
+      const parsed = JSON.parse(rawJson) as {
+        modes?: { name: string; shortName?: string; channels: unknown[] }[];
+      };
+      if (!Array.isArray(parsed.modes) || parsed.modes.length <= 1) return;
+      parsed.modes.splice(selectedModeIdx, 1);
+      setRawJson(JSON.stringify(parsed, null, 2));
+      setSelectedModeIdx((prev) => Math.max(0, prev - 1));
+      setStatusMessage("Removed mode");
+    } catch {
+      // Ignore
+    }
   };
 
   const activeMode = validation?.expanded_modes[selectedModeIdx] ?? null;
@@ -824,25 +905,122 @@ export function FixtureBuilder() {
           </div>
         )}
 
-        {/* Mode Selector Pills */}
-        {validation && validation.expanded_modes.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {validation.expanded_modes.map((m, idx) => (
-              <button
-                key={m.name}
-                type="button"
-                onClick={() => setSelectedModeIdx(idx)}
-                className={`px-2.5 py-1 rounded font-mono text-xs border transition-colors ${
-                  idx === selectedModeIdx
-                    ? "bg-ember/20 border-ember text-mist"
-                    : "bg-pitch border-steel text-fog hover:text-mist"
-                }`}
-              >
-                {m.name} ({m.channel_count}ch)
-              </button>
-            ))}
+        {/* Modes Section & Add Mode */}
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-mono text-[11px] uppercase tracking-wider text-fog">
+              Modes ({validation?.expanded_modes.length ?? 0})
+            </span>
+            <button
+              type="button"
+              data-testid="add-mode-btn"
+              onClick={handleAddMode}
+              className="flex items-center gap-1 px-2 py-0.5 rounded bg-ink border border-steel hover:border-ember font-mono text-[11px] text-frost transition-colors"
+            >
+              <Plus className="w-3 h-3 text-ember" />
+              <span>Add Mode</span>
+            </button>
           </div>
-        )}
+          {validation && validation.expanded_modes.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5">
+              {validation.expanded_modes.map((m, idx) => (
+                <button
+                  key={m.name}
+                  type="button"
+                  onClick={() => setSelectedModeIdx(idx)}
+                  className={`px-2.5 py-1 rounded font-mono text-xs border transition-colors ${
+                    idx === selectedModeIdx
+                      ? "bg-ember/20 border-ember text-mist"
+                      : "bg-pitch border-steel text-fog hover:text-mist"
+                  }`}
+                >
+                  {m.name} ({m.channel_count}ch)
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="bg-pitch border border-dashed border-steel rounded px-2.5 py-2 font-mono text-[11px] text-fog">
+              No modes defined yet. Click &ldquo;Add Mode&rdquo; to create a DMX channel mode for this fixture.
+            </div>
+          )}
+
+          {/* Visual Mode Configurator for the selected mode */}
+          {selectedRawMode && (
+            <div
+              data-testid="visual-mode-config"
+              className="bg-pitch border border-steel rounded p-2.5 flex flex-col gap-2"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <label className="flex items-center gap-1.5 flex-1 min-w-0">
+                  <span className="font-mono text-[10px] text-fog uppercase shrink-0">
+                    Mode Name
+                  </span>
+                  <input
+                    type="text"
+                    aria-label="Selected Mode Name"
+                    value={selectedRawMode.name}
+                    onChange={(e) =>
+                      updateSelectedMode((m) => ({ ...m, name: e.target.value }))
+                    }
+                    className="flex-1 min-w-0 bg-ink border border-steel rounded px-1.5 py-0.5 font-mono text-xs text-mist"
+                  />
+                </label>
+                {(parsedRawOfl?.modes?.length ?? 0) > 1 && (
+                  <button
+                    type="button"
+                    data-testid="delete-selected-mode-btn"
+                    onClick={handleDeleteSelectedMode}
+                    className="px-2 py-0.5 rounded bg-ink border border-steel hover:border-signal font-mono text-[10px] text-fog hover:text-signal"
+                  >
+                    Delete Mode
+                  </button>
+                )}
+              </div>
+
+              {availableChannelNames.length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <span className="font-mono text-[10px] text-fog uppercase">
+                    Mode Channels (toggle to include)
+                  </span>
+                  <div className="flex flex-wrap gap-1">
+                    {availableChannelNames.map((chName) => {
+                      const included = selectedRawMode.channels.includes(chName);
+                      return (
+                        <button
+                          key={chName}
+                          type="button"
+                          data-testid={`mode-ch-toggle-${chName}`}
+                          aria-pressed={included}
+                          onClick={() =>
+                            updateSelectedMode((m) => {
+                              const exists = m.channels.includes(chName);
+                              const nextChannels = exists
+                                ? m.channels.filter((c) => c !== chName)
+                                : [...m.channels, chName];
+                              return {
+                                ...m,
+                                channels:
+                                  nextChannels.length > 0 ? nextChannels : m.channels,
+                              };
+                            })
+                          }
+                          className={`px-2 py-0.5 rounded border font-mono text-[10px] transition-colors ${
+                            included
+                              ? "bg-ember/20 border-ember text-frost"
+                              : "bg-ink border-steel text-fog hover:text-mist"
+                          }`}
+                        >
+                          {included ? "✓ " : "+ "}
+                          {chName}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
 
         {/* Cell Mapping Strip */}
         {activeMode && (

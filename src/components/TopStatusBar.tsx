@@ -27,6 +27,7 @@ function keyToSelection(key: string): AdapterSelection {
 
 export function TopStatusBar() {
   const telemetry = useTaktStore((s) => s.telemetry);
+  const jitterSamplesUs = useTaktStore((s) => s.jitterSamplesUs);
   const parkedChannels = useTaktStore((s) => s.parkedChannels);
   const blackout = useTaktStore((s) => s.blackout);
   const grandMaster = useTaktStore((s) => s.grandMaster);
@@ -85,7 +86,9 @@ export function TopStatusBar() {
     telemetry.meanUs > 0
       ? (1_000_000 / telemetry.meanUs).toFixed(1)
       : "44.0";
-  const timingHealthy = telemetry.droppedFrames === 0;
+  const recentDrops = jitterSamplesUs.filter((dt) => dt > 34_090.5).length;
+  const timingHealthy =
+    jitterSamplesUs.length > 0 ? recentDrops === 0 : telemetry.droppedFrames === 0;
 
   return (
     <header className="shrink-0 bg-slate-dark border-b border-steel px-3 py-1.5 flex flex-wrap items-center justify-between gap-2">
@@ -162,14 +165,20 @@ export function TopStatusBar() {
 
         {/* Active Warning Badges */}
         {parkedCount > 0 && (
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-signal/20 border border-signal text-frost font-mono text-xs font-medium">
+          <div
+            data-testid="topbar-park-override-badge"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-signal/20 border border-signal text-frost font-mono text-xs font-medium"
+          >
             <Lock className="w-3.5 h-3.5 text-signal" />
             <span>PARK OVERRIDE: {parkedCount} CH</span>
           </div>
         )}
 
         {blackout && (
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-signal text-frost font-mono text-xs font-semibold">
+          <div
+            data-testid="topbar-blackout-badge"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-signal text-frost font-mono text-xs font-semibold"
+          >
             <ShieldAlert className="w-3.5 h-3.5" />
             <span>BLACKOUT ACTIVE</span>
           </div>
@@ -261,7 +270,10 @@ export function TopStatusBar() {
         </div>
 
         {/* Grand Master */}
-        <div className="flex items-center gap-2 bg-ink border border-steel rounded-md px-3 py-1">
+        <div
+          title="Grand Master (GM): scales overall DMX output intensity (0–100%) across all universes. Parked channels bypass GM."
+          className="flex items-center gap-2 bg-ink border border-steel rounded-md px-3 py-1"
+        >
           <Cpu className="w-3.5 h-3.5 text-fog" />
           <span className="font-mono text-[11px] text-fog uppercase">GM</span>
           <NumericSlider

@@ -16,7 +16,23 @@
     height: 100%;
     background-color: #0a0f18;
     color: #e8eef6;
+    color-scheme: dark;
   }
+
+  input[type="number"] {
+    color-scheme: dark;
+  }
+}
+
+.no-spinner::-webkit-outer-spin-button,
+.no-spinner::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.no-spinner {
+  -moz-appearance: textfield;
+  appearance: textfield;
 }
 
 /* Custom scrollbar styled for AGE dark studio theme */

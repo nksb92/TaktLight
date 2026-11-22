@@ -2,6 +2,7 @@ import {
   Activity,
   ArrowDown,
   ArrowUp,
+  AudioWaveform,
   ChevronDown,
   Copy,
   Layers,
@@ -21,6 +22,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { startScenePointerDrag } from "../lib/sceneDrag";
 import {
   amplitudeOffsetToRangePct,
   buildCurve1DSvgPreview,
@@ -43,7 +45,9 @@ import {
 } from "../lib/mixerLogic";
 import type { OrderRuleStr } from "../lib/patchLogic";
 import { useTaktStore } from "../store/useTaktStore";
+import { ColorPaletteBuilderModal } from "./ColorPaletteBuilderModal";
 import { NumericSlider } from "./NumericSlider";
+import { TimelineRightInspector } from "./TimelineRightInspector";
 
 type GeneratorKind = FxElementDef["kind"];
 type SceneMode = "color" | "color_anim" | "effect";
@@ -223,8 +227,14 @@ function buildElementFromForm(params: {
         gradient: params.gradient,
         angle_deg: params.angleDeg,
         fx_kind_tag: params.fxKindTag,
-        inline_colors: params.inlineColors.length > 0 ? params.inlineColors : undefined,
-        value_stops: params.valueStops.length > 0 ? params.valueStops : undefined,
+        inline_colors:
+          params.trait === "color" && params.inlineColors.length > 0
+            ? params.inlineColors
+            : undefined,
+        value_stops:
+          params.fxKindTag === "value_fx" && params.valueStops.length > 0
+            ? params.valueStops
+            : undefined,
         palette_ref: paletteRef,
         order: params.order,
       };
@@ -290,6 +300,7 @@ export function SceneAndFxManager({
   showInspector?: boolean;
 }) {
   const showState = useTaktStore((s) => s.showState);
+  const fixtureDetailsCache = useTaktStore((s) => s.fixtureDetailsCache);
   const activeScenes = useTaktStore((s) => s.activeScenes);
   const liveBpm = useTaktStore((s) => s.liveBpm);
   const compiledCells = useTaktStore((s) => s.compiledCells);
@@ -320,6 +331,9 @@ export function SceneAndFxManager({
   const createQuickSceneInBank = useTaktStore(
     (s) => s.createQuickSceneInBank,
   );
+  const convertSceneToTimeline = useTaktStore(
+    (s) => s.convertSceneToTimeline,
+  );
   const createSceneBank = useTaktStore((s) => s.createSceneBank);
   const renameSceneBank = useTaktStore((s) => s.renameSceneBank);
   const deleteSceneBank = useTaktStore((s) => s.deleteSceneBank);
@@ -340,11 +354,12 @@ export function SceneAndFxManager({
   );
 
   // Bank UI state
-  const [addBankOpen, setAddBankOpen] = useState(false);
-  const [newBankName, setNewBankName] = useState("");
   const [selectedBankFilter, setSelectedBankFilter] = useState<string>("all");
+  const [paletteBuilderOpen, setPaletteBuilderOpen] = useState<boolean>(false);
   const [renamingBank, setRenamingBank] = useState<string | null>(null);
   const [renameBankValue, setRenameBankValue] = useState("");
+  const [renamingSceneId, setRenamingSceneId] = useState<string | null>(null);
+  const [renameSceneValue, setRenameSceneValue] = useState("");
   const [bankContextMenu, setBankContextMenu] = useState<{
     bank: string;
     x: number;
@@ -458,6 +473,83 @@ export function SceneAndFxManager({
       ),
     [selectedScenePrimaryBlock],
   );
+
+  const availableFxTraitOptions = useMemo(() => {
+    const opts: Array<{ value: string; label: string }> = [
+      { value: "dimmer", label: "Segment Dimmer" },
+    ];
+    const seen = new Set<string>(["dimmer"]);
+    const addOpt = (value: string, label: string) => {
+      if (seen.has(value)) return;
+      seen.add(value);
+      opts.push({ value, label });
+    };
+
+    const rawTarget = (fxTargetGroup || "all").trim();
+    let targetFixtures = showState.patch;
+    if (rawTarget && rawTarget !== "all" && rawTarget !== "*") {
+      const grp = showState.groups.find((g) => g.id === rawTarget);
+      const refs = grp ? grp.targets : [rawTarget];
+      const fxIds = new Set(
+        refs.map((r) => {
+          const t = r.trim();
+          const colon = t.indexOf(":");
+          return colon === -1 ? t : t.slice(0, colon).trim();
+        }),
+      );
+      const filtered = showState.patch.filter((f) => fxIds.has(f.id));
+      if (filtered.length > 0) targetFixtures = filtered;
+    }
+
+    let hasMaster = false;
+    let hasRed = false;
+    let hasGreen = false;
+    let hasBlue = false;
+    let hasWhite = false;
+    let hasStrobe = false;
+    let hasPan = false;
+    let hasTilt = false;
+    const customNames: string[] = [];
+
+    for (const fx of targetFixtures) {
+      const detail = fixtureDetailsCache[fx.profile];
+      const mode = detail?.expanded_modes.find((m) => m.name === fx.mode);
+      for (const ch of mode?.channels ?? []) {
+        if (ch.role.kind === "intensity" && ch.target.scope === "fixture") {
+          hasMaster = true;
+        } else if (ch.role.kind === "color_intensity") {
+          const c = ch.role.color.toLowerCase();
+          if (c.includes("red")) hasRed = true;
+          else if (c.includes("green")) hasGreen = true;
+          else if (c.includes("blue")) hasBlue = true;
+          else if (c.includes("white")) hasWhite = true;
+        } else if (ch.role.kind === "shutter_strobe") {
+          hasStrobe = true;
+        } else if (ch.role.kind === "unmapped") {
+          const lower = ch.name.toLowerCase();
+          if (lower.includes("pan")) hasPan = true;
+          else if (lower.includes("tilt")) hasTilt = true;
+          else if (!customNames.includes(ch.name)) customNames.push(ch.name);
+        }
+      }
+    }
+
+    if (hasMaster) addOpt("master_dimmer", "Master Dimmer");
+    if (hasRed) addOpt("red", "Red");
+    if (hasGreen) addOpt("green", "Green");
+    if (hasBlue) addOpt("blue", "Blue");
+    if (hasWhite) addOpt("white", "White");
+    if (hasStrobe) addOpt("strobe", "Strobe");
+    if (hasPan) addOpt("pan", "Pan");
+    if (hasTilt) addOpt("tilt", "Tilt");
+    for (const cName of customNames) {
+      addOpt(`channel:${cName.toLowerCase()}`, cName);
+    }
+    if (fxTrait && !seen.has(fxTrait) && fxTrait !== "color") {
+      addOpt(fxTrait, fxTrait);
+    }
+    return opts;
+  }, [fixtureDetailsCache, fxTargetGroup, fxTrait, showState.groups, showState.patch]);
 
   const activeProceduralElement =
     proceduralElements[
@@ -709,11 +801,35 @@ export function SceneAndFxManager({
     };
   };
 
+  // Keep local gizmo spatial state synchronized when FixtureGrid2D drags/rotates/scales the gizmo
+  const liveShaderEl = selectedScenePrimaryBlock?.elements.find(
+    (el): el is Extract<FxElementDef, { kind: "spatial_shader_2d" }> =>
+      el.kind === "spatial_shader_2d",
+  );
+  useEffect(() => {
+    if (!liveShaderEl) return;
+    setFxCenterX(liveShaderEl.center_x);
+    setFxCenterY(liveShaderEl.center_y);
+    setFxDirectionDeg(liveShaderEl.direction_deg);
+    setFxSpatialFreq(liveShaderEl.spatial_freq);
+  }, [
+    liveShaderEl?.center_x,
+    liveShaderEl?.center_y,
+    liveShaderEl?.direction_deg,
+    liveShaderEl?.spatial_freq,
+  ]);
+
   const syncSelectedSceneBlock = async (
     overrides: FxParamOverrides,
     targetProcIndex = activeElementIdx,
   ) => {
     if (!selectedScene) return;
+    const liveProc = selectedScenePrimaryBlock?.elements.filter(
+      (el) => !isStaticDockElement(el),
+    );
+    const liveEl = liveProc?.[targetProcIndex];
+    const liveSpatial =
+      liveEl && liveEl.kind === "spatial_shader_2d" ? liveEl : null;
     const snap = {
       kind: overrides.kind ?? fxKind,
       trait: overrides.trait ?? fxTrait,
@@ -736,10 +852,12 @@ export function SceneAndFxManager({
       activeRatio: overrides.activeRatio ?? fxActiveRatio,
       fade: overrides.fade ?? fxFade,
       shader: overrides.shader ?? fxShader,
-      spatialFreq: overrides.spatialFreq ?? fxSpatialFreq,
-      directionDeg: overrides.directionDeg ?? fxDirectionDeg,
-      centerX: overrides.centerX ?? fxCenterX,
-      centerY: overrides.centerY ?? fxCenterY,
+      spatialFreq:
+        overrides.spatialFreq ?? liveSpatial?.spatial_freq ?? fxSpatialFreq,
+      directionDeg:
+        overrides.directionDeg ?? liveSpatial?.direction_deg ?? fxDirectionDeg,
+      centerX: overrides.centerX ?? liveSpatial?.center_x ?? fxCenterX,
+      centerY: overrides.centerY ?? liveSpatial?.center_y ?? fxCenterY,
       paletteRef:
         overrides.paletteRef !== undefined
           ? overrides.paletteRef
@@ -1072,6 +1190,9 @@ export function SceneAndFxManager({
           block_refs: [targetBlockId],
         });
       }
+      if (elem.kind === "spatial_shader_2d") {
+        setActiveShaderGizmoBlockId(targetBlockId);
+      }
       setActiveElementIdx(0);
       loadElementIntoEditor(updatedBlk, 0);
       setFxPickerMode(false);
@@ -1298,10 +1419,12 @@ export function SceneAndFxManager({
       <div
         key={scene.id}
         data-testid={`scene-tile-${scene.id}`}
-        draggable
-        onDragStart={(e) => {
-          e.dataTransfer?.setData("text/takt-scene-id", scene.id);
-          e.dataTransfer?.setData("text/plain", scene.id);
+        onPointerDown={(e) => {
+          if (e.button !== 0 || scene.timeline_ref) return;
+          const target = e.target as HTMLElement | null;
+          if (target?.closest("button, input")) return;
+          e.preventDefault();
+          startScenePointerDrag(scene.id, scene.name, e.clientX, e.clientY);
         }}
         onContextMenu={(e) => {
           e.preventDefault();
@@ -1312,7 +1435,7 @@ export function SceneAndFxManager({
             y: e.clientY,
           });
         }}
-        className={`relative flex items-stretch rounded border transition-colors overflow-hidden min-h-[44px] ${borderClass} ${mappingActiveRing} ${
+        className={`relative flex items-stretch rounded border transition-colors overflow-hidden min-h-[44px] select-none ${borderClass} ${mappingActiveRing} ${
           isMultiSelected && multiSelectedSceneIds.length > 1
             ? "ring-2 ring-frost"
             : ""
@@ -1398,9 +1521,48 @@ export function SceneAndFxManager({
           className="flex-1 px-2 py-1.5 flex flex-col justify-center min-w-0 cursor-pointer"
         >
           <div className="flex items-center justify-between gap-1">
-            <span className="font-sans text-xs font-semibold text-frost truncate">
-              {scene.name}
-            </span>
+            {renamingSceneId === scene.id ? (
+              <input
+                type="text"
+                autoFocus
+                data-testid={`rename-scene-input-${scene.id}`}
+                value={renameSceneValue}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => setRenameSceneValue(e.target.value)}
+                onBlur={() => {
+                  const trimmed = renameSceneValue.trim();
+                  if (trimmed && trimmed !== scene.name) {
+                    void upsertScene({ ...scene, name: trimmed });
+                  }
+                  setRenamingSceneId(null);
+                }}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter") {
+                    const trimmed = renameSceneValue.trim();
+                    if (trimmed && trimmed !== scene.name) {
+                      void upsertScene({ ...scene, name: trimmed });
+                    }
+                    setRenamingSceneId(null);
+                  } else if (e.key === "Escape") {
+                    setRenamingSceneId(null);
+                  }
+                }}
+                className="w-full px-1 py-0.5 rounded bg-pitch border border-ember font-sans text-xs font-semibold text-frost outline-none"
+              />
+            ) : (
+              <span
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  setRenamingSceneId(scene.id);
+                  setRenameSceneValue(scene.name);
+                }}
+                title="Double-click to rename scene"
+                className="font-sans text-xs font-semibold text-frost truncate"
+              >
+                {scene.name}
+              </span>
+            )}
             {((mappingOverlayMode !== "off" && (keyBind || midiBind)) ||
               keyBind) && (
               <span className="px-1 py-0.2 rounded bg-pitch border border-steel font-mono text-[9px] text-frost shrink-0">
@@ -1411,7 +1573,14 @@ export function SceneAndFxManager({
             )}
           </div>
           <div className="flex items-center justify-between gap-1 font-mono text-[9px] text-fog">
-            <span>{typeLabel}</span>
+            {scene.timeline_ref ? (
+              <span className="inline-flex items-center gap-1 text-cobalt font-semibold">
+                <AudioWaveform className="w-2.5 h-2.5" />
+                <span>TIMELINE</span>
+              </span>
+            ) : (
+              <span>{typeLabel}</span>
+            )}
           </div>
         </div>
 
@@ -1576,53 +1745,20 @@ export function SceneAndFxManager({
                 </button>
               ))}
 
-              {/* Compact + Button to Create New Bank */}
+              {/* Compact + Button to Instantly Create New Bank */}
               <button
                 type="button"
                 data-testid="open-add-bank-btn"
-                onClick={() => setAddBankOpen((v) => !v)}
-                title="Add Bank"
+                onClick={() => {
+                  let n = allBanks.length + 1;
+                  while (allBanks.includes(`Bank ${n}`)) n += 1;
+                  createSceneBank(`Bank ${n}`);
+                }}
+                title="Add Bank (double-click bank name to rename)"
                 className="px-1.5 py-0.5 rounded border border-steel bg-ink text-mist hover:border-ember"
               >
                 <Plus className="w-3 h-3" />
               </button>
-
-              {addBankOpen && (
-                <div className="flex items-center gap-1 ml-1">
-                  <input
-                    aria-label="New Bank Name"
-                    type="text"
-                    value={newBankName}
-                    onChange={(e) => setNewBankName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        const clean = newBankName.trim();
-                        if (clean) {
-                          createSceneBank(clean);
-                          setNewBankName("");
-                          setAddBankOpen(false);
-                        }
-                      }
-                    }}
-                    placeholder="Bank Name"
-                    className="w-28 bg-ink border border-steel rounded px-1.5 py-0.5 text-[11px] text-frost"
-                  />
-                  <button
-                    type="button"
-                    data-testid="add-bank-btn"
-                    onClick={() => {
-                      const clean = newBankName.trim();
-                      if (!clean) return;
-                      createSceneBank(clean);
-                      setNewBankName("");
-                      setAddBankOpen(false);
-                    }}
-                    className="px-2 py-0.5 rounded bg-ember text-frost text-[11px] font-semibold"
-                  >
-                    Add
-                  </button>
-                </div>
-              )}
             </div>
           </div>
 
@@ -1738,7 +1874,16 @@ export function SceneAndFxManager({
                         />
                       ) : (
                         <div className="flex items-center gap-1 min-w-0">
-                          <span className="font-sans text-xs font-semibold text-frost truncate">
+                          <span
+                            data-testid={`bank-name-${bName}`}
+                            onDoubleClick={(e) => {
+                              e.stopPropagation();
+                              setRenamingBank(bName);
+                              setRenameBankValue(bName);
+                            }}
+                            title="Double-click to rename bank"
+                            className="font-sans text-xs font-semibold text-frost truncate cursor-text"
+                          >
                             {bName}
                           </span>
                           {isStackable && (
@@ -1852,8 +1997,8 @@ export function SceneAndFxManager({
                 </div>
               </div>
 
-              {/* Always-Visible Scene Target Selector */}
-              {selectedScene && (
+              {/* Always-Visible Scene Target Selector (hidden for Timeline Super-Scenes, whose child scenes handle targets) */}
+              {selectedScene && !selectedScene.timeline_ref && (
                 <div
                   data-testid="scene-target-bar"
                   className="shrink-0 bg-pitch border-b border-steel/70 px-2.5 py-1 flex items-center justify-between gap-2 font-mono text-[10px]"
@@ -1894,9 +2039,11 @@ export function SceneAndFxManager({
 
               {/* Scrollable Inspector Content */}
               <div className="flex-1 min-h-0 overflow-y-auto p-2.5 flex flex-col gap-2">
-                {(selectedScene || fxPickerMode) && inspectorRailTab === "fx" && (
+                {selectedScene?.timeline_ref && inspectorRailTab === "fx" ? (
+                  <TimelineRightInspector timelineId={selectedScene.timeline_ref} />
+                ) : !selectedScene?.timeline_ref && (selectedScene || fxPickerMode) && inspectorRailTab === "fx" && (
                   <>
-                    {/* DASLIGHT 5 CLEAN 2-COLUMN CHOICE MATRIX (6 FX TILES) */}
+                    {/* DASLIGHT 5 CLEAN 2-COLUMN CHOICE MATRIX (6 FX TILES + TIMELINE) */}
                     {fxPickerMode ? (
                       <div className="flex flex-col gap-2 pt-1">
                         <div
@@ -1966,6 +2113,27 @@ export function SceneAndFxManager({
                           >
                             MAPPINGS
                           </button>
+                          {!fxAppendMode && (
+                            <button
+                              type="button"
+                              data-testid="fx-picker-tile-timeline"
+                              title="Convert this scene into a multi-track audio and lighting Timeline"
+                              onClick={() => {
+                                void (async () => {
+                                  const sc =
+                                    selectedScene ??
+                                    (await createQuickSceneInBank(
+                                      allBanks[0] ?? "Bank 1",
+                                    ));
+                                  await convertSceneToTimeline(sc.id);
+                                })();
+                              }}
+                              className="col-span-2 h-11 rounded bg-cobalt/15 border border-cobalt/60 hover:border-cobalt hover:bg-cobalt/25 font-mono text-[11px] font-semibold text-frost flex items-center justify-center gap-1.5 px-2 transition-colors"
+                            >
+                              <AudioWaveform className="w-3.5 h-3.5 text-cobalt" />
+                              <span>TIMELINE</span>
+                            </button>
+                          )}
                         </div>
 
                         {fxAppendMode && proceduralElements.length > 0 && (
@@ -2014,11 +2182,15 @@ export function SceneAndFxManager({
                           <button
                             type="button"
                             data-testid="toggle-fx-picker-btn"
+                            aria-label="Remove FX"
                             onClick={() => {
-                              setFxAppendMode(false);
-                              setFxPickerMode(true);
+                              void (async () => {
+                                await removeActiveFxElement();
+                                setFxAppendMode(false);
+                                setFxPickerMode(true);
+                              })();
                             }}
-                            title="Back to FX Choice Matrix"
+                            title="Remove FX & Back to FX Choice Matrix"
                             className="p-1 rounded text-fog hover:text-frost hover:bg-ink shrink-0"
                           >
                             <X className="w-3.5 h-3.5" />
@@ -2033,12 +2205,55 @@ export function SceneAndFxManager({
                           {submenuLabel(activeSubmenu)}
                         </div>
 
+                        {/* Dynamic Target Channel / Trait Selector for Scalar FX & Mappings */}
+                        {(activeSubmenu === "curve_fx" ||
+                          activeSubmenu === "chaser_fx" ||
+                          activeSubmenu === "value_fx" ||
+                          activeSubmenu === "mappings") && (
+                          <div className="bg-pitch border border-steel rounded px-2 py-1.5 flex items-center justify-between gap-2 font-mono text-[10px]">
+                            <span
+                              className="text-fog shrink-0"
+                              title="Choose which fixture channel or trait this effect modulates"
+                            >
+                              Target Channel
+                            </span>
+                            <select
+                              aria-label="FX Target Channel"
+                              data-testid="fx-target-trait-select"
+                              value={fxTrait}
+                              onChange={(e) => {
+                                const tr = e.target.value;
+                                setFxTrait(tr);
+                                void syncSelectedSceneBlock({ trait: tr });
+                              }}
+                              className="flex-1 min-w-0 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
+                            >
+                              {availableFxTraitOptions.map((opt) => (
+                                <option key={opt.value} value={opt.value}>
+                                  {opt.label}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+
                         {/* SHARED MULTI-STOP COLOR EDITOR FOR COLOR FX & COLOR MAPPINGS */}
                         {(activeSubmenu === "color_fx" ||
                           activeSubmenu === "color_mappings") && (
                           <div className="bg-pitch border border-steel rounded p-2 flex flex-col gap-2 font-mono text-[10px]">
-                            <label className="flex flex-col gap-0.5">
-                              <span className="text-fog">Color Preset</span>
+                            <div className="flex flex-col gap-0.5">
+                              <div className="flex items-center justify-between">
+                                <span className="text-fog">Color Preset</span>
+                                <button
+                                  type="button"
+                                  data-testid="open-palette-builder-fx-btn"
+                                  onClick={() => setPaletteBuilderOpen(true)}
+                                  title="Create or edit multi-stop color palettes"
+                                  className="px-1.5 py-0.5 rounded bg-ink border border-steel hover:border-ember text-[9px] text-mist hover:text-frost"
+                                >
+                                  + Palette Builder
+                                </button>
+                              </div>
                               <select
                                 aria-label="Color Preset"
                                 value={fxPaletteRef}
@@ -2075,7 +2290,7 @@ export function SceneAndFxManager({
                                   </option>
                                 ))}
                               </select>
-                            </label>
+                            </div>
 
                             {(() => {
                               const stops =
@@ -3505,6 +3720,33 @@ export function SceneAndFxManager({
                           });
                         }
                       };
+                      if (selectedScene.timeline_ref) {
+                        const linkedTl = showState.timelines.find(
+                          (t) => t.id === selectedScene.timeline_ref,
+                        );
+                        const dynLen = linkedTl
+                          ? linkedTl.tracks.reduce(
+                              (acc, tr) =>
+                                Math.max(
+                                  acc,
+                                  ...tr.clips.map((c) => c.start_sec + c.duration_sec),
+                                ),
+                              0,
+                            )
+                          : 0;
+                        return (
+                          <div className="flex flex-col gap-1">
+                            <span className="text-fog">Duration</span>
+                            <div
+                              data-testid="timeline-dynamic-duration-readout"
+                              className="bg-ink border border-steel/70 rounded px-2 py-1 text-xs text-mist"
+                              title="Timeline length is calculated dynamically from the end of its last clip"
+                            >
+                              Dynamic ({dynLen.toFixed(1)}s)
+                            </div>
+                          </div>
+                        );
+                      }
                       return (
                         <div className="flex flex-col gap-1">
                           <span className="text-fog">Duration</span>
@@ -3514,7 +3756,7 @@ export function SceneAndFxManager({
                               data-testid="scene-duration-input"
                               type="number"
                               min={0.1}
-                              step={0.25}
+                              step={curDurUnit === "beats" ? 1 : 0.1}
                               value={curDurVal}
                               onChange={(e) => {
                                 const parsed = Number(e.target.value);
@@ -3901,6 +4143,22 @@ export function SceneAndFxManager({
           <button
             type="button"
             onClick={() => {
+              const target = showState.scenes.find(
+                (s) => s.id === sceneContextMenu.sceneId,
+              );
+              if (target) {
+                setRenamingSceneId(target.id);
+                setRenameSceneValue(target.name);
+              }
+              setSceneContextMenu(null);
+            }}
+            className="w-full px-3 py-1.5 text-left text-mist hover:bg-ink"
+          >
+            Rename Scene
+          </button>
+          <button
+            type="button"
+            onClick={() => {
               toggleSceneFlashMode(sceneContextMenu.sceneId);
               setSceneContextMenu(null);
             }}
@@ -3959,6 +4217,20 @@ export function SceneAndFxManager({
           })}
         </section>
       )}
+      <ColorPaletteBuilderModal
+        open={paletteBuilderOpen}
+        initialPaletteId={fxPaletteRef}
+        onClose={() => setPaletteBuilderOpen(false)}
+        onSaved={(pal) => {
+          const stops = [...(pal.colors ?? [pal.hex_start, pal.hex_end])];
+          setFxPaletteRef(pal.id);
+          setFxInlineColors(stops);
+          void syncSelectedSceneBlock({
+            paletteRef: pal.id,
+            inlineColors: stops,
+          });
+        }}
+      />
     </div>
   );
 }

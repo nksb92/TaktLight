@@ -108,7 +108,9 @@ export const NumericSlider: React.FC<NumericSliderProps> = ({
     }
     const clampedDisplay = Math.max(displayMin, Math.min(displayMax, parsedDisplay));
     const nextRaw = clampRaw(clampedDisplay / mult);
-    onChange(nextRaw);
+    if (Math.abs(nextRaw - value) > 1e-6) {
+      onChange(nextRaw);
+    }
     onCommit?.(nextRaw);
     setDraft(formatDisplay(nextRaw));
   };
@@ -156,7 +158,7 @@ export const NumericSlider: React.FC<NumericSliderProps> = ({
                 e.currentTarget.blur();
               }
             }}
-            className={`w-12 rounded border border-zinc-700 bg-zinc-950 px-1 py-0.5 text-center font-mono text-[10px] text-zinc-200 focus:border-amber-500 focus:outline-none ${inputClassName}`}
+            className={`no-spinner w-12 rounded border border-zinc-700 bg-zinc-950 px-1 py-0.5 text-center font-mono text-[10px] text-zinc-200 focus:border-amber-500 focus:outline-none ${inputClassName}`}
           />
           {unit && <span className="text-[9px] text-zinc-500">{unit}</span>}
           <button
@@ -259,7 +261,7 @@ export const NumericSlider: React.FC<NumericSliderProps> = ({
               e.currentTarget.blur();
             }
           }}
-          className={`w-14 rounded border border-zinc-700 bg-zinc-950 px-1.5 py-0.5 text-right font-mono text-[11px] text-zinc-200 focus:border-amber-500 focus:outline-none ${inputClassName}`}
+          className={`no-spinner w-14 rounded border border-zinc-700 bg-zinc-950 px-1.5 py-0.5 text-right font-mono text-[11px] text-zinc-200 focus:border-amber-500 focus:outline-none ${inputClassName}`}
         />
         {unit && (
           <span className="text-[10px] font-mono text-zinc-400">{unit}</span>

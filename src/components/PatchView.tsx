@@ -446,6 +446,7 @@ export function PatchView() {
           <button
             type="button"
             role="switch"
+            data-testid="toggle-rollover-split"
             aria-checked={rolloverEnabled}
             onClick={() => void setRolloverEnabled(!rolloverEnabled)}
             title="Toggle universe spillover split mode (Shortcut: R)"

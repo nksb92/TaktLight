@@ -1,4 +1,4 @@
-import { Cable, Clock, Layers, LayoutGrid, Monitor } from "lucide-react";
+import { Cable, Layers, LayoutGrid, Monitor } from "lucide-react";
 import { useTaktStore } from "../store/useTaktStore";
 
 export function BottomNavBar() {
@@ -9,7 +9,8 @@ export function BottomNavBar() {
     activeTab === "studio" ||
     activeTab === "grid" ||
     activeTab === "palettes" ||
-    activeTab === "scenes";
+    activeTab === "scenes" ||
+    activeTab === "timeline";
 
   return (
     <footer
@@ -44,20 +45,6 @@ export function BottomNavBar() {
         >
           <LayoutGrid className="w-3.5 h-3.5" />
           <span>Studio / 2D Grid</span>
-        </button>
-
-        <button
-          type="button"
-          aria-pressed={activeTab === "timeline"}
-          onClick={() => setActiveTab("timeline")}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded font-sans text-xs font-medium transition-colors ${
-            activeTab === "timeline"
-              ? "bg-ember text-frost"
-              : "text-fog hover:text-mist"
-          }`}
-        >
-          <Clock className="w-3.5 h-3.5" />
-          <span>Timeline</span>
         </button>
 
         <button

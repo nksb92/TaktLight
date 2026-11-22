@@ -24,6 +24,7 @@ import {
   type GroupMixerStripState,
   useTaktStore,
 } from "../store/useTaktStore";
+import { ColorPaletteBuilderModal } from "./ColorPaletteBuilderModal";
 import { NumericSlider } from "./NumericSlider";
 
 type TraitCategory = "dimmer" | "color" | "beam" | "fader";
@@ -132,8 +133,6 @@ export function PalettesAndControls({
   const upsertDimmerPalette = useTaktStore((s) => s.upsertDimmerPalette);
   const deleteDimmerPalette = useTaktStore((s) => s.deleteDimmerPalette);
   const upsertGroup = useTaktStore((s) => s.upsertGroup);
-  const upsertFxBlock = useTaktStore((s) => s.upsertFxBlock);
-  const upsertScene = useTaktStore((s) => s.upsertScene);
   const setLiveLayers = useTaktStore((s) => s.setLiveLayers);
   const updateGroupMixerStrip = useTaktStore((s) => s.updateGroupMixerStrip);
   const undoShow = useTaktStore((s) => s.undoShow);
@@ -159,6 +158,7 @@ export function PalettesAndControls({
   const [layerSeq, setLayerSeq] = useState(1);
   const hsSquareRef = useRef<HTMLDivElement | null>(null);
   const [pickingHs, setPickingHs] = useState(false);
+  const [paletteBuilderOpen, setPaletteBuilderOpen] = useState(false);
 
   const paletteUsageCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -231,6 +231,20 @@ export function PalettesAndControls({
   const sceneControlsMasterDimmer = Boolean(sceneMasterDimmerEl);
   const sceneControlsColor = Boolean(sceneColorEl);
 
+  const savedSceneTraitsRef = useRef<
+    Record<
+      string,
+      Partial<Record<"dimmer" | "master_dimmer" | "color", FxElementDef>>
+    >
+  >({});
+  const traitOpChainRef = useRef<Promise<void>>(Promise.resolve());
+
+  const enqueueTraitOp = (op: () => Promise<void>): Promise<void> => {
+    const next = traitOpChainRef.current.then(op, op);
+    traitOpChainRef.current = next.catch(() => undefined);
+    return next;
+  };
+
   const currentDimmerVal = useMemo(() => {
     if (sceneDimmerEl && sceneDimmerEl.kind === "static_trait") {
       if (sceneDimmerEl.palette_ref) {
@@ -267,16 +281,26 @@ export function PalettesAndControls({
   const [curR, curG, curB] = hexToRgb(currentColorHex);
   const curHsv = rgbToHsv(curR, curG, curB);
 
-  const upsertSceneTraitElement = async (
+  const applySceneTraitElementNow = async (
     traitName: "dimmer" | "master_dimmer" | "color",
     nextElement: FxElementDef | null,
   ) => {
-    if (!selectedScene) return;
-    const targetBlockId =
-      selectedSceneBlock?.id ?? `blk_scene_${selectedScene.id}`;
-    const blockName =
-      selectedSceneBlock?.name ?? `${selectedScene.name} Look`;
-    const prevElements = selectedSceneBlock?.elements ?? [];
+    const storeState = useTaktStore.getState();
+    const freshShow = storeState.showState;
+    const freshScene =
+      freshShow.scenes.find((s) => s.id === storeState.selectedSceneId) ??
+      freshShow.scenes[0] ??
+      null;
+    if (!freshScene) return;
+
+    const freshBlockRef = freshScene.block_refs[0];
+    const freshBlock = freshBlockRef
+      ? (freshShow.fx_library.find((b) => b.id === freshBlockRef) ?? null)
+      : null;
+
+    const targetBlockId = freshBlock?.id ?? `blk_scene_${freshScene.id}`;
+    const blockName = freshBlock?.name ?? `${freshScene.name} Look`;
+    const prevElements = freshBlock?.elements ?? [];
     const prevStatic = prevElements.filter((el) => el.kind === "static_trait");
     const prevProcedural = prevElements.filter((el) => el.kind !== "static_trait");
     let nextStatic: FxElementDef[];
@@ -292,31 +316,95 @@ export function PalettesAndControls({
     }
     const nextElements = [...nextStatic, ...prevProcedural];
 
-    const sceneDurVal = selectedScene.duration_value ?? 4;
-    const sceneDurUnit = selectedScene.duration_unit ?? "beats";
+    const sceneDurVal = freshScene.duration_value ?? 4;
+    const sceneDurUnit = freshScene.duration_unit ?? "beats";
 
-    await upsertFxBlock({
+    await storeState.upsertFxBlock({
       id: targetBlockId,
       name: blockName,
       target_group:
-        selectedSceneBlock?.target_group ?? (activeGroupFilterId || "all"),
+        freshBlock?.target_group ?? (storeState.activeGroupFilterId || "all"),
       duration_beats:
-        selectedSceneBlock?.duration_beats ??
+        freshBlock?.duration_beats ??
         (sceneDurUnit === "beats" ? sceneDurVal : 4),
       duration_sec:
-        selectedSceneBlock?.duration_sec ??
+        freshBlock?.duration_sec ??
         (sceneDurUnit === "seconds" ? sceneDurVal : null),
-      loop_block: selectedSceneBlock?.loop_block ?? true,
+      loop_block: freshBlock?.loop_block ?? true,
       elements: nextElements,
     });
 
-    if (!selectedScene.block_refs.includes(targetBlockId)) {
-      await upsertScene({
-        ...selectedScene,
-        block_refs: [targetBlockId, ...selectedScene.block_refs],
+    const latestShow = useTaktStore.getState().showState;
+    const latestScene =
+      latestShow.scenes.find((s) => s.id === freshScene.id) ?? freshScene;
+    if (!latestScene.block_refs.includes(targetBlockId)) {
+      await useTaktStore.getState().upsertScene({
+        ...latestScene,
+        block_refs: [targetBlockId, ...latestScene.block_refs],
       });
     }
   };
+
+  const upsertSceneTraitElement = (
+    traitName: "dimmer" | "master_dimmer" | "color",
+    nextElement: FxElementDef | null,
+  ) => enqueueTraitOp(() => applySceneTraitElementNow(traitName, nextElement));
+
+  const toggleSceneColorTrait = (fallbackHex: string) =>
+    enqueueTraitOp(async () => {
+      const storeState = useTaktStore.getState();
+      const freshShow = storeState.showState;
+      const freshScene =
+        freshShow.scenes.find((s) => s.id === storeState.selectedSceneId) ??
+        freshShow.scenes[0] ??
+        null;
+      if (!freshScene) return;
+
+      const freshBlockRef = freshScene.block_refs[0];
+      const freshBlock = freshBlockRef
+        ? (freshShow.fx_library.find((b) => b.id === freshBlockRef) ?? null)
+        : null;
+      const freshColorEl = freshBlock?.elements.find(
+        (e) => e.kind === "static_trait" && e.trait === "color",
+      );
+
+      if (freshColorEl) {
+        savedSceneTraitsRef.current[freshScene.id] = {
+          ...savedSceneTraitsRef.current[freshScene.id],
+          color: freshColorEl,
+        };
+        if (freshColorEl.kind === "static_trait" && freshColorEl.hex_start) {
+          setColorStartHex(freshColorEl.hex_start);
+          setColorEndHex(freshColorEl.hex_end ?? freshColorEl.hex_start);
+        } else {
+          setColorStartHex(fallbackHex);
+        }
+        await applySceneTraitElementNow("color", null);
+      } else {
+        const saved = savedSceneTraitsRef.current[freshScene.id]?.color;
+        if (saved) {
+          if (saved.kind === "static_trait" && saved.hex_start) {
+            setColorStartHex(saved.hex_start);
+            setColorEndHex(saved.hex_end ?? saved.hex_start);
+          }
+          await applySceneTraitElementNow("color", saved);
+        } else {
+          setColorStartHex(fallbackHex);
+          setColorEndHex(fallbackHex);
+          await applySceneTraitElementNow("color", {
+            kind: "static_trait",
+            trait: "color",
+            op: "ltp",
+            palette_ref: null,
+            value_start: 0,
+            value_end: 0,
+            hex_start: fallbackHex,
+            hex_end: fallbackHex,
+            order: null,
+          });
+        }
+      }
+    });
 
   const setSceneDimmerValue = (val01: number) => {
     const clamped = clamp01(val01);
@@ -1395,13 +1483,27 @@ export function PalettesAndControls({
                       type="button"
                       data-testid="toggle-scene-controls-dimmer"
                       aria-pressed={sceneControlsDimmer}
-                      onClick={() =>
-                        sceneControlsDimmer
-                          ? void upsertSceneTraitElement("dimmer", null)
-                          : setSceneDimmerValue(
+                      onClick={() => {
+                        if (!selectedScene) return;
+                        if (sceneControlsDimmer && sceneDimmerEl) {
+                          savedSceneTraitsRef.current[selectedScene.id] = {
+                            ...savedSceneTraitsRef.current[selectedScene.id],
+                            dimmer: sceneDimmerEl,
+                          };
+                          void upsertSceneTraitElement("dimmer", null);
+                        } else {
+                          const saved =
+                            savedSceneTraitsRef.current[selectedScene.id]
+                              ?.dimmer;
+                          if (saved) {
+                            void upsertSceneTraitElement("dimmer", saved);
+                          } else {
+                            setSceneDimmerValue(
                               currentDimmerVal > 0 ? currentDimmerVal : 1,
-                            )
-                      }
+                            );
+                          }
+                        }
+                      }}
                       title="Toggle whether this scene controls Segment Dimmer"
                       className="flex items-center gap-1 font-mono text-[10px] text-frost hover:text-amber-300"
                     >
@@ -1493,11 +1595,9 @@ export function PalettesAndControls({
                       type="button"
                       data-testid="toggle-scene-controls-color"
                       aria-pressed={sceneControlsColor}
-                      onClick={() =>
-                        sceneControlsColor
-                          ? void upsertSceneTraitElement("color", null)
-                          : setSceneStaticColorHex(currentColorHex)
-                      }
+                      onClick={() => {
+                        void toggleSceneColorTrait(currentColorHex);
+                      }}
                       title="Toggle whether this scene controls Color"
                       className="flex items-center gap-1.5 font-semibold text-frost hover:text-amber-300"
                     >
@@ -1604,6 +1704,15 @@ export function PalettesAndControls({
                           </button>
                         );
                       })}
+                      <button
+                        type="button"
+                        data-testid="open-palette-builder-dock-btn"
+                        onClick={() => setPaletteBuilderOpen(true)}
+                        title="Open Color Palette Builder"
+                        className="h-3.5 px-1.5 rounded-sm border border-steel bg-ink hover:border-ember font-mono text-[8px] text-mist hover:text-frost"
+                      >
+                        + Palette
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -2246,6 +2355,11 @@ export function PalettesAndControls({
           </>
         )}
       </div>
+      <ColorPaletteBuilderModal
+        open={paletteBuilderOpen}
+        onClose={() => setPaletteBuilderOpen(false)}
+        onSaved={(pal) => setSceneColorPalette(pal.id)}
+      />
     </div>
   );
 }

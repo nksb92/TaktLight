@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect } from "react";
 import { BottomNavBar } from "./components/BottomNavBar";
@@ -6,7 +7,6 @@ import { FixtureBuilder } from "./components/FixtureBuilder";
 import { JitterHistogram } from "./components/JitterHistogram";
 import { PatchView } from "./components/PatchView";
 import { StudioWorkspace } from "./components/StudioWorkspace";
-import { TimelineEditor } from "./components/TimelineEditor";
 import { TopStatusBar } from "./components/TopStatusBar";
 import { isTauriEnvironment, useTaktStore } from "./store/useTaktStore";
 
@@ -21,6 +21,15 @@ export function App() {
 
   useEffect(() => {
     const disconnect = initEngineConnection();
+    if (isTauriEnvironment()) {
+      const raf = requestAnimationFrame(() => {
+        void invoke("close_splashscreen").catch(() => undefined);
+      });
+      return () => {
+        cancelAnimationFrame(raf);
+        disconnect();
+      };
+    }
     return () => {
       disconnect();
     };
@@ -79,7 +88,8 @@ export function App() {
     activeTab === "studio" ||
     activeTab === "grid" ||
     activeTab === "palettes" ||
-    activeTab === "scenes";
+    activeTab === "scenes" ||
+    activeTab === "timeline";
 
   return (
     <div
@@ -105,7 +115,6 @@ export function App() {
         )}
         {activeTab === "patch" && <PatchView />}
         {isStudio && <StudioWorkspace />}
-        {activeTab === "timeline" && <TimelineEditor />}
         {activeTab === "fixtures" && <FixtureBuilder />}
       </main>
       <BottomNavBar />
