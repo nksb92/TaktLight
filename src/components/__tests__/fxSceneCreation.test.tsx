@@ -334,4 +334,44 @@ describe("FX Scene Creation, Parameter Adaptation & DMX Plausibility (All 6 UI T
     const cells = getTubeCellRgbw();
     expect(cells.some((c) => c.w > 0)).toBe(true);
   });
+
+  it("supports Static toggle (rate_cycles=0) and Phase Offset on color_mappings and mappings", async () => {
+    await setupStudioWithTube();
+    const scId = await createAndSelectFreshScene();
+    await setStaticDockDimmerFull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("fx-picker-tile-color_mappings"));
+      await Promise.resolve();
+    });
+
+    // Toggle Static on -> rate_cycles becomes 0
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("spatial-static-toggle"));
+      await Promise.resolve();
+    });
+
+    let el = getActiveSceneElements(scId).find((e) => e.kind === "spatial_shader_2d");
+    expect(el?.kind === "spatial_shader_2d" ? el.rate_cycles : null).toBe(0);
+
+    // Adjust Phase Offset slider -> phase_offset updates
+    await act(async () => {
+      const phaseInput = screen.getByLabelText("Spatial Phase Offset value");
+      fireEvent.change(phaseInput, { target: { value: "50" } });
+      fireEvent.blur(phaseInput);
+      await Promise.resolve();
+    });
+
+    el = getActiveSceneElements(scId).find((e) => e.kind === "spatial_shader_2d");
+    expect(el?.kind === "spatial_shader_2d" ? el.phase_offset : null).toBeCloseTo(0.5, 2);
+
+    // Toggle Static off -> restores previous non-zero rate
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("spatial-static-toggle"));
+      await Promise.resolve();
+    });
+
+    el = getActiveSceneElements(scId).find((e) => e.kind === "spatial_shader_2d");
+    expect(el?.kind === "spatial_shader_2d" ? el.rate_cycles : null).toBe(1);
+  });
 });

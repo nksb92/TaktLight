@@ -63,7 +63,9 @@ describe("2D Grid, Timeline Inspector & TopStatusBar Normal Usage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
     fireEvent.click(screen.getByTestId("scene-play-zone-sc_tl_cyber_intro"));
 
-    // Clip tab: update stretch factor & reset
+    // Clip tab: select first clip, then update stretch factor & reset
+    fireEvent.pointerDown(screen.getByTestId("clip-body-trk_1-0"), { clientX: 50, button: 0 });
+    fireEvent.pointerUp(window);
     expect(screen.getByTestId("selected-clip-inspector")).toBeInTheDocument();
     await act(async () => {
       const stretchInput = screen.getByTestId("clip-stretch-factor-input");

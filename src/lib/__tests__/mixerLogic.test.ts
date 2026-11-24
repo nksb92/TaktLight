@@ -7,6 +7,7 @@ import {
   buildStepChasePreviewBlocks,
   computeBeatGridMarkers,
   computeClipAlphaAt,
+  computeSceneSequenceDurationSec,
   DEFAULT_COLOR_PALETTES,
   dmxToPerceptualU8,
   evaluateCurve1DScalar,
@@ -15,9 +16,11 @@ import {
   evaluateStepChaseScalar,
   evalUnipolarWaveform,
   extractRgbw,
+  getActiveSequenceStepAt,
   integrateTempoMapBeats,
   linearRgbToOklab,
   MERGE_OP_LABELS,
+  patternScaleToBoxHalfNorm,
   patternScaleToSpatialFreq,
   quantizeChannelValue,
   rangePctToAmplitudeOffset,
@@ -178,6 +181,9 @@ describe("mixerLogic", () => {
     const freq = patternScaleToSpatialFreq(2.0);
     expect(freq).toBeCloseTo(0.5, 3);
     expect(spatialFreqToPatternScale(freq)).toBeCloseTo(2.0, 2);
+    expect(patternScaleToBoxHalfNorm(1.0)).toBeCloseTo(0.2, 5);
+    expect(patternScaleToBoxHalfNorm(3.0)).toBeCloseTo(0.6, 5);
+    expect(patternScaleToBoxHalfNorm(10.0)).toBeCloseTo(2.0, 5);
 
     const svg = buildCurve1DSvgPreview({
       waveform: "sine",
@@ -682,5 +688,42 @@ describe("mixerLogic", () => {
     expect(redOut.dmxByUniverse[0][1]).toBe(255);
     expect(redOut.dmxByUniverse[0][2]).toBe(0);
     expect(redOut.dmxByUniverse[0][3]).toBe(0);
+  });
+
+  it("computes SceneSequence duration and active step across empty, mixed units, crossfade, and playback modes", () => {
+    expect(computeSceneSequenceDurationSec([], 120)).toBe(0);
+    expect(getActiveSequenceStepAt([], "loop", 0.5, 120)).toBeNull();
+
+    const steps = [
+      { scene_id: "sc_1", duration_value: 2, duration_unit: "beats" as const, fade_sec: 0.5 }, // 1.0s at 120 BPM
+      { scene_id: "sc_2", duration_value: 1.5, duration_unit: "seconds" as const, fade_sec: 0.5 }, // 1.5s
+      { scene_id: "sc_3", duration_value: 1, duration_unit: "seconds" as const, fade_sec: 0 }, // 1.0s
+    ];
+    expect(computeSceneSequenceDurationSec(steps, 120)).toBeCloseTo(3.5, 5);
+
+    // Loop mode: t=1.25s is 0.25s into step 1 (fade_sec=0.5 -> fadeAlpha=0.5, prevIndex=0)
+    const loopMid = getActiveSequenceStepAt(steps, "loop", 1.25, 120)!;
+    expect(loopMid.activeIndex).toBe(1);
+    expect(loopMid.prevIndex).toBe(0);
+    expect(loopMid.fadeAlpha).toBeCloseTo(0.5, 5);
+
+    // Loop wrap: t=3.75s wraps to 0.25s into step 0 with prevIndex=2
+    const loopWrap = getActiveSequenceStepAt(steps, "loop", 3.75, 120)!;
+    expect(loopWrap.activeIndex).toBe(0);
+    expect(loopWrap.prevIndex).toBe(2);
+    expect(loopWrap.fadeAlpha).toBeCloseTo(0.5, 5);
+
+    // One-shot holds final step past total duration
+    const oneShotEnd = getActiveSequenceStepAt(steps, "one_shot", 10.0, 120)!;
+    expect(oneShotEnd.activeIndex).toBe(2);
+    expect(oneShotEnd.prevIndex).toBeNull();
+    expect(oneShotEnd.fadeAlpha).toBe(1);
+
+    // Bounce: order [0, 1, 2, 1] -> total bounce cycle = 1.0 + 1.5 + 1.0 + 1.5 = 5.0s
+    // At t=4.0s -> 0.5s into returning step 1, prevIndex=2
+    const bounceRet = getActiveSequenceStepAt(steps, "bounce", 4.0, 120)!;
+    expect(bounceRet.activeIndex).toBe(1);
+    expect(bounceRet.prevIndex).toBe(2);
+    expect(bounceRet.stepLocalSec).toBeCloseTo(0.5, 5);
   });
 });

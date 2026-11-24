@@ -1,20 +1,25 @@
 import { describe, expect, it } from "vitest";
 import {
   applySingleTrackOverwrite,
+  buildTimelineSnapTargets,
   clampTrimEndNonOverlapping,
   clampTrimStartNonOverlapping,
   cleanBeatValue,
   clipsOverlap,
   computeEffectCycleBoundaries,
   computeSnapGridMarkers,
+  computeSnapThresholdSec,
   computeTimelineContentDurationSec,
   computeTimelineViewportDurationSec,
   computeZoomAdaptiveRulerTicks,
   durationBeatsToSec,
+  ensureTrailingEmptyTrack,
   gridBeatsToSec,
   resolveNonOverlappingStart,
   secToDurationBeats,
   secToGridBeats,
+  selectAutoFillHitTimes,
+  snapTimeSecToTargets,
 } from "../timelineLogic";
 
 describe("timelineLogic", () => {
@@ -136,5 +141,195 @@ describe("timelineLogic", () => {
     expect(secToDurationBeats(dur16Sec, 130)).toBe(16);
     expect(cleanBeatValue(15.9987)).toBe(16);
     expect(cleanBeatValue(0.0012)).toBe(0);
+  });
+
+  it("ensures exactly one empty untyped trailing track below the lowest used track", () => {
+    const emptyOnly = [
+      { id: "trk_1", name: "Track 1", track_type: "untyped" as const, target_group: "all", clips: [] },
+    ];
+    expect(ensureTrailingEmptyTrack(emptyOnly)).toEqual(emptyOnly);
+
+    const afterMusicOnTrack1 = ensureTrailingEmptyTrack([
+      {
+        id: "trk_1",
+        name: "Track 1",
+        track_type: "music" as const,
+        target_group: null,
+        clips: [{ ref_block: null, start_sec: 0, duration_sec: 4, fade_in_sec: 0, fade_out_sec: 0, inline_fx: [], audio_file: "song.wav" }],
+      },
+    ]);
+    expect(afterMusicOnTrack1).toHaveLength(2);
+    expect(afterMusicOnTrack1[1]).toMatchObject({
+      name: "Track 2",
+      track_type: "untyped",
+      clips: [],
+    });
+
+    // Adding a clip on Track 2 creates Track 3
+    const afterSceneOnTrack2 = ensureTrailingEmptyTrack([
+      afterMusicOnTrack1[0],
+      {
+        ...afterMusicOnTrack1[1],
+        track_type: "effect" as const,
+        clips: [{ ref_block: "blk_1", start_sec: 0, duration_sec: 2, fade_in_sec: 0, fade_out_sec: 0, inline_fx: [] }],
+      },
+    ]);
+    expect(afterSceneOnTrack2).toHaveLength(3);
+    expect(afterSceneOnTrack2[2]).toMatchObject({
+      name: "Track 3",
+      track_type: "untyped",
+      clips: [],
+    });
+
+    // Calling again when Track 3 is already empty below does not create Track 4
+    expect(ensureTrailingEmptyTrack(afterSceneOnTrack2)).toHaveLength(3);
+  });
+
+  it("builds snap targets strictly from active Beats/Kicks/Snares toggles, excludes dragged clip, and breaks ties in favor of transients", () => {
+    const tracks = [
+      {
+        id: "trk_1",
+        name: "Track 1",
+        track_type: "effect" as const,
+        target_group: "all",
+        clips: [
+          {
+            ref_block: "blk_1",
+            start_sec: 1.0,
+            duration_sec: 1.0,
+            fade_in_sec: 0,
+            fade_out_sec: 0,
+            inline_fx: [],
+          },
+          {
+            ref_block: "blk_1",
+            start_sec: 3.0,
+            duration_sec: 1.0,
+            fade_in_sec: 0,
+            fade_out_sec: 0,
+            inline_fx: [],
+          },
+        ],
+      },
+    ];
+    const transients = [
+      { time_sec: 0.5, band: "kick" as const },
+      { time_sec: 1.23, band: "snare" as const },
+      { time_sec: 1.5, band: "kick" as const },
+      { time_sec: 2.37, band: "snare" as const },
+    ];
+
+    // Beats OFF, Kicks OFF, Snares ON -> beats (0.5/1.0/1.5) and kicks omitted; snares kept; dragged clip 0 (1.0..2.0) omitted
+    const targetsSnaresOnly = buildTimelineSnapTargets({
+      viewportDurationSec: 8,
+      effectiveBpm: 120,
+      gridOffsetSec: 0,
+      snapGrid: "beat",
+      showBeats: false,
+      showKicks: false,
+      showSnares: true,
+      transients,
+      tracks,
+      excludeClip: { trackId: "trk_1", clipIndex: 0 },
+    });
+
+    expect(targetsSnaresOnly.some((t) => t.kind === "beat")).toBe(false);
+    expect(targetsSnaresOnly.some((t) => t.kind === "kick")).toBe(false);
+    expect(targetsSnaresOnly.filter((t) => t.kind === "snare").map((t) => t.time_sec)).toEqual([
+      1.23, 2.37,
+    ]);
+    // Own edges (1.0, 2.0) excluded, other clip edges (3.0, 4.0) preserved
+    expect(targetsSnaresOnly.filter((t) => t.kind === "clip").map((t) => t.time_sec)).toEqual([
+      3.0, 4.0,
+    ]);
+
+    // Near 1.05s: would have snapped to Beat 1.0 or own start 1.0 before; now does NOT snap to 1.0
+    const resNearOldBeat = snapTimeSecToTargets(1.05, targetsSnaresOnly, 0.15);
+    expect(resNearOldBeat.snappedTo).toBeNull();
+    expect(resNearOldBeat.time_sec).toBe(1.05);
+
+    // Near 1.15s: snaps directly to 1.23s Snare
+    const resNearSnare = snapTimeSecToTargets(1.15, targetsSnaresOnly, 0.15);
+    expect(resNearSnare.snappedTo).toEqual({ time_sec: 1.23, kind: "snare" });
+    expect(resNearSnare.time_sec).toBe(1.23);
+
+    // Tie-breaking: when a clip edge and snare are at identical 3.0s, transient wins over clip edge
+    const tieTargets = buildTimelineSnapTargets({
+      viewportDurationSec: 8,
+      effectiveBpm: 120,
+      gridOffsetSec: 0,
+      snapGrid: "beat",
+      showBeats: true,
+      showKicks: false,
+      showSnares: true,
+      transients: [{ time_sec: 3.0, band: "snare" }],
+      tracks,
+      excludeClip: null,
+    });
+    const tieRes = snapTimeSecToTargets(3.01, tieTargets, 0.15);
+    expect(tieRes.snappedTo).toEqual({ time_sec: 3.0, kind: "snare" });
+
+    // Zoom-adaptive snap tolerance clamped cleanly between 0.04s and 0.22s
+    expect(computeSnapThresholdSec(24, 10)).toBe(0.22);
+    expect(computeSnapThresholdSec(100, 10)).toBe(0.1);
+    expect(computeSnapThresholdSec(400, 10)).toBe(0.04);
+  });
+
+  it("selects auto-fill hit times with cadence and optional playhead-forward count limits", () => {
+    const hits = [0.5, 1.0, 1.5, 1.55, 2.0, 2.5, 3.0, 3.5, 4.0];
+
+    // All hits (maxCount: null) keeps every non-overlapping hit even if playhead > 0
+    expect(
+      selectAutoFillHitTimes({
+        hitTimes: hits,
+        startFromSec: 2.0,
+        cadence: 1,
+        maxCount: null,
+        minGapSec: 0.2,
+      }),
+    ).toEqual([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]);
+
+    // Every 2nd / 4th hit across full range
+    expect(
+      selectAutoFillHitTimes({
+        hitTimes: hits,
+        startFromSec: 0,
+        cadence: 2,
+        maxCount: null,
+        minGapSec: 0.2,
+      }),
+    ).toEqual([0.5, 1.5, 2.5, 3.5]);
+
+    expect(
+      selectAutoFillHitTimes({
+        hitTimes: hits,
+        startFromSec: 0,
+        cadence: 4,
+        maxCount: null,
+        minGapSec: 0.2,
+      }),
+    ).toEqual([0.5, 2.5]);
+
+    expect(
+      selectAutoFillHitTimes({
+        hitTimes: hits,
+        startFromSec: 0,
+        cadence: 4,
+        offset: 1,
+        maxCount: null,
+        minGapSec: 0.2,
+      }),
+    ).toEqual([1.0, 3.0]);
+
+    // Limited count (maxCount: 3) + cadence 2 from playhead 2.0s forward
+    expect(
+      selectAutoFillHitTimes({
+        hitTimes: hits,
+        startFromSec: 2.0,
+        cadence: 2,
+        maxCount: 3,
+        minGapSec: 0.2,
+      }),
+    ).toEqual([2.0, 3.0, 4.0]);
   });
 });

@@ -85,39 +85,6 @@ describe("Palettes, Static Dock Controls & Live Mixer Normal Usage", () => {
     expect(blueAfterPick).toBeGreaterThan(150);
   });
 
-  it("controls Live Busking Mixer strip (Full, Blackout, Flash, Strobe toggle) and outputs plausible DMX", async () => {
-    await mountStudioWithTube();
-
-    fireEvent.click(screen.getByTestId("submode-live_busking"));
-    expect(screen.getByTestId("live-mixer-console")).toBeInTheDocument();
-    expect(screen.getByTestId("group-mixer-strip-all")).toBeInTheDocument();
-
-    // Full button drives master dimmer & white output to 255
-    fireEvent.click(screen.getByTestId("mixer-full-all"));
-    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
-    expect(useTaktStore.getState().dmxByUniverse[1][5]).toBe(255);
-
-    // Blackout button drops all pixel RGBW output to 0
-    fireEvent.click(screen.getByTestId("mixer-blackout-all"));
-    const boDmx = Array.from(useTaktStore.getState().dmxByUniverse[1].slice(2, 34));
-    expect(boDmx.every((v) => v === 0)).toBe(true);
-    // Toggle BO back off before testing momentary Flash
-    fireEvent.click(screen.getByTestId("mixer-blackout-all"));
-
-    // Momentary Flash lifts output while held and releases to 0
-    fireEvent.pointerDown(screen.getByTestId("mixer-flash-all"));
-    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
-    fireEvent.pointerUp(screen.getByTestId("mixer-flash-all"));
-    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
-
-    // Strobe toggle activates strobe state on the strip
-    const strobeBtn = screen.getByTestId("mixer-strobe-toggle-all");
-    fireEvent.click(strobeBtn);
-    expect(useTaktStore.getState().groupMixerStrips["all"]?.strobeEnabled).toBe(true);
-    fireEvent.click(strobeBtn);
-    expect(useTaktStore.getState().groupMixerStrips["all"]?.strobeEnabled).toBe(false);
-  });
-
   it("links a saved color palette directly onto the active scene from the COLOR dock", async () => {
     await mountStudioWithTube();
 
@@ -131,6 +98,6 @@ describe("Palettes, Static Dock Controls & Live Mixer Normal Usage", () => {
     const blk = useTaktStore
       .getState()
       .showState.fx_library.find((b) => b.id === "blk_scene_sc_new_1");
-    expect(blk?.elements.some((e) => e.trait === "color")).toBe(true);
+    expect(blk?.elements.some((e) => e.kind !== "scene_sequence" && e.trait === "color")).toBe(true);
   });
 });

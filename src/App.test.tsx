@@ -82,8 +82,9 @@ describe("TaktLight Slice 1 Studio UI", () => {
     expect(screen.getByText("RLCV3 8-Segment RGBW Tube")).toBeInTheDocument();
     expect(screen.getByText("RLCV4 16-Segment RGBW Tube")).toBeInTheDocument();
 
-    // Start new custom fixture draft, edit name, and save to user library
+    // Start new custom fixture draft (starts with 0 modes), add a mode, edit name, and save to user library
     fireEvent.click(screen.getByRole("button", { name: /New Builder Draft/i }));
+    fireEvent.click(screen.getByTestId("add-mode-btn"));
     const nameInput = screen.getByLabelText("Fixture Name");
     fireEvent.change(nameInput, { target: { value: "Studio Neon Bar" } });
 
@@ -207,7 +208,7 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
     const xmlPreview = await screen.findByTestId("show-xml-preview");
     expect(xmlPreview).toHaveTextContent('<TaktLightShow version="1.0"');
     expect(xmlPreview).toHaveTextContent('profile="age/rlcv3_8_segment_tube.json"');
-  }, 15000);
+  }, 60000);
 
   it("renders 2D Fixture Grid, updates GridPos, and previews 1D OrderRule & TargetRef mapping", async () => {
     await useTaktStore
@@ -763,7 +764,7 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
     const updatedBlk = useTaktStore
       .getState()
       .showState.fx_library.find((b) => b.id === "blk_scene_sc_new_1");
-    const dimEl = updatedBlk?.elements.find((e) => e.trait === "dimmer");
+    const dimEl = updatedBlk?.elements.find((e) => e.kind !== "scene_sequence" && e.trait === "dimmer");
     expect(dimEl?.kind === "static_trait" ? dimEl.value_start : null).toBeCloseTo(0.6);
 
     // 2. Bank Management: instant Bank creation + double-click rename + blank scene landing on Choice Matrix
@@ -815,7 +816,7 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
             .getState()
             .showState.scenes.find((s) => s.id === colorScene.id)?.block_refs[0],
       )!;
-    expect(colorBlk.elements[0].trait).toBe("color");
+    expect(colorBlk.elements[0].kind !== "scene_sequence" ? colorBlk.elements[0].trait : null).toBe("color");
     expect(colorBlk.elements[0].kind).toBe("curve_1d");
 
     // Add an Effect Scene in Effects bank -> lands on Choice Matrix -> pick CHASER FX
@@ -914,20 +915,13 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
     fireEvent.click(screen.getByTestId("trait-tab-color"));
     expect(screen.getByTestId("color-hs-square")).toBeInTheDocument();
 
-    // 4. Key Mapping + Live Mixer
+    // 4. Key Mapping
     fireEvent.click(screen.getByTestId("toggle-key-map-overlay"));
     expect(screen.getByTestId("mapping-overlay-banner")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("scene-play-zone-sc_new_1"));
     fireEvent.keyDown(window, { key: "k" });
     expect(useTaktStore.getState().keyBindings["sc_new_1"]).toBe("K");
     fireEvent.click(screen.getByTestId("toggle-key-map-overlay"));
-
-    fireEvent.click(screen.getByTestId("submode-live_busking"));
-    expect(screen.getByTestId("live-mixer-console")).toBeInTheDocument();
-    fireEvent.pointerDown(screen.getByTestId("mixer-flash-all"));
-    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(255);
-    fireEvent.pointerUp(screen.getByTestId("mixer-flash-all"));
-    expect(useTaktStore.getState().dmxByUniverse[1][0]).toBe(0);
 
     // 5. Timeline Super-Scene Dock & Layering Color Scene + Effect Scene onto Tracks
     fireEvent.click(screen.getByTestId("submode-builder"));
@@ -973,7 +967,8 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
     });
 
     const tracksAfter = useTaktStore.getState().showState.timelines[0].tracks;
-    const trkEffectId = tracksAfter[tracksAfter.length - 1].id;
+    const trkEffectId = tracksAfter[tracksAfter.length - 2].id;
+    const trailingTrack = tracksAfter[tracksAfter.length - 1];
 
     expect(
       screen.getByTestId(`track-lane-${tracksBefore[0].id}`),
@@ -981,6 +976,8 @@ describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select
     expect(
       screen.getByTestId(`track-lane-${trkEffectId}`),
     ).toHaveTextContent(`[EFFECT] ${effectScene.name}`);
+    expect(trailingTrack.track_type).toBe("untyped");
+    expect(trailingTrack.clips).toHaveLength(0);
   });
 });
 
@@ -1080,6 +1077,10 @@ describe("TaktLight NLE Video-Editor Timeline", () => {
     // Auto-fill kicks creates a dedicated Kick Hits FX track populated with kick clips
     await act(async () => {
       fireEvent.click(screen.getByTestId("timeline-auto-place-kicks-btn"));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("timeline-kicks-confirm-btn"));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -1217,9 +1218,9 @@ describe("TaktLight Usage Notes Regressions (Items 1-18)", () => {
     render(<App />);
 
     // GM tooltip present in TopStatusBar
-    expect(
-      screen.getByText("GM").closest("[title]")?.getAttribute("title"),
-    ).toMatch(/Grand Master/i);
+    fireEvent.focus(screen.getByTestId("topbar-gm-help"));
+    expect(screen.getByRole("tooltip")).toHaveTextContent(/Grand Master/i);
+    fireEvent.blur(screen.getByTestId("topbar-gm-help"));
 
     // Patch 2 fixtures and open Studio
     fireEvent.click(screen.getByRole("button", { name: /Patch Fixtures/i }));

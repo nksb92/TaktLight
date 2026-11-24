@@ -219,9 +219,8 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
   });
 
   it("L8: color_mappings mirror_x, mirror_y, and invert transform around gizmo center on all shaders", () => {
-    // Off-center gizmo at (0.3, 0.4), sample point at (0.4, 0.55) => dx=+0.1, dy=+0.15
+    // Off-center gizmo at (0.3, 0.4)
     const baseArgs = {
-      normXy: [0.4, 0.55] as [number, number],
       basePhaseCycles: 0.1,
       spatialFreq: 1.0,
       colorWidth: 1,
@@ -231,27 +230,89 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
     };
 
     for (const shader of ["linear_sweep", "pinwheel", "plasma"] as const) {
-      const sNone = evaluateSpatialShader2DPhase({ ...baseArgs, shader, transform: null });
-      const sMx = evaluateSpatialShader2DPhase({ ...baseArgs, shader, transform: "mirror_x" });
-      const sMy = evaluateSpatialShader2DPhase({ ...baseArgs, shader, transform: "mirror_y" });
-      const sInv = evaluateSpatialShader2DPhase({ ...baseArgs, shader, transform: "invert" });
-      expect(sMx).not.toBeCloseTo(sNone, 3);
-      expect(sMy).not.toBeCloseTo(sNone, 3);
-      expect(sInv).not.toBeCloseTo(sNone, 3);
+      const sNegBoth = evaluateSpatialShader2DPhase({
+        ...baseArgs,
+        normXy: [0.2, 0.25],
+        shader,
+        transform: null,
+      });
+      const sMxLeft = evaluateSpatialShader2DPhase({
+        ...baseArgs,
+        normXy: [0.2, 0.25],
+        shader,
+        transform: "mirror_x",
+      });
+      const sMxRight = evaluateSpatialShader2DPhase({
+        ...baseArgs,
+        normXy: [0.4, 0.25],
+        shader,
+        transform: "mirror_x",
+      });
+      const sMyTop = evaluateSpatialShader2DPhase({
+        ...baseArgs,
+        normXy: [0.2, 0.25],
+        shader,
+        transform: "mirror_y",
+      });
+      const sMyBottom = evaluateSpatialShader2DPhase({
+        ...baseArgs,
+        normXy: [0.2, 0.55],
+        shader,
+        transform: "mirror_y",
+      });
+      const sInv = evaluateSpatialShader2DPhase({
+        ...baseArgs,
+        normXy: [0.2, 0.25],
+        shader,
+        transform: "invert",
+      });
+
+      // Mirror X places the mirror plane at centerX (0.3)
+      expect(sMxLeft).toBeCloseTo(sMxRight, 5);
+      expect(sMxLeft).not.toBeCloseTo(sNegBoth, 3);
+      // Mirror Y places the mirror plane at centerY (0.4)
+      expect(sMyTop).toBeCloseTo(sMyBottom, 5);
+      expect(sMyTop).not.toBeCloseTo(sNegBoth, 3);
+      expect(sInv).not.toBeCloseTo(sNegBoth, 3);
     }
 
-    // Radial wave invert flips value cleanly
+    // Radial wave invert flips value cleanly, and mirror_x / mirror_y double the radial centers
     const rNone = evaluateSpatialShader2DPhase({
       ...baseArgs,
+      normXy: [0.4, 0.55],
       shader: "radial_wave",
       transform: null,
     });
     const rInv = evaluateSpatialShader2DPhase({
       ...baseArgs,
+      normXy: [0.4, 0.55],
       shader: "radial_wave",
       transform: "invert",
     });
     expect(rNone + rInv).toBeCloseTo(1.0, 4);
+
+    const rMxLeft = evaluateSpatialShader2DPhase({
+      ...baseArgs,
+      normXy: [0.2, 0.4],
+      shader: "radial_wave",
+      transform: "mirror_x",
+    });
+    const rMxRight = evaluateSpatialShader2DPhase({
+      ...baseArgs,
+      normXy: [0.4, 0.4],
+      shader: "radial_wave",
+      transform: "mirror_x",
+    });
+    expect(rMxLeft).toBeCloseTo(rMxRight, 5);
+    expect(rMxLeft).not.toBeCloseTo(
+      evaluateSpatialShader2DPhase({
+        ...baseArgs,
+        normXy: [0.2, 0.4],
+        shader: "radial_wave",
+        transform: null,
+      }),
+      3,
+    );
   });
 
   it("L9 & L10: selecting a FixtureBuilder preset stays in Visual Builder and added modes are visually configurable", async () => {
@@ -281,5 +342,132 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
     expect(
       (screen.getByLabelText("Selected Mode Name") as HTMLInputElement).value,
     ).toBe("Compact 2ch");
+  });
+
+  it("Timeline empty-spot click deselects highlighted clip", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
+    fireEvent.click(screen.getByTestId("scene-play-zone-sc_tl_cyber_intro"));
+
+    // Select clip 0 -> selectedTimelineClip is set and Clip Inspector is shown
+    fireEvent.pointerDown(screen.getByTestId("clip-body-trk_1-0"), { clientX: 50, button: 0 });
+    fireEvent.pointerUp(window);
+    expect(useTaktStore.getState().selectedTimelineClip).toEqual({
+      trackId: "trk_1",
+      clipIndex: 0,
+    });
+    expect(screen.getByTestId("selected-clip-inspector")).toBeInTheDocument();
+
+    // Left-click on empty spot of track lane -> deselects clip (no highlight, inspector shows empty prompt)
+    fireEvent.click(screen.getByTestId("track-lane-trk_1"));
+    expect(useTaktStore.getState().selectedTimelineClip).toBeNull();
+    expect(screen.queryByLabelText("Selected Clip Start Sec")).not.toBeInTheDocument();
+    expect(screen.getByText(/Click a clip on any timeline track/i)).toBeInTheDocument();
+  });
+
+  it("FX gizmo initially covers all selected fixtures and remembers per-scene adjustments", async () => {
+    await useTaktStore
+      .getState()
+      .patchFixtures(
+        "age/rlcv3_8_segment_tube.json",
+        "34ch Pixel Mode",
+        "Tube Gizmo",
+        2,
+        1,
+        1,
+      );
+    // Place fixture 1 at (0.2, 0.25) and fixture 2 at (0.8, 0.75) and select both
+    const [fx1, fx2] = useTaktStore.getState().showState.patch;
+    await useTaktStore.getState().updateFixtureGridPos(fx1.id, {
+      x: 0.2,
+      y: 0.25,
+      rotation: 0,
+      scale_x: 0.2,
+      scale_y: 0.04,
+    });
+    await useTaktStore.getState().updateFixtureGridPos(fx2.id, {
+      x: 0.8,
+      y: 0.75,
+      rotation: 0,
+      scale_x: 0.2,
+      scale_y: 0.04,
+    });
+    useTaktStore.getState().setSelectedFixtureIds([fx1.id, fx2.id]);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
+
+    // Scene 1: create color_mappings -> gizmo centers on (0.5, 0.5) and spans all selected fixtures
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("fx-picker-tile-color_mappings"));
+      await Promise.resolve();
+    });
+    const blk1 = useTaktStore
+      .getState()
+      .showState.fx_library.find((b) => b.id === "blk_scene_sc_new_1")!;
+    const sh1 = blk1.elements.find((e) => e.kind === "spatial_shader_2d");
+    expect(sh1?.kind === "spatial_shader_2d" ? sh1.center_x : 0).toBeCloseTo(0.5, 1);
+    expect(sh1?.kind === "spatial_shader_2d" ? sh1.center_y : 0).toBeCloseTo(0.5, 1);
+    // Pattern scale must be large enough to cover x=0.2..0.8 (half >= 0.3 -> spatial_freq <= 0.67)
+    expect(sh1?.kind === "spatial_shader_2d" ? sh1.spatial_freq : 99).toBeLessThan(0.75);
+
+    // Adjust Scene 1 gizmo to custom (0.68, 0.34), create Scene 2 with its own color_mappings, then switch back to Scene 1
+    await act(async () => {
+      await useTaktStore.getState().upsertFxBlock({
+        ...blk1,
+        elements: blk1.elements.map((e) =>
+          e.kind === "spatial_shader_2d"
+            ? { ...e, center_x: 0.68, center_y: 0.34 }
+            : e,
+        ),
+      });
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("quick-add-scene-Bank 1"));
+      await Promise.resolve();
+    });
+    const allScenes = useTaktStore.getState().showState.scenes;
+    const sc2 = allScenes[allScenes.length - 1];
+    fireEvent.click(screen.getByTestId(`scene-play-zone-${sc2.id}`));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("fx-picker-tile-color_mappings"));
+      await Promise.resolve();
+    });
+
+    // Switch back to Scene 1 -> remembers its adjusted (0.68, 0.34)
+    fireEvent.click(screen.getByTestId("scene-play-zone-sc_new_1"));
+    const blk1Reloaded = useTaktStore
+      .getState()
+      .showState.fx_library.find((b) => b.id === "blk_scene_sc_new_1")!;
+    const sh1Reloaded = blk1Reloaded.elements.find((e) => e.kind === "spatial_shader_2d");
+    expect(sh1Reloaded?.kind === "spatial_shader_2d" ? sh1Reloaded.center_x : 0).toBeCloseTo(
+      0.68,
+      2,
+    );
+    expect(sh1Reloaded?.kind === "spatial_shader_2d" ? sh1Reloaded.center_y : 0).toBeCloseTo(
+      0.34,
+      2,
+    );
+  });
+
+  it("Timeline clip drag holds optimistic position without snapping back to old position on release", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));
+    fireEvent.click(screen.getByTestId("scene-play-zone-sc_tl_cyber_intro"));
+
+    const clipEl = screen.getByTestId("timeline-clip-trk_1-0");
+    const leftBefore = clipEl.style.left;
+
+    const clipBody = screen.getByTestId("clip-body-trk_1-0");
+    fireEvent.pointerDown(clipBody, { clientX: 100, button: 0 });
+    fireEvent.pointerMove(window, { clientX: 220 });
+    fireEvent.pointerUp(window);
+
+    // Immediately after pointerUp, clip must already reflect new position (no snap-back flicker)
+    const leftAfter = screen.getByTestId("timeline-clip-trk_1-0").style.left;
+    expect(leftAfter).not.toBe(leftBefore);
+    expect(parseFloat(leftAfter)).toBeGreaterThan(parseFloat(leftBefore));
   });
 });

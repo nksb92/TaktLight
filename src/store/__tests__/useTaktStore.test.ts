@@ -101,6 +101,33 @@ describe("useTaktStore", () => {
   });
 
   it("patches split fixtures, undoes/redoes, coalesces grid drags, and exports/imports XML", async () => {
+    // Configure Universe 2 as sACN to verify cross-protocol split warning
+    const curShow = useTaktStore.getState().showState;
+    const unisWithSacnU2 = curShow.network_outputs.universes.map((u) =>
+      u.id === 2
+        ? {
+            id: 2,
+            review_output: false,
+            protocol: {
+              protocol: "sacn" as const,
+              mode: { mode: "multicast" as const },
+              sacn_universe: 2,
+              priority: 100,
+            },
+          }
+        : u,
+    );
+    useTaktStore.setState({
+      showState: {
+        ...curShow,
+        network_outputs: {
+          ...curShow.network_outputs,
+          universes: unisWithSacnU2,
+        },
+      },
+      universes: unisWithSacnU2,
+    });
+
     await useTaktStore
       .getState()
       .patchFixtures(
@@ -596,5 +623,231 @@ describe("useTaktStore", () => {
         (c) => c.target.scope === "fixture" && c.role.kind === "intensity",
       ),
     ).toBe(true);
+  });
+
+  it("deep-clones FX blocks and timelines when duplicating a scene so edits stay independent", async () => {
+    await useTaktStore.getState().upsertFxBlock({
+      id: "blk_orig",
+      name: "Orig Block",
+      target_group: "all",
+      duration_beats: 4,
+      loop_block: true,
+      elements: [
+        {
+          kind: "static_trait",
+          trait: "color",
+          op: "ltp",
+          palette_ref: null,
+          value_start: null,
+          value_end: null,
+          hex_start: "#FF0000",
+          hex_end: "#FF0000",
+          order: null,
+        },
+      ],
+    });
+    await useTaktStore.getState().upsertScene({
+      id: "sc_orig",
+      name: "Orig Scene",
+      bank: "Bank 1",
+      target_group: null,
+      priority: 10,
+      fade_in_sec: 0,
+      fade_out_sec: 0,
+      block_refs: ["blk_orig"],
+    });
+
+    const copy = await useTaktStore.getState().duplicateScene("sc_orig");
+    expect(copy).not.toBeNull();
+    expect(copy!.block_refs).toHaveLength(1);
+    expect(copy!.block_refs[0]).not.toBe("blk_orig");
+
+    // Mutate the copied scene's FX block -> original scene's block must remain unchanged
+    const copiedBlock = useTaktStore
+      .getState()
+      .showState.fx_library.find((b) => b.id === copy!.block_refs[0])!;
+    await useTaktStore.getState().upsertFxBlock({
+      ...copiedBlock,
+      elements: [
+        {
+          kind: "static_trait",
+          trait: "color",
+          op: "ltp",
+          palette_ref: null,
+          value_start: null,
+          value_end: null,
+          hex_start: "#0000FF",
+          hex_end: "#0000FF",
+          order: null,
+        },
+      ],
+    });
+
+    const origBlockAfter = useTaktStore
+      .getState()
+      .showState.fx_library.find((b) => b.id === "blk_orig")!;
+    expect(origBlockAfter.elements[0].kind).toBe("static_trait");
+    if (origBlockAfter.elements[0].kind === "static_trait") {
+      expect(origBlockAfter.elements[0].hex_start).toBe("#FF0000");
+    }
+
+    // Timeline scene duplication also deep-clones the referenced timeline
+    const tlScene = await useTaktStore
+      .getState()
+      .createTimelineSceneInBank("Bank 1", "Orig TL");
+    const tlCopy = await useTaktStore.getState().duplicateScene(tlScene.id);
+    expect(tlCopy).not.toBeNull();
+    expect(tlCopy!.timeline_ref).toBeTruthy();
+    expect(tlCopy!.timeline_ref).not.toBe(tlScene.timeline_ref);
+  });
+
+  it("reorders scene banks cleanly from left to right and right to left", () => {
+    useTaktStore.getState().createSceneBank("Bank 2");
+    useTaktStore.getState().createSceneBank("Bank 3");
+    expect(useTaktStore.getState().sceneBanks).toEqual([
+      "Bank 1",
+      "Bank 2",
+      "Bank 3",
+    ]);
+
+    useTaktStore.getState().reorderSceneBanks("Bank 1", "Bank 3");
+    expect(useTaktStore.getState().sceneBanks).toEqual([
+      "Bank 2",
+      "Bank 3",
+      "Bank 1",
+    ]);
+
+    useTaktStore.getState().reorderSceneBanks("Bank 1", "Bank 2");
+    expect(useTaktStore.getState().sceneBanks).toEqual([
+      "Bank 1",
+      "Bank 2",
+      "Bank 3",
+    ]);
+  });
+
+  it("reuses cached file handle on subsequent saves without re-opening Save As dialog and uses valid .xml picker extension", async () => {
+    const writes: string[] = [];
+    const showSaveFilePicker = vi.fn(async (_opts: unknown) => ({
+      createWritable: async () => ({
+        write: async (data: string) => {
+          writes.push(data);
+        },
+        close: async () => {},
+      }),
+    }));
+    (window as unknown as { showSaveFilePicker?: unknown }).showSaveFilePicker =
+      showSaveFilePicker;
+
+    const ok1 = await useTaktStore.getState().saveProjectToFile();
+    expect(ok1).toBe(true);
+    expect(showSaveFilePicker).toHaveBeenCalledTimes(1);
+    const pickerOpts = showSaveFilePicker.mock.calls[0][0] as {
+      types: Array<{ accept: Record<string, string[]> }>;
+    };
+    expect(pickerOpts.types[0].accept["application/xml"]).toEqual([".xml"]);
+
+    const ok2 = await useTaktStore.getState().saveProjectToFile();
+    expect(ok2).toBe(true);
+    expect(showSaveFilePicker).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveLength(2);
+
+    const xml = await useTaktStore.getState().exportShowXml();
+    await useTaktStore.getState().importShowXml(xml);
+    const ok3 = await useTaktStore.getState().saveProjectToFile();
+    expect(ok3).toBe(true);
+    expect(showSaveFilePicker).toHaveBeenCalledTimes(2);
+
+    delete (window as unknown as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+  });
+
+  it("updates opened project file in place on Ctrl+S / saveProjectToFile without opening Save As dialog", async () => {
+    const initialXml = await useTaktStore.getState().exportShowXml();
+    const writes: string[] = [];
+    const queryPermission = vi.fn(async () => "prompt");
+    const requestPermission = vi.fn(async () => "granted");
+    const openedHandle = {
+      getFile: async () => ({
+        text: async () => initialXml,
+      }),
+      queryPermission,
+      requestPermission,
+      createWritable: async () => ({
+        write: async (data: string) => {
+          writes.push(data);
+        },
+        close: async () => {},
+      }),
+    };
+
+    const showOpenFilePicker = vi.fn(async () => [openedHandle]);
+    const showSaveFilePicker = vi.fn(async () => {
+      throw new Error("Save As dialog should not open for an already opened project");
+    });
+
+    const win = window as unknown as {
+      showOpenFilePicker?: unknown;
+      showSaveFilePicker?: unknown;
+    };
+    win.showOpenFilePicker = showOpenFilePicker;
+    win.showSaveFilePicker = showSaveFilePicker;
+
+    try {
+      const openResult = await useTaktStore.getState().openProjectFromFile();
+      expect(openResult).toBe("opened");
+      expect(showOpenFilePicker).toHaveBeenCalledTimes(1);
+      expect(useTaktStore.getState().isDirty).toBe(false);
+
+      // Edit the opened project
+      await useTaktStore
+        .getState()
+        .patchFixtures(
+          "age/rlcv3_8_segment_tube.json",
+          "34ch Pixel Mode",
+          "Edited Tube",
+          1,
+          1,
+          1,
+        );
+      expect(useTaktStore.getState().isDirty).toBe(true);
+
+      // Save should write directly to the opened file handle without Save As
+      const saved = await useTaktStore.getState().saveProjectToFile();
+      expect(saved).toBe(true);
+      expect(showSaveFilePicker).not.toHaveBeenCalled();
+      expect(queryPermission).toHaveBeenCalledWith({ mode: "readwrite" });
+      expect(requestPermission).toHaveBeenCalledWith({ mode: "readwrite" });
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).toContain("Edited Tube");
+      expect(useTaktStore.getState().isDirty).toBe(false);
+    } finally {
+      delete win.showOpenFilePicker;
+      delete win.showSaveFilePicker;
+    }
+  });
+
+  it("replaces blank project Bank 1 on project open and round-trips bank colors in XML", async () => {
+    const store = useTaktStore.getState();
+    await store.renameSceneBank("Bank 1", "Dimmer");
+    store.setBankColor("Dimmer", "#3B82F6");
+    store.setBankColor("Colors Tubes", "#A855F7");
+
+    const xml = await useTaktStore.getState().exportShowXml();
+    expect(xml).toContain("<BankColors>");
+    expect(xml).toContain('bank="Dimmer" color="#3B82F6"');
+    expect(xml).toContain('bank="Colors Tubes" color="#A855F7"');
+
+    // Reset to fresh blank project that starts with "Bank 1" and empty bankColors
+    useTaktStore.getState().resetForTest();
+    expect(useTaktStore.getState().sceneBanks).toEqual(["Bank 1"]);
+    expect(useTaktStore.getState().bankColors).toEqual({});
+
+    // Import saved XML -> "Bank 1" must NOT remain, and bank colors must be restored
+    await useTaktStore.getState().importShowXml(xml);
+    expect(useTaktStore.getState().sceneBanks).toEqual(["Dimmer"]);
+    expect(useTaktStore.getState().sceneBanks).not.toContain("Bank 1");
+    expect(useTaktStore.getState().bankColors).toEqual({
+      Dimmer: "#3B82F6",
+      "Colors Tubes": "#A855F7",
+    });
   });
 });

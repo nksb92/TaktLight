@@ -246,6 +246,13 @@ describe("FX Scene Types Plausibility (TS Simulation Mixer)", () => {
       expect(Math.abs(c.r - c.g)).toBeLessThanOrEqual(2);
       expect(Math.abs(c.g - c.b)).toBeLessThanOrEqual(2);
     }
+
+    // Static mode (rate_cycles = 0) freezes over time and shifts with phase_offset
+    const s0 = evalAt([STATIC_FULL_DIMMER, baseMap({ rate_cycles: 0, phase_offset: 0 })], 0.0);
+    const s1 = evalAt([STATIC_FULL_DIMMER, baseMap({ rate_cycles: 0, phase_offset: 0 })], 0.5);
+    expect(s0.cells).toEqual(s1.cells);
+    const sShift = evalAt([STATIC_FULL_DIMMER, baseMap({ rate_cycles: 0, phase_offset: 0.5 })], 0.0);
+    expect(s0.cells).not.toEqual(sShift.cells);
   });
 
   it("FX-03 chaser_fx: respects pixels_on count, advances over time, bounces when one_way=false, softens with fade, and reverses order", () => {
