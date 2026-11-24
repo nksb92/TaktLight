@@ -38,25 +38,33 @@ import {
   type AudioAnalysisResult,
   type ClipDef,
   computeBeatGridMarkers,
+  computeSceneSequenceDurationSec,
+  type FxElementDef,
   sampleOklabGradientHex,
-  snapTimeSecToMarkers,
   type TimelineDef,
   type TrackDef,
   type TrackType,
 } from "../lib/mixerLogic";
 import {
   applySingleTrackOverwrite,
+  type AutoFillCadence,
+  buildTimelineSnapTargets,
   clampTrimEndNonOverlapping,
   clampTrimStartNonOverlapping,
   computeEffectCycleBoundaries,
-  computeSnapGridMarkers,
+  computeSnapThresholdSec,
   computeTimelineContentDurationSec,
   computeTimelineViewportDurationSec,
   computeZoomAdaptiveRulerTicks,
+  ensureTrailingEmptyTrack,
   secToGridBeats,
+  selectAutoFillHitTimes,
   type SnapGridSubdivision,
+  type SnapTarget,
+  snapTimeSecToTargets,
 } from "../lib/timelineLogic";
 import { useTaktStore } from "../store/useTaktStore";
+import { HelpTooltip } from "./HelpTooltip";
 import { classifySceneMode } from "./SceneAndFxManager";
 
 type DragMode =
@@ -86,6 +94,8 @@ function ClipWaveformCanvas({
   clipDurationSec,
   clipWidthPx,
   showTransients,
+  showKicks = true,
+  showSnares = true,
   testId,
 }: {
   audioFile: string;
@@ -93,6 +103,8 @@ function ClipWaveformCanvas({
   clipDurationSec: number;
   clipWidthPx: number;
   showTransients: boolean;
+  showKicks?: boolean;
+  showSnares?: boolean;
   testId: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -206,6 +218,8 @@ function ClipWaveformCanvas({
       const pipH = Math.max(4, Math.round(backingH * 0.24));
       for (const m of analysis.transients) {
         if (m.time_sec > clipDurationSec) continue;
+        if (m.band === "kick" && !showKicks) continue;
+        if (m.band === "snare" && !showSnares) continue;
         const x = Math.round(
           (m.time_sec / Math.max(0.05, clipDurationSec)) * backingW,
         );
@@ -229,7 +243,15 @@ function ClipWaveformCanvas({
         }
       }
     }
-  }, [audioFile, analysis, clipDurationSec, clipWidthPx, showTransients]);
+  }, [
+    audioFile,
+    analysis,
+    clipDurationSec,
+    clipWidthPx,
+    showTransients,
+    showKicks,
+    showSnares,
+  ]);
 
   return (
     <canvas
@@ -252,6 +274,7 @@ export function TimelineEditor({
   onToggleExpand?: () => void;
 }) {
   const showState = useTaktStore((s) => s.showState);
+  const bankColors = useTaktStore((s) => s.bankColors);
   const activeTimelineId = useTaktStore((s) => s.activeTimelineId);
   const timelinePlaying = useTaktStore((s) => s.timelinePlaying);
   const timelinePlayheadSec = useTaktStore((s) => s.timelinePlayheadSec);
@@ -269,6 +292,12 @@ export function TimelineEditor({
   const sensitivity = useTaktStore((s) => s.timelineSensitivity);
   const showTransients = useTaktStore((s) => s.timelineShowTransients);
   const projectTransients = useTaktStore((s) => s.timelineProjectTransients);
+  const showBeats = useTaktStore((s) => s.timelineShowBeats);
+  const setShowBeats = useTaktStore((s) => s.setTimelineShowBeats);
+  const showKicks = useTaktStore((s) => s.timelineShowKicks);
+  const setShowKicks = useTaktStore((s) => s.setTimelineShowKicks);
+  const showSnares = useTaktStore((s) => s.timelineShowSnares);
+  const setShowSnares = useTaktStore((s) => s.setTimelineShowSnares);
   const canUndo = useTaktStore((s) => s.canUndo);
   const canRedo = useTaktStore((s) => s.canRedo);
 
@@ -296,6 +325,23 @@ export function TimelineEditor({
   const [paletteSelectedSceneId, setPaletteSelectedSceneId] = useState(
     showState.scenes[0]?.id ?? "",
   );
+  const [kicksPopoverOpen, setKicksPopoverOpen] = useState(false);
+  const [kicksSelectedBlockId, setKicksSelectedBlockId] = useState<string>("");
+  const [kicksTriggerBand, setKicksTriggerBand] = useState<
+    "kick" | "snare" | "beat"
+  >("kick");
+  const [kicksAutoDuration, setKicksAutoDuration] = useState(true);
+  const [kicksCustomDurationSec, setKicksCustomDurationSec] = useState(0.2);
+  const [kicksTrackMode, setKicksTrackMode] = useState<"update" | "new">(
+    "update",
+  );
+  const [kicksCadence, setKicksCadence] = useState<AutoFillCadence>(1);
+  const [kicksCadenceOffset, setKicksCadenceOffset] = useState<number>(0);
+  const [kicksCountMode, setKicksCountMode] = useState<
+    "all" | "4" | "8" | "16" | "32" | "custom"
+  >("all");
+  const [kicksCustomCount, setKicksCustomCount] = useState<number>(8);
+  const kicksPopoverRef = useRef<HTMLDivElement | null>(null);
   const [timelineNotice, setTimelineNotice] = useState<string | null>(null);
   const [trackContextMenu, setTrackContextMenu] = useState<{
     trackId: string;
@@ -321,6 +367,7 @@ export function TimelineEditor({
   const dragRafRef = useRef<number | null>(null);
   const scrubLastIpcMsRef = useRef<number>(0);
   const scrubLatestSecRef = useRef<number | null>(null);
+  const activeSnapGuideRef = useRef<SnapTarget | null>(null);
   const audioPlayingStateRef = useRef<{
     playing: boolean;
     timelineId: string | null;
@@ -351,6 +398,19 @@ export function TimelineEditor({
     }
   }, [currentTimeline]);
 
+  // Activate the viewed timeline immediately on mount or switch so it outputs at the playhead before Play is pressed
+  useEffect(() => {
+    if (!currentTimeline) return;
+    const state = useTaktStore.getState();
+    if (state.activeTimelineId !== currentTimeline.id && !state.timelinePlaying) {
+      void setTimelineTransport(
+        currentTimeline.id,
+        false,
+        state.activeTimelineId === null ? state.timelinePlayheadSec : 0,
+      );
+    }
+  }, [currentTimeline?.id, setTimelineTransport]);
+
   // Dynamic infinite-canvas duration
   const contentDurationSec = useMemo(
     () =>
@@ -377,32 +437,20 @@ export function TimelineEditor({
     [effectiveBpm, gridOffsetSec],
   );
 
-  // Keep selectedClip valid or auto-select first available clip
+  // Keep selectedClip valid when set; null means explicitly deselected (no clip highlighted)
   const resolvedSelectedClip = useMemo(() => {
-    if (!currentTimeline) return null;
-    if (selectedClip) {
-      const trk = currentTimeline.tracks.find(
-        (t) => t.id === selectedClip.trackId,
-      );
-      const clp = trk?.clips[selectedClip.clipIndex];
-      if (trk && clp) {
-        return {
-          trackId: trk.id,
-          clipIndex: selectedClip.clipIndex,
-          clip: clp,
-          track: trk,
-        };
-      }
-    }
-    for (const trk of currentTimeline.tracks) {
-      if (trk.clips.length > 0) {
-        return {
-          trackId: trk.id,
-          clipIndex: 0,
-          clip: trk.clips[0],
-          track: trk,
-        };
-      }
+    if (!currentTimeline || !selectedClip) return null;
+    const trk = currentTimeline.tracks.find(
+      (t) => t.id === selectedClip.trackId,
+    );
+    const clp = trk?.clips[selectedClip.clipIndex];
+    if (trk && clp) {
+      return {
+        trackId: trk.id,
+        clipIndex: selectedClip.clipIndex,
+        clip: clp,
+        track: trk,
+      };
     }
     return null;
   }, [currentTimeline, selectedClip]);
@@ -514,27 +562,30 @@ export function TimelineEditor({
       return;
     }
 
+    const expectedStoreHead =
+      timelinePlayheadSec + Math.max(0, (nowMs - timelinePlayheadAnchorMs) / 1000);
     const predictedSec = prev.playing
       ? prev.anchorHeadSec + Math.max(0, (nowMs - prev.anchorMs) / 1000)
       : -1;
-    const drift = Math.abs(predictedSec - timelinePlayheadSec);
+    const drift = Math.abs(predictedSec - expectedStoreHead);
 
     if (
       !prev.playing ||
       prev.timelineId !== currentTimeline.id ||
       drift > 0.15
     ) {
-      timelineAudioPlayer.startFrom(timelinePlayheadSec, currentTimeline.tracks);
+      timelineAudioPlayer.startFrom(expectedStoreHead, currentTimeline.tracks);
       audioPlayingStateRef.current = {
         playing: true,
         timelineId: currentTimeline.id,
-        anchorHeadSec: timelinePlayheadSec,
+        anchorHeadSec: expectedStoreHead,
         anchorMs: nowMs,
       };
     }
   }, [
     activeTimelineId,
     currentTimeline,
+    timelinePlayheadAnchorMs,
     timelinePlayheadSec,
     timelinePlaying,
   ]);
@@ -592,30 +643,78 @@ export function TimelineEditor({
     });
   }, [currentTimeline, showState.bpm, viewportDurationSec]);
 
-  const snapMarkers = useMemo(() => {
-    const gridTargets = computeSnapGridMarkers(
+  const snapThresholdSec = computeSnapThresholdSec(pxPerSec, 10);
+  const scrubSnapThresholdSec = computeSnapThresholdSec(pxPerSec, 8);
+
+  const baseSnapTargets = useMemo(() => {
+    return buildTimelineSnapTargets({
       viewportDurationSec,
       effectiveBpm,
       gridOffsetSec,
       snapGrid,
-    );
-    const transientTimes = projectTransients
-      ? timelineTransients.map((m) => m.time_sec)
-      : [];
-    const clipEdges: number[] = [];
-    if (currentTimeline) {
-      for (const trk of currentTimeline.tracks) {
-        for (const c of trk.clips) {
-          clipEdges.push(c.start_sec, c.start_sec + c.duration_sec);
-        }
-      }
-    }
-    return [...gridTargets, ...clipEdges, ...transientTimes];
+      showBeats,
+      showKicks,
+      showSnares,
+      transients: timelineTransients,
+      tracks: currentTimeline?.tracks ?? [],
+      excludeClip: null,
+    });
   }, [
     currentTimeline,
     effectiveBpm,
     gridOffsetSec,
-    projectTransients,
+    showBeats,
+    showKicks,
+    showSnares,
+    snapGrid,
+    timelineTransients,
+    viewportDurationSec,
+  ]);
+
+  const excludeDraggedClip = useMemo(() => {
+    if (
+      !clipDragState ||
+      !clipDragState.trackId ||
+      clipDragState.clipIndex === undefined
+    ) {
+      return null;
+    }
+    if (
+      clipDragState.mode === "move" ||
+      clipDragState.mode === "trim_start" ||
+      clipDragState.mode === "trim_end"
+    ) {
+      return {
+        trackId: clipDragState.trackId,
+        clipIndex: clipDragState.clipIndex,
+      };
+    }
+    return null;
+  }, [clipDragState]);
+
+  const dragSnapTargets = useMemo(() => {
+    if (!excludeDraggedClip) return baseSnapTargets;
+    return buildTimelineSnapTargets({
+      viewportDurationSec,
+      effectiveBpm,
+      gridOffsetSec,
+      snapGrid,
+      showBeats,
+      showKicks,
+      showSnares,
+      transients: timelineTransients,
+      tracks: currentTimeline?.tracks ?? [],
+      excludeClip: excludeDraggedClip,
+    });
+  }, [
+    baseSnapTargets,
+    currentTimeline,
+    effectiveBpm,
+    excludeDraggedClip,
+    gridOffsetSec,
+    showBeats,
+    showKicks,
+    showSnares,
     snapGrid,
     timelineTransients,
     viewportDurationSec,
@@ -633,6 +732,13 @@ export function TimelineEditor({
       if (!clip.ref_block) return 0;
       const blk = showState.fx_library.find((b) => b.id === clip.ref_block);
       if (!blk) return 0;
+      const seqEl = blk.elements.find(
+        (el): el is Extract<FxElementDef, { kind: "scene_sequence" }> =>
+          el.kind === "scene_sequence",
+      );
+      if (seqEl && seqEl.steps.length > 0) {
+        return computeSceneSequenceDurationSec(seqEl.steps, effectiveBpm);
+      }
       if (blk.duration_sec && blk.duration_sec > 0.05) return blk.duration_sec;
       return ((blk.duration_beats || 4) * 60) / Math.max(20, effectiveBpm);
     },
@@ -665,15 +771,19 @@ export function TimelineEditor({
       nextTracks: TrackDef[],
       coalesceKey?: string,
       extraPatch?: Partial<TimelineDef>,
+      ensureFreeTrackBelow = false,
     ) => {
       if (!currentTimeline) return;
-      const nextContentDur = computeTimelineContentDurationSec(nextTracks);
+      const finalTracks = ensureFreeTrackBelow
+        ? ensureTrailingEmptyTrack(nextTracks)
+        : nextTracks;
+      const nextContentDur = computeTimelineContentDurationSec(finalTracks);
       await upsertTimeline(
         {
           ...currentTimeline,
           ...extraPatch,
           duration_sec: Math.max(32, nextContentDur),
-          tracks: nextTracks,
+          tracks: finalTracks,
         },
         coalesceKey,
       );
@@ -700,6 +810,33 @@ export function TimelineEditor({
         const clipType: TrackType = srcClip.audio_file ? "music" : "effect";
         const movedClip = updater(srcClip);
         const safeStart = Math.max(0, Number(movedClip.start_sec.toFixed(3)));
+        const lastTrack = currentTimeline.tracks[currentTimeline.tracks.length - 1];
+        const trailingEmptyTrack =
+          lastTrack &&
+          lastTrack.id !== trackId &&
+          lastTrack.clips.length === 0 &&
+          (lastTrack.track_type ?? "untyped") === "untyped"
+            ? lastTrack
+            : null;
+        if (trailingEmptyTrack) {
+          const nextTracks = currentTimeline.tracks.map((tr) => {
+            if (tr.id === trackId && !isDuplicate) {
+              return { ...tr, clips: tr.clips.filter((_, idx) => idx !== clipIndex) };
+            }
+            if (tr.id === trailingEmptyTrack.id) {
+              return {
+                ...tr,
+                track_type: clipType,
+                target_group: clipType === "music" ? null : "all",
+                clips: [{ ...movedClip, start_sec: safeStart }],
+              };
+            }
+            return tr;
+          });
+          void saveTimelineTracks(nextTracks, coalesceKey, undefined, true);
+          setSelectedClip({ trackId: trailingEmptyTrack.id, clipIndex: 0 });
+          return;
+        }
         const newTrackId = `trk_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
         const newTrack: TrackDef = {
           id: newTrackId,
@@ -719,7 +856,7 @@ export function TimelineEditor({
           ),
           newTrack,
         ];
-        void saveTimelineTracks(nextTracks, coalesceKey);
+        void saveTimelineTracks(nextTracks, coalesceKey, undefined, true);
         setSelectedClip({ trackId: newTrackId, clipIndex: 0 });
         return;
       }
@@ -755,7 +892,7 @@ export function TimelineEditor({
           }
           return tr;
         });
-        void saveTimelineTracks(nextTracks, coalesceKey);
+        void saveTimelineTracks(nextTracks, coalesceKey, undefined, true);
         setSelectedClip({
           trackId: targetTrackId,
           clipIndex: insertedIndex,
@@ -869,9 +1006,11 @@ export function TimelineEditor({
         const left = rect?.left ?? 0;
         const frac = Math.max(0, Math.min(1, (e.clientX - left) / vw));
         const rawSec = frac * viewportDurationSec;
-        const sec = magneticSnap
-          ? snapTimeSecToMarkers(rawSec, snapMarkers, 0.12)
-          : Number(rawSec.toFixed(3));
+        const snapRes = magneticSnap
+          ? snapTimeSecToTargets(rawSec, baseSnapTargets, scrubSnapThresholdSec)
+          : { time_sec: Number(rawSec.toFixed(3)), snappedTo: null };
+        activeSnapGuideRef.current = snapRes.snappedTo;
+        const sec = snapRes.time_sec;
         // Instant local update + throttled backend IPC (eliminates scrub lag!)
         setDisplayPlayheadSec(sec);
         scrubLatestSecRef.current = sec;
@@ -912,9 +1051,11 @@ export function TimelineEditor({
       ) {
         const isDuplicate = clipDragState.mode === "duplicate_move";
         const rawStart = Math.max(0, clipDragState.initialStartSec + dxSec);
-        const snappedStart = magneticSnap
-          ? snapTimeSecToMarkers(rawStart, snapMarkers, 0.15)
-          : Number(rawStart.toFixed(3));
+        const snapRes = magneticSnap
+          ? snapTimeSecToTargets(rawStart, dragSnapTargets, snapThresholdSec)
+          : { time_sec: Number(rawStart.toFixed(3)), snappedTo: null };
+        activeSnapGuideRef.current = snapRes.snappedTo;
+        const snappedStart = snapRes.time_sec;
 
         let hoveredTrackId = trackId;
         if (Number.isFinite(e.clientY)) {
@@ -970,9 +1111,11 @@ export function TimelineEditor({
           0,
           Math.min(origEnd - 0.1, clipDragState.initialStartSec + dxSec),
         );
-        const snappedStart = magneticSnap
-          ? snapTimeSecToMarkers(rawStart, snapMarkers, 0.15)
-          : Number(rawStart.toFixed(6));
+        const snapRes = magneticSnap
+          ? snapTimeSecToTargets(rawStart, dragSnapTargets, snapThresholdSec)
+          : { time_sec: Number(rawStart.toFixed(6)), snappedTo: null };
+        activeSnapGuideRef.current = snapRes.snappedTo;
+        const snappedStart = snapRes.time_sec;
         const safeStart = clampTrimStartNonOverlapping(
           snappedStart,
           origEnd,
@@ -1026,9 +1169,11 @@ export function TimelineEditor({
             clipDragState.initialDurationSec +
             dxSec,
         );
-        const snappedEnd = magneticSnap
-          ? snapTimeSecToMarkers(rawEnd, snapMarkers, 0.15)
-          : Number(rawEnd.toFixed(6));
+        const snapRes = magneticSnap
+          ? snapTimeSecToTargets(rawEnd, dragSnapTargets, snapThresholdSec)
+          : { time_sec: Number(rawEnd.toFixed(6)), snappedTo: null };
+        activeSnapGuideRef.current = snapRes.snappedTo;
+        const snappedEnd = snapRes.time_sec;
         const clampedEnd = clampTrimEndNonOverlapping(
           clipDragState.initialStartSec,
           snappedEnd,
@@ -1096,6 +1241,7 @@ export function TimelineEditor({
     const onPointerUp = () => {
       if (committed) return;
       committed = true;
+      activeSnapGuideRef.current = null;
 
       if (dragRafRef.current !== null) {
         cancelAnimationFrame(dragRafRef.current);
@@ -1116,8 +1262,9 @@ export function TimelineEditor({
       }
 
       const ov = localClipOverrideRef.current;
-      localClipOverrideRef.current = null;
       if (ov) {
+        // Hold optimistic override until store commits the new timeline (prevents drop flicker)
+        pendingCommitTimelineRef.current = currentTimeline;
         commitClipUpdate(
           ov.trackId,
           ov.clipIndex,
@@ -1138,18 +1285,22 @@ export function TimelineEditor({
     window.addEventListener("mousemove", onPointerMove);
     window.addEventListener("mouseup", onPointerUp);
     return () => {
+      activeSnapGuideRef.current = null;
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("mousemove", onPointerMove);
       window.removeEventListener("mouseup", onPointerUp);
     };
   }, [
+    baseSnapTargets,
     clipDragState,
     commitClipUpdate,
     currentTimeline,
+    dragSnapTargets,
     magneticSnap,
+    scrubSnapThresholdSec,
     setTimelineTransport,
-    snapMarkers,
+    snapThresholdSec,
     stretchToolActive,
     timelinePlaying,
     viewportDurationSec,
@@ -1176,11 +1327,12 @@ export function TimelineEditor({
     startSec: number,
     durationSec = clipDurationSec,
     overrideBlockRef?: string,
+    sourceDurationSec?: number,
   ) => {
     const blockToUse = overrideBlockRef || effectiveBlockRef;
     if (!currentTimeline || !trackId || !blockToUse) return;
     const snappedStart = magneticSnap
-      ? snapTimeSecToMarkers(startSec, snapMarkers, 0.15)
+      ? snapTimeSecToTargets(startSec, baseSnapTargets, snapThresholdSec).time_sec
       : startSec;
     const clip: ClipDef = {
       ref_block: blockToUse,
@@ -1189,10 +1341,20 @@ export function TimelineEditor({
       fade_in_sec: 0,
       fade_out_sec: 0,
       inline_fx: [],
+      ...(sourceDurationSec !== undefined
+        ? { source_duration_sec: Number(sourceDurationSec.toFixed(6)) }
+        : {}),
     };
+    const lastTrack = currentTimeline.tracks[currentTimeline.tracks.length - 1];
+    const trailingEmptyTrack =
+      lastTrack &&
+      lastTrack.clips.length === 0 &&
+      (lastTrack.track_type ?? "untyped") === "untyped"
+        ? lastTrack
+        : null;
     const targetTrack =
       trackId === "__new__"
-        ? null
+        ? trailingEmptyTrack
         : currentTimeline.tracks.find((t) => t.id === trackId) ?? null;
 
     if (!targetTrack || (targetTrack.track_type ?? "untyped") === "music") {
@@ -1209,7 +1371,12 @@ export function TimelineEditor({
         target_group: "all",
         clips: [clip],
       };
-      await saveTimelineTracks([...currentTimeline.tracks, newTrack]);
+      await saveTimelineTracks(
+        [...currentTimeline.tracks, newTrack],
+        undefined,
+        undefined,
+        true,
+      );
       setSelectedClip({ trackId: newTrackId, clipIndex: 0 });
       return;
     }
@@ -1231,6 +1398,9 @@ export function TimelineEditor({
             }
           : tr,
       ),
+      undefined,
+      undefined,
+      true,
     );
     setSelectedClip({ trackId: targetTrack.id, clipIndex: insertedIndex });
   };
@@ -1249,7 +1419,7 @@ export function TimelineEditor({
       tr.clips.some((c) => Boolean(c.audio_file)),
     );
     const snappedStart = magneticSnap
-      ? snapTimeSecToMarkers(atSec, snapMarkers, 0.15)
+      ? snapTimeSecToTargets(atSec, baseSnapTargets, snapThresholdSec).time_sec
       : atSec;
     // Place the first song in an empty timeline cleanly at 0.0s
     const clipStart = !hasExistingMusic
@@ -1281,9 +1451,16 @@ export function TimelineEditor({
           )
         : [{ at_sec: 0, bpm: syncedBpm }];
 
+    const lastTrack = currentTimeline.tracks[currentTimeline.tracks.length - 1];
+    const trailingEmptyTrack =
+      lastTrack &&
+      lastTrack.clips.length === 0 &&
+      (lastTrack.track_type ?? "untyped") === "untyped"
+        ? lastTrack
+        : null;
     const targetTrack =
       trackId === "__new__"
-        ? null
+        ? trailingEmptyTrack
         : currentTimeline.tracks.find((t) => t.id === trackId) ?? null;
 
     if (!targetTrack || (targetTrack.track_type ?? "untyped") === "effect") {
@@ -1300,10 +1477,15 @@ export function TimelineEditor({
         target_group: null,
         clips: [audioClip],
       };
-      await saveTimelineTracks([...currentTimeline.tracks, newTrack], undefined, {
-        tempo_map: syncedTempoMap,
-        grid_offset_sec: syncedOffset,
-      });
+      await saveTimelineTracks(
+        [...currentTimeline.tracks, newTrack],
+        undefined,
+        {
+          tempo_map: syncedTempoMap,
+          grid_offset_sec: syncedOffset,
+        },
+        true,
+      );
       setSelectedClip({ trackId: newTrackId, clipIndex: 0 });
     } else {
       const { clips: nextClips, insertedIndex } = applySingleTrackOverwrite(
@@ -1321,6 +1503,7 @@ export function TimelineEditor({
           tempo_map: syncedTempoMap,
           grid_offset_sec: syncedOffset,
         },
+        true,
       );
       setSelectedClip({ trackId: targetTrack.id, clipIndex: insertedIndex });
     }
@@ -1365,7 +1548,7 @@ export function TimelineEditor({
     sceneId: string,
     trackId: string,
     atSec: number,
-    durationSec = clipDurationSec,
+    durationSec?: number,
   ) => {
     const scene = showState.scenes.find((s) => s.id === sceneId);
     if (scene?.timeline_ref) {
@@ -1393,8 +1576,25 @@ export function TimelineEditor({
     }
     if (!blockId) blockId = effectiveBlockRef;
     if (!blockId) return;
+    const blockDef = showState.fx_library.find((b) => b.id === blockId);
+    const seqElem = blockDef?.elements.find(
+      (el): el is Extract<FxElementDef, { kind: "scene_sequence" }> =>
+        el.kind === "scene_sequence",
+    );
+    const seqNaturalSec =
+      seqElem && seqElem.steps.length > 0
+        ? computeSceneSequenceDurationSec(seqElem.steps, effectiveBpm)
+        : undefined;
+    const resolvedDurationSec =
+      durationSec ?? (seqNaturalSec && seqNaturalSec > 0.05 ? seqNaturalSec : clipDurationSec);
     setPaletteSelectedSceneId(sceneId);
-    await handleAddClipAt(trackId, atSec, durationSec, blockId);
+    await handleAddClipAt(
+      trackId,
+      atSec,
+      resolvedDurationSec,
+      blockId,
+      seqNaturalSec && seqNaturalSec > 0.05 ? seqNaturalSec : undefined,
+    );
   };
 
   useEffect(() => {
@@ -1551,6 +1751,7 @@ export function TimelineEditor({
         void setTimelineTransport(currentTimeline.id, !timelinePlaying);
       } else if (e.key === "Home") {
         e.preventDefault();
+        setDisplayPlayheadSec(0);
         void setTimelineTransport(currentTimeline.id, false, 0);
       } else if (e.key === "Delete" || e.key === "Backspace") {
         if (resolvedSelectedClip) {
@@ -1586,67 +1787,201 @@ export function TimelineEditor({
     undoShow,
   ]);
 
-  // Auto-Fill Kicks: places the selected FX scene on all strong detected Kick transients
-  // across the full song on a dedicated FX track (no 32-clip cap!)
+  useEffect(() => {
+    if (!kicksPopoverOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (
+        kicksPopoverRef.current &&
+        !kicksPopoverRef.current.contains(e.target as Node)
+      ) {
+        setKicksPopoverOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setKicksPopoverOpen(false);
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointerDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [kicksPopoverOpen]);
+
+  const autoFillSceneOptions = useMemo(() => {
+    const opts: Array<{ blockId: string; label: string }> = [];
+    const seen = new Set<string>();
+    for (const sc of showState.scenes) {
+      if (sc.timeline_ref || sc.block_refs.length === 0) continue;
+      const blkId = sc.block_refs[0];
+      if (!blkId || seen.has(blkId)) continue;
+      seen.add(blkId);
+      opts.push({
+        blockId: blkId,
+        label: sc.bank ? `${sc.name} (${sc.bank})` : sc.name,
+      });
+    }
+    for (const blk of showState.fx_library) {
+      if (seen.has(blk.id)) continue;
+      if (blk.elements.some((el) => el.kind === "scene_sequence")) continue;
+      seen.add(blk.id);
+      opts.push({ blockId: blk.id, label: blk.name });
+    }
+    return opts;
+  }, [showState.fx_library, showState.scenes]);
+
+  const resolvedKicksBlockId = useMemo(() => {
+    if (
+      kicksSelectedBlockId &&
+      autoFillSceneOptions.some((o) => o.blockId === kicksSelectedBlockId)
+    ) {
+      return kicksSelectedBlockId;
+    }
+    if (
+      resolvedSelectedClip?.clip.ref_block &&
+      autoFillSceneOptions.some(
+        (o) => o.blockId === resolvedSelectedClip.clip.ref_block,
+      )
+    ) {
+      return resolvedSelectedClip.clip.ref_block;
+    }
+    return autoFillSceneOptions[0]?.blockId ?? effectiveBlockRef;
+  }, [
+    autoFillSceneOptions,
+    effectiveBlockRef,
+    kicksSelectedBlockId,
+    resolvedSelectedClip,
+  ]);
+
+  const kicksPreviewTimes = useMemo(() => {
+    if (kicksTriggerBand === "beat") {
+      return beatGridMarkers;
+    }
+    const allBand = timelineTransients.filter(
+      (m) => m.band === kicksTriggerBand,
+    );
+    const strong = allBand.filter((m) => m.strength >= 0.35);
+    const chosen = strong.length > 0 ? strong : allBand;
+    if (chosen.length > 0) {
+      return chosen.map((m) => m.time_sec);
+    }
+    return kicksTriggerBand === "kick"
+      ? beatGridMarkers.filter((_, i) => i % 2 === 0)
+      : [];
+  }, [beatGridMarkers, kicksTriggerBand, timelineTransients]);
+
+  const resolvedKicksMaxCount =
+    kicksCountMode === "all"
+      ? null
+      : kicksCountMode === "custom"
+        ? Math.max(1, Math.floor(kicksCustomCount) || 1)
+        : Number(kicksCountMode);
+
+  const resolvedKicksHitDur = kicksAutoDuration
+    ? Number(
+        Math.min(0.25, Math.max(0.1, (60 / Math.max(20, effectiveBpm)) * 0.45)).toFixed(3),
+      )
+    : Math.max(0.05, Number(kicksCustomDurationSec) || 0.2);
+
+  const resolvedKicksOffset = Math.max(
+    0,
+    Math.min(kicksCadence - 1, kicksCadenceOffset),
+  );
+
+  const kicksFillTimes = useMemo(() => {
+    return selectAutoFillHitTimes({
+      hitTimes: kicksPreviewTimes,
+      startFromSec: displayPlayheadSec,
+      cadence: kicksCadence,
+      offset: resolvedKicksOffset,
+      maxCount: resolvedKicksMaxCount,
+      minGapSec: resolvedKicksHitDur,
+    });
+  }, [
+    displayPlayheadSec,
+    kicksCadence,
+    kicksPreviewTimes,
+    resolvedKicksHitDur,
+    resolvedKicksMaxCount,
+    resolvedKicksOffset,
+  ]);
+
+  // Auto-Fill Kicks/Snares/Beats: places the chosen FX scene on detected hits
   const handleAutoPlaceOnKicks = async () => {
-    if (!currentTimeline || !effectiveBlockRef) return;
-    const allKicks = timelineTransients.filter((m) => m.band === "kick");
-    const strongKicks = allKicks.filter((m) => m.strength >= 0.35);
-    const chosenKicks = strongKicks.length > 0 ? strongKicks : allKicks;
-
-    const times =
-      chosenKicks.length > 0
-        ? chosenKicks.map((k) => k.time_sec)
-        : beatGridMarkers.filter((_, i) => i % 2 === 0);
-
-    if (times.length === 0) {
-      setTimelineNotice("No kick transients or beat markers available to fill.");
+    const targetBlockId = resolvedKicksBlockId;
+    if (!currentTimeline || !targetBlockId) {
+      setTimelineNotice("Create or select an FX scene before filling hits.");
+      return;
+    }
+    if (kicksFillTimes.length === 0) {
+      setTimelineNotice(
+        kicksPreviewTimes.length === 0
+          ? `No ${kicksTriggerBand} markers available. Add/analyze audio or choose Beats.`
+          : `No ${kicksTriggerBand} markers found at or after playhead (${displayPlayheadSec.toFixed(2)}s).`,
+      );
       return;
     }
 
-    const hitDur = Number(
-      Math.min(0.25, Math.max(0.1, (60 / Math.max(20, effectiveBpm)) * 0.45)).toFixed(3),
-    );
+    const generated: ClipDef[] = kicksFillTimes.map((t) => ({
+      ref_block: targetBlockId,
+      start_sec: Number(Math.max(0, t).toFixed(3)),
+      duration_sec: resolvedKicksHitDur,
+      fade_in_sec: 0,
+      fade_out_sec: 0,
+      inline_fx: [],
+    }));
 
-    // Filter out hits closer than hitDur so they never collide
-    const generated: ClipDef[] = [];
-    let lastEnd = -1;
-    for (const t of times) {
-      if (t >= lastEnd - 1e-3) {
-        generated.push({
-          ref_block: effectiveBlockRef,
-          start_sec: Number(Math.max(0, t).toFixed(3)),
-          duration_sec: hitDur,
-          fade_in_sec: 0,
-          fade_out_sec: 0,
-          inline_fx: [],
-        });
-        lastEnd = t + hitDur;
+    const defaultTrackName =
+      kicksTriggerBand === "snare"
+        ? "Snare Hits"
+        : kicksTriggerBand === "beat"
+          ? "Beat Hits"
+          : "Kick Hits";
+
+    const existingTrack =
+      kicksTrackMode === "update"
+        ? currentTimeline.tracks.find(
+            (t) => t.name === defaultTrackName && t.track_type === "effect",
+          )
+        : undefined;
+
+    if (existingTrack) {
+      let nextTrackClips: ClipDef[];
+      if (resolvedKicksMaxCount === null) {
+        nextTrackClips = generated;
+      } else {
+        nextTrackClips = [...existingTrack.clips];
+        for (const clip of generated) {
+          nextTrackClips = applySingleTrackOverwrite(clip, nextTrackClips).clips;
+        }
       }
-    }
-
-    const existingKickTrack = currentTimeline.tracks.find(
-      (t) => t.name === "Kick Hits" && t.track_type === "effect",
-    );
-    if (existingKickTrack) {
       await saveTimelineTracks(
         currentTimeline.tracks.map((tr) =>
-          tr.id === existingKickTrack.id ? { ...tr, clips: generated } : tr,
+          tr.id === existingTrack.id ? { ...tr, clips: nextTrackClips } : tr,
         ),
+        undefined,
+        undefined,
+        true,
       );
-      setSelectedClip({ trackId: existingKickTrack.id, clipIndex: 0 });
+      setSelectedClip({ trackId: existingTrack.id, clipIndex: 0 });
     } else {
-      const newTrackId = `trk_kicks_${Date.now()}`;
+      const newTrackId = `trk_${kicksTriggerBand}_${Date.now()}`;
       const newTrack: TrackDef = {
         id: newTrackId,
-        name: "Kick Hits",
+        name: defaultTrackName,
         track_type: "effect",
         target_group: "all",
         clips: generated,
       };
-      await saveTimelineTracks([...currentTimeline.tracks, newTrack]);
+      await saveTimelineTracks(
+        [...currentTimeline.tracks, newTrack],
+        undefined,
+        undefined,
+        true,
+      );
       setSelectedClip({ trackId: newTrackId, clipIndex: 0 });
     }
+    setKicksPopoverOpen(false);
     setTimelineNotice(null);
   };
 
@@ -1685,7 +2020,7 @@ export function TimelineEditor({
     const frac = Math.max(0, Math.min(1, (clientX - left) / vw));
     const rawSec = frac * viewportDurationSec;
     const sec = magneticSnap
-      ? snapTimeSecToMarkers(rawSec, snapMarkers, 0.12)
+      ? snapTimeSecToTargets(rawSec, baseSnapTargets, scrubSnapThresholdSec).time_sec
       : Number(rawSec.toFixed(3));
     setDisplayPlayheadSec(sec);
     scrubLatestSecRef.current = sec;
@@ -1697,9 +2032,13 @@ export function TimelineEditor({
     const blk = showState.fx_library.find((b) => b.id === blockId);
     if (!blk) return null;
     for (const el of blk.elements) {
+      if (el.kind === "scene_sequence") continue;
       if (el.palette_ref) {
         const pal = showState.color_palettes.find((p) => p.id === el.palette_ref);
         if (pal) return [pal.hex_start, pal.hex_end];
+      }
+      if (el.kind === "static_trait" && el.trait === "color" && el.hex_start) {
+        return [el.hex_start, el.hex_end ?? el.hex_start];
       }
     }
     return null;
@@ -1739,335 +2078,630 @@ export function TimelineEditor({
 
   return (
     <div className="h-full min-h-0 flex flex-col bg-slate-dark border border-steel rounded overflow-hidden">
-      {/* Slim Single NLE Transport & Tool Bar */}
-      <div className="shrink-0 flex flex-wrap items-center justify-between gap-1.5 bg-slate border-b border-steel px-2.5 py-1.5">
-        <div className="flex items-center gap-1.5 min-w-0">
-          <AudioWaveform className="w-3.5 h-3.5 text-cobalt shrink-0" />
-          <h2 className="font-sans text-xs font-semibold text-frost truncate max-w-[140px]">
-            {currentTimeline.name}
-          </h2>
-          <span
-            data-testid="timeline-content-length"
-            className="font-mono text-[10px] text-fog bg-pitch border border-steel rounded px-1.5 py-0.5 shrink-0"
-            title="Dynamic timeline length (end of last clip)"
-          >
-            {contentDurationSec.toFixed(1)}s
-          </span>
-          <span
-            data-testid="timeline-header-bpm"
-            className="font-mono text-[10px] text-plum bg-pitch border border-steel rounded px-1.5 py-0.5 shrink-0"
-            title="Current timeline tempo in BPM (edit in right-side Timeline Settings tab)"
-          >
-            {effectiveBpm} BPM
-          </span>
-        </div>
+      {/* Two-Row NLE Toolbar: Row 1 = Transport & View Settings, Row 2 = Editing Tools & Guide Toggles */}
+      <div className="shrink-0 bg-slate border-b border-steel flex flex-col">
+        {/* Row 1: Identity & Transport (Left) + Display/Zoom/Expand Settings (Right) */}
+        <div
+          data-testid="timeline-toolbar-row-1"
+          className="flex flex-wrap items-center justify-between gap-1.5 px-2.5 py-1 border-b border-steel/60"
+        >
+          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+            <AudioWaveform className="w-3.5 h-3.5 text-cobalt shrink-0" />
+            <h2 className="font-sans text-xs font-semibold text-frost truncate max-w-[140px]">
+              {currentTimeline.name}
+            </h2>
+            <span
+              data-testid="timeline-content-length"
+              className="font-mono text-[10px] text-fog bg-pitch border border-steel rounded px-1.5 py-0.5 shrink-0"
+              title="Dynamic timeline length (end of last clip)"
+            >
+              {contentDurationSec.toFixed(1)}s
+            </span>
+            <span
+              data-testid="timeline-header-bpm"
+              className="font-mono text-[10px] text-plum bg-pitch border border-steel rounded px-1.5 py-0.5 shrink-0"
+              title="Current timeline tempo in BPM (edit in right-side Timeline Settings tab)"
+            >
+              {effectiveBpm} BPM
+            </span>
 
-        <div className="flex flex-wrap items-center gap-1">
-          <button
-            type="button"
-            onClick={() =>
-              void setTimelineTransport(currentTimeline.id, false, 0)
-            }
-            title="Return to Start (Home)"
-            aria-label="Return to Start"
-            className="p-1 rounded border border-steel bg-ink hover:border-fog text-mist"
-          >
-            <SkipBack className="w-3 h-3" />
-          </button>
+            <span className="h-4 w-px bg-steel/70 mx-0.5" />
 
-          <button
-            type="button"
-            onClick={() =>
-              void setTimelineTransport(
-                currentTimeline.id,
-                !timelinePlaying,
-              )
-            }
-            title="Play or Pause Timeline (Space)"
-            className="flex items-center gap-1 px-2 py-1 rounded bg-ember hover:bg-burnt text-frost font-mono text-[11px] font-semibold transition-colors"
-          >
-            {timelinePlaying ? (
-              <>
-                <Pause className="w-3 h-3" />
-                <span>Pause Timeline</span>
-              </>
-            ) : (
-              <>
-                <Play className="w-3 h-3" />
-                <span>Play Timeline</span>
-              </>
-            )}
-          </button>
+            <button
+              type="button"
+              onClick={() =>
+                void setTimelineTransport(currentTimeline.id, false, 0)
+              }
+              title="Return to Start (Home)"
+              aria-label="Return to Start"
+              className="p-1 rounded border border-steel bg-ink hover:border-fog text-mist"
+            >
+              <SkipBack className="w-3 h-3" />
+            </button>
 
-          <button
-            type="button"
-            data-testid="timeline-loop-toggle"
-            aria-pressed={Boolean(currentTimeline.loop_timeline)}
-            onClick={handleToggleLoop}
-            title={
-              currentTimeline.loop_timeline
-                ? "Loop Enabled: wraps back to 0s at end of last clip"
-                : "One-Shot: stops and releases at end of last clip"
-            }
-            className={`flex items-center gap-1 px-1.5 py-1 rounded border font-mono text-[10px] transition-colors ${
-              currentTimeline.loop_timeline
-                ? "border-pine bg-pine/25 text-frost font-semibold"
-                : "border-steel bg-ink text-fog hover:text-mist"
-            }`}
-          >
-            <Repeat className="w-3 h-3" />
-            <span>Loop</span>
-          </button>
-
-          <label
-            className="flex items-center gap-1 bg-pitch border border-steel rounded px-1.5 py-0.5"
-            title="Current playhead position in seconds"
-          >
-            <Clock className="w-3 h-3 text-ember" />
-            <input
-              aria-label="Timeline Playhead Sec"
-              type="number"
-              min={0}
-              step={0.1}
-              value={Number(displayPlayheadSec.toFixed(2))}
-              onChange={(e) =>
+            <button
+              type="button"
+              onClick={() =>
                 void setTimelineTransport(
                   currentTimeline.id,
-                  timelinePlaying,
-                  Number(e.target.value) || 0,
+                  !timelinePlaying,
                 )
               }
-              className="w-12 bg-ink border border-steel rounded px-1 py-0.5 font-mono text-[10px] text-frost"
-            />
-          </label>
-
-          <span className="h-4 w-px bg-steel/70 mx-0.5" />
-
-          {/* Tools: Snap + Snap Grid Subdivision, Time-Stretch Mode, Beats/Sec */}
-          <div className="flex items-center gap-0.5 rounded border border-steel bg-ink px-1 py-0.5 font-mono text-[10px] text-mist">
-            <label
-              className="flex items-center gap-1 cursor-pointer pr-1"
-              title="Magnetically snap clips and playhead to the selected Beat Grid subdivision and clip edges"
+              title="Play or Pause Timeline (Space)"
+              className="flex items-center gap-1 px-2 py-1 rounded bg-ember hover:bg-burnt text-frost font-mono text-[11px] font-semibold transition-colors"
             >
-              <input
-                aria-label="Magnetic Snap"
-                type="checkbox"
-                checked={magneticSnap}
-                onChange={(e) => setMagneticSnap(e.target.checked)}
-              />
-              <Magnet className="w-3 h-3 text-plum" />
-              <span>Snap</span>
-            </label>
-            <select
-              aria-label="Snap Grid Subdivision"
-              data-testid="timeline-snap-grid-select"
-              disabled={!magneticSnap}
-              value={snapGrid}
-              onChange={(e) =>
-                setSnapGrid(e.target.value as SnapGridSubdivision)
-              }
-              title="Snap grid resolution: Whole Beats (default), Bars (4 beats), 1/2 Beat, or 1/4 Beat"
-              className="bg-pitch border border-steel/70 rounded px-1 py-0 text-[10px] text-frost disabled:opacity-40"
-            >
-              <option value="bar">Bar</option>
-              <option value="beat">Beat</option>
-              <option value="half">1/2</option>
-              <option value="quarter">1/4</option>
-            </select>
-          </div>
-
-          <button
-            type="button"
-            data-testid="timeline-stretch-tool-toggle"
-            aria-pressed={stretchToolActive}
-            onClick={() => setStretchToolActive((v) => !v)}
-            title="Time-Stretch Tool: when active, dragging a clip's edges stretches or compresses its FX speed to fit instead of looping"
-            className={`flex items-center gap-1 px-1.5 py-1 rounded border font-mono text-[10px] transition-colors ${
-              stretchToolActive
-                ? "border-ember bg-ember/25 text-frost font-semibold"
-                : "border-steel bg-ink text-fog hover:text-mist"
-            }`}
-          >
-            <MoveHorizontal className="w-3 h-3" />
-            <span>Stretch</span>
-          </button>
-
-          <div
-            className="flex items-center gap-0.5 bg-ink border border-steel rounded p-0.5 font-mono text-[10px]"
-            title="Switch ruler and clip inspector between Beats and Seconds"
-          >
-            <button
-              type="button"
-              data-testid="timeline-unit-beats"
-              aria-pressed={timeUnit === "beats"}
-              onClick={() => setTimeUnit("beats")}
-              className={`px-1.5 py-0.5 rounded ${
-                timeUnit === "beats"
-                  ? "bg-plum/30 text-frost font-semibold"
-                  : "text-fog hover:text-mist"
-              }`}
-            >
-              Beats
-            </button>
-            <button
-              type="button"
-              data-testid="timeline-unit-seconds"
-              aria-pressed={timeUnit === "seconds"}
-              onClick={() => setTimeUnit("seconds")}
-              className={`px-1.5 py-0.5 rounded ${
-                timeUnit === "seconds"
-                  ? "bg-cobalt/30 text-frost font-semibold"
-                  : "text-fog hover:text-mist"
-              }`}
-            >
-              Sec
-            </button>
-          </div>
-
-          <span className="h-4 w-px bg-steel/70 mx-0.5" />
-
-          {/* Clip Actions */}
-          <button
-            type="button"
-            data-testid="timeline-split-clip-btn"
-            onClick={() => void handleSplitClipAtPlayhead()}
-            title="Split selected or hovered clip at the playhead"
-            className="flex items-center gap-1 px-1.5 py-1 rounded bg-ink border border-steel hover:border-ember font-mono text-[10px] text-frost"
-          >
-            <Scissors className="w-3 h-3 text-ember" />
-            <span>Split</span>
-          </button>
-
-          <button
-            type="button"
-            data-testid="timeline-duplicate-clip-btn"
-            disabled={!resolvedSelectedClip}
-            onClick={() => void handleDuplicateSelectedClip()}
-            title="Duplicate selected clip (Ctrl+D, or Alt+Drag any clip)"
-            className="flex items-center gap-1 px-1.5 py-1 rounded bg-ink border border-steel hover:border-cobalt font-mono text-[10px] text-frost disabled:opacity-40"
-          >
-            <Copy className="w-3 h-3 text-cobalt" />
-          </button>
-
-          <button
-            type="button"
-            data-testid="timeline-auto-place-kicks-btn"
-            onClick={() => void handleAutoPlaceOnKicks()}
-            title="Automatically place the selected FX scene on all strong detected Kick transients across the song"
-            className="flex items-center gap-1 px-1.5 py-1 rounded bg-plum/20 border border-plum hover:bg-plum/30 font-mono text-[10px] text-frost"
-          >
-            <Sparkles className="w-3 h-3 text-plum" />
-            <span>Kicks</span>
-          </button>
-
-          <input
-            ref={musicInputRef}
-            type="file"
-            accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a"
-            aria-label="Add Music File"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) {
-                void dropAudioFileToTrack(file, "__new__", displayPlayheadSec);
-              }
-              e.target.value = "";
-            }}
-          />
-          <button
-            type="button"
-            data-testid="timeline-add-music-btn"
-            onClick={() => musicInputRef.current?.click()}
-            title="Add Music Track from Audio File (or drag and drop MP3/WAV/OGG/FLAC onto any track)"
-            className="flex items-center gap-1 px-1.5 py-1 rounded border border-steel bg-ink hover:border-cobalt font-mono text-[10px] text-frost"
-          >
-            <Music className="w-3 h-3 text-cobalt" />
-            <span>Music</span>
-          </button>
-
-          {/* Zoom Controls */}
-          <div
-            className="flex items-center gap-0.5 bg-ink border border-steel rounded p-0.5 font-mono text-[10px]"
-            title="Zoom timeline horizontally (or hold Ctrl + Mousewheel)"
-          >
-            <button
-              type="button"
-              data-testid="timeline-zoom-out"
-              onClick={() =>
-                setTimelineZoom((z) =>
-                  Math.max(0.2, Number((z - 0.25).toFixed(2))),
-                )
-              }
-              title="Zoom Out"
-              className="p-0.5 text-mist hover:text-ember"
-            >
-              <ZoomOut className="w-3 h-3" />
-            </button>
-            <button
-              type="button"
-              data-testid="timeline-zoom-reset"
-              onClick={() => setTimelineZoom(1.0)}
-              title="Reset Zoom to 1.0x"
-              className="px-1 text-frost"
-            >
-              {timelineZoom.toFixed(1)}×
-            </button>
-            <button
-              type="button"
-              data-testid="timeline-zoom-in"
-              onClick={() =>
-                setTimelineZoom((z) =>
-                  Math.min(8.0, Number((z + 0.5).toFixed(2))),
-                )
-              }
-              title="Zoom In"
-              className="p-0.5 text-mist hover:text-ember"
-            >
-              <ZoomIn className="w-3 h-3" />
-            </button>
-          </div>
-
-          {!hideUndoRedo && (
-            <>
-              <button
-                type="button"
-                disabled={!canUndo}
-                onClick={() => void undoShow()}
-                className="p-1 rounded border border-steel bg-ink text-mist disabled:opacity-40"
-              >
-                <Undo2 className="w-3 h-3" />
-              </button>
-              <button
-                type="button"
-                disabled={!canRedo}
-                onClick={() => void redoShow()}
-                className="p-1 rounded border border-steel bg-ink text-mist disabled:opacity-40"
-              >
-                <Redo2 className="w-3 h-3" />
-              </button>
-            </>
-          )}
-
-          {onToggleExpand && (
-            <button
-              type="button"
-              data-testid="timeline-expand-toggle"
-              aria-pressed={expanded}
-              onClick={onToggleExpand}
-              title={
-                expanded
-                  ? "Collapse Timeline to Bottom-Right Dock"
-                  : "Expand Timeline to Full Bottom Width"
-              }
-              className="p-1 rounded border border-steel bg-ink text-mist hover:border-ember hover:text-frost"
-            >
-              {expanded ? (
-                <Minimize2 className="w-3.5 h-3.5" />
+              {timelinePlaying ? (
+                <>
+                  <Pause className="w-3 h-3" />
+                  <span>Pause Timeline</span>
+                </>
               ) : (
-                <Maximize2 className="w-3.5 h-3.5" />
+                <>
+                  <Play className="w-3 h-3" />
+                  <span>Play Timeline</span>
+                </>
               )}
             </button>
-          )}
+
+            <button
+              type="button"
+              data-testid="timeline-loop-toggle"
+              aria-pressed={Boolean(currentTimeline.loop_timeline)}
+              onClick={handleToggleLoop}
+              title={
+                currentTimeline.loop_timeline
+                  ? "Loop Enabled: wraps back to 0s at end of last clip"
+                  : "One-Shot: stops and releases at end of last clip"
+              }
+              className={`flex items-center gap-1 px-1.5 py-1 rounded border font-mono text-[10px] transition-colors ${
+                currentTimeline.loop_timeline
+                  ? "border-pine bg-pine/25 text-frost font-semibold"
+                  : "border-steel bg-ink text-fog hover:text-mist"
+              }`}
+            >
+              <Repeat className="w-3 h-3" />
+              <span>Loop</span>
+            </button>
+
+            <label
+              className="flex items-center gap-1 bg-pitch border border-steel rounded px-1.5 py-0.5"
+              title="Current playhead position in seconds"
+            >
+              <Clock className="w-3 h-3 text-ember" />
+              <input
+                aria-label="Timeline Playhead Sec"
+                type="number"
+                min={0}
+                step={0.1}
+                value={Number(displayPlayheadSec.toFixed(2))}
+                onChange={(e) =>
+                  void setTimelineTransport(
+                    currentTimeline.id,
+                    timelinePlaying,
+                    Number(e.target.value) || 0,
+                  )
+                }
+                className="w-12 bg-ink border border-steel rounded px-1 py-0.5 font-mono text-[10px] text-frost"
+              />
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1">
+            <div
+              className="flex items-center gap-0.5 bg-ink border border-steel rounded p-0.5 font-mono text-[10px]"
+              title="Switch ruler and clip inspector between Beats and Seconds"
+            >
+              <button
+                type="button"
+                data-testid="timeline-unit-beats"
+                aria-pressed={timeUnit === "beats"}
+                onClick={() => setTimeUnit("beats")}
+                className={`px-1.5 py-0.5 rounded ${
+                  timeUnit === "beats"
+                    ? "bg-plum/30 text-frost font-semibold"
+                    : "text-fog hover:text-mist"
+                }`}
+              >
+                Beats
+              </button>
+              <button
+                type="button"
+                data-testid="timeline-unit-seconds"
+                aria-pressed={timeUnit === "seconds"}
+                onClick={() => setTimeUnit("seconds")}
+                className={`px-1.5 py-0.5 rounded ${
+                  timeUnit === "seconds"
+                    ? "bg-cobalt/30 text-frost font-semibold"
+                    : "text-fog hover:text-mist"
+                }`}
+              >
+                Sec
+              </button>
+            </div>
+
+            {/* Zoom Controls */}
+            <div
+              className="flex items-center gap-0.5 bg-ink border border-steel rounded p-0.5 font-mono text-[10px]"
+              title="Zoom timeline horizontally (or hold Ctrl + Mousewheel)"
+            >
+              <button
+                type="button"
+                data-testid="timeline-zoom-out"
+                onClick={() =>
+                  setTimelineZoom((z) =>
+                    Math.max(0.2, Number((z - 0.25).toFixed(2))),
+                  )
+                }
+                title="Zoom Out"
+                className="p-0.5 text-mist hover:text-ember"
+              >
+                <ZoomOut className="w-3 h-3" />
+              </button>
+              <button
+                type="button"
+                data-testid="timeline-zoom-reset"
+                onClick={() => setTimelineZoom(1.0)}
+                title="Reset Zoom to 1.0x"
+                className="px-1 text-frost"
+              >
+                {timelineZoom.toFixed(1)}×
+              </button>
+              <button
+                type="button"
+                data-testid="timeline-zoom-in"
+                onClick={() =>
+                  setTimelineZoom((z) =>
+                    Math.min(8.0, Number((z + 0.5).toFixed(2))),
+                  )
+                }
+                title="Zoom In"
+                className="p-0.5 text-mist hover:text-ember"
+              >
+                <ZoomIn className="w-3 h-3" />
+              </button>
+            </div>
+
+            {!hideUndoRedo && (
+              <>
+                <button
+                  type="button"
+                  disabled={!canUndo}
+                  onClick={() => void undoShow()}
+                  className="p-1 rounded border border-steel bg-ink text-mist disabled:opacity-40"
+                >
+                  <Undo2 className="w-3 h-3" />
+                </button>
+                <button
+                  type="button"
+                  disabled={!canRedo}
+                  onClick={() => void redoShow()}
+                  className="p-1 rounded border border-steel bg-ink text-mist disabled:opacity-40"
+                >
+                  <Redo2 className="w-3 h-3" />
+                </button>
+              </>
+            )}
+
+            {onToggleExpand && (
+              <button
+                type="button"
+                data-testid="timeline-expand-toggle"
+                aria-pressed={expanded}
+                onClick={onToggleExpand}
+                title={
+                  expanded
+                    ? "Collapse Timeline to Bottom-Right Dock"
+                    : "Expand Timeline to Full Bottom Width"
+                }
+                className="p-1 rounded border border-steel bg-ink text-mist hover:border-ember hover:text-frost"
+              >
+                {expanded ? (
+                  <Minimize2 className="w-3.5 h-3.5" />
+                ) : (
+                  <Maximize2 className="w-3.5 h-3.5" />
+                )}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Row 2: Editing Tools (Left) + Independent Guide/Transient Toggles (Right) */}
+        <div
+          data-testid="timeline-toolbar-row-2"
+          className="flex flex-wrap items-center justify-between gap-1.5 px-2.5 py-1 bg-pitch/60"
+        >
+          <div className="flex flex-wrap items-center gap-1">
+            {/* Snap + Snap Grid Subdivision */}
+            <div className="flex items-center gap-0.5 rounded border border-steel bg-ink px-1 py-0.5 font-mono text-[10px] text-mist">
+              <HelpTooltip text="Magnetically snap clips and playhead to enabled Beat/Transient guides and clip edges.">
+                <label className="flex items-center gap-1 cursor-pointer pr-1">
+                  <input
+                    aria-label="Magnetic Snap"
+                    type="checkbox"
+                    checked={magneticSnap}
+                    onChange={(e) => setMagneticSnap(e.target.checked)}
+                  />
+                  <Magnet className="w-3 h-3 text-plum" />
+                  <span>Snap</span>
+                </label>
+              </HelpTooltip>
+              <select
+                aria-label="Snap Grid Subdivision"
+                data-testid="timeline-snap-grid-select"
+                disabled={!magneticSnap || !showBeats}
+                value={snapGrid}
+                onChange={(e) =>
+                  setSnapGrid(e.target.value as SnapGridSubdivision)
+                }
+                title="Snap grid resolution: Whole Beats (default), Bars (4 beats), 1/2 Beat, or 1/4 Beat"
+                className="bg-pitch border border-steel/70 rounded px-1 py-0 text-[10px] text-frost disabled:opacity-40"
+              >
+                <option value="bar">Bar</option>
+                <option value="beat">Beat</option>
+                <option value="half">1/2</option>
+                <option value="quarter">1/4</option>
+              </select>
+            </div>
+
+            <HelpTooltip text="Time-Stretch Tool: dragging a clip's edges stretches or compresses its FX speed to fit instead of looping.">
+              <button
+                type="button"
+                data-testid="timeline-stretch-tool-toggle"
+                aria-pressed={stretchToolActive}
+                onClick={() => setStretchToolActive((v) => !v)}
+                className={`flex items-center gap-1 px-1.5 py-1 rounded border font-mono text-[10px] transition-colors ${
+                  stretchToolActive
+                    ? "border-ember bg-ember/25 text-frost font-semibold"
+                    : "border-steel bg-ink text-fog hover:text-mist"
+                }`}
+              >
+                <MoveHorizontal className="w-3 h-3" />
+                <span>Stretch</span>
+              </button>
+            </HelpTooltip>
+
+            <button
+              type="button"
+              data-testid="timeline-split-clip-btn"
+              onClick={() => void handleSplitClipAtPlayhead()}
+              title="Split selected or hovered clip at the playhead"
+              className="flex items-center gap-1 px-1.5 py-1 rounded bg-ink border border-steel hover:border-ember font-mono text-[10px] text-frost"
+            >
+              <Scissors className="w-3 h-3 text-ember" />
+              <span>Split</span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="timeline-duplicate-clip-btn"
+              disabled={!resolvedSelectedClip}
+              onClick={() => void handleDuplicateSelectedClip()}
+              title="Duplicate selected clip (Ctrl+D, or Alt+Drag any clip)"
+              className="flex items-center gap-1 px-1.5 py-1 rounded bg-ink border border-steel hover:border-cobalt font-mono text-[10px] text-frost disabled:opacity-40"
+            >
+              <Copy className="w-3 h-3 text-cobalt" />
+            </button>
+
+            {/* Kicks / Auto-Fill Popover */}
+            <div ref={kicksPopoverRef} className="relative">
+              <button
+                type="button"
+                data-testid="timeline-auto-place-kicks-btn"
+                aria-expanded={kicksPopoverOpen}
+                onClick={() => {
+                  if (!kicksPopoverOpen && resolvedSelectedClip?.clip.ref_block) {
+                    setKicksSelectedBlockId(resolvedSelectedClip.clip.ref_block);
+                  }
+                  setKicksPopoverOpen((v) => !v);
+                }}
+                title="Auto-place a chosen Scene/FX on detected Kicks, Snares, or Beats"
+                className={`flex items-center gap-1 px-1.5 py-1 rounded border font-mono text-[10px] transition-colors ${
+                  kicksPopoverOpen
+                    ? "bg-plum/35 border-plum text-frost font-semibold"
+                    : "bg-plum/20 border-plum text-frost hover:bg-plum/30"
+                }`}
+              >
+                <Sparkles className="w-3 h-3 text-plum" />
+                <span>Kicks ▾</span>
+              </button>
+
+              {kicksPopoverOpen && (
+                <div
+                  data-testid="timeline-kicks-popover"
+                  className="absolute left-0 top-full mt-1 z-40 w-72 rounded-md border border-steel bg-slate-dark p-2.5 shadow-2xl font-mono text-[10px] flex flex-col gap-2"
+                >
+                  <div className="flex items-center justify-between text-frost font-semibold border-b border-steel/60 pb-1">
+                    <span>Auto-Fill Hits</span>
+                    <span className="text-[9px] text-fog">
+                      {kicksFillTimes.length} / {kicksPreviewTimes.length} hits
+                    </span>
+                  </div>
+
+                  <label className="flex flex-col gap-0.5">
+                    <span className="text-fog">Scene / FX Clip</span>
+                    <select
+                      aria-label="Auto-Fill Scene"
+                      value={resolvedKicksBlockId}
+                      onChange={(e) => setKicksSelectedBlockId(e.target.value)}
+                      className="bg-ink border border-steel rounded px-1.5 py-1 text-xs text-frost"
+                    >
+                      {autoFillSceneOptions.length === 0 ? (
+                        <option value="">No FX scenes available</option>
+                      ) : (
+                        autoFillSceneOptions.map((opt) => (
+                          <option key={opt.blockId} value={opt.blockId}>
+                            {opt.label}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-fog">Trigger On</span>
+                      <select
+                        aria-label="Auto-Fill Trigger"
+                        value={kicksTriggerBand}
+                        onChange={(e) =>
+                          setKicksTriggerBand(
+                            e.target.value as "kick" | "snare" | "beat",
+                          )
+                        }
+                        className="bg-ink border border-steel rounded px-1.5 py-1 text-xs text-frost"
+                      >
+                        <option value="kick">Kicks</option>
+                        <option value="snare">Snares</option>
+                        <option value="beat">Beats</option>
+                      </select>
+                    </label>
+
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-fog">Track Mode</span>
+                      <select
+                        aria-label="Auto-Fill Track Mode"
+                        value={kicksTrackMode}
+                        onChange={(e) =>
+                          setKicksTrackMode(
+                            e.target.value as "update" | "new",
+                          )
+                        }
+                        className="bg-ink border border-steel rounded px-1.5 py-1 text-xs text-frost"
+                      >
+                        <option value="update">Update Track</option>
+                        <option value="new">New Track</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-fog">Cadence</span>
+                      <select
+                        aria-label="Auto-Fill Cadence"
+                        data-testid="timeline-kicks-cadence-select"
+                        value={String(kicksCadence)}
+                        onChange={(e) =>
+                          setKicksCadence(
+                            (Number(e.target.value) as AutoFillCadence) || 1,
+                          )
+                        }
+                        className="bg-ink border border-steel rounded px-1.5 py-1 text-xs text-frost"
+                      >
+                        <option value="1">Every Hit</option>
+                        <option value="2">Every 2nd (1 of 2)</option>
+                        <option value="4">Every 4th (1 of 4)</option>
+                      </select>
+                    </label>
+
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-fog">Fill Count</span>
+                      <select
+                        aria-label="Auto-Fill Count"
+                        data-testid="timeline-kicks-count-select"
+                        value={kicksCountMode}
+                        onChange={(e) =>
+                          setKicksCountMode(
+                            e.target.value as
+                              | "all"
+                              | "4"
+                              | "8"
+                              | "16"
+                              | "32"
+                              | "custom",
+                          )
+                        }
+                        className="bg-ink border border-steel rounded px-1.5 py-1 text-xs text-frost"
+                      >
+                        <option value="all">All</option>
+                        <option value="4">4 hits</option>
+                        <option value="8">8 hits</option>
+                        <option value="16">16 hits</option>
+                        <option value="32">32 hits</option>
+                        <option value="custom">Custom…</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  {kicksCadence > 1 && (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-mist">Hit Position</span>
+                      <select
+                        aria-label="Auto-Fill Hit Offset"
+                        data-testid="timeline-kicks-offset-select"
+                        value={String(resolvedKicksOffset)}
+                        onChange={(e) =>
+                          setKicksCadenceOffset(
+                            Math.max(0, Math.floor(Number(e.target.value) || 0)),
+                          )
+                        }
+                        className="w-28 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
+                      >
+                        {Array.from({ length: kicksCadence }, (_, idx) => {
+                          const ord =
+                            idx === 0
+                              ? "1st"
+                              : idx === 1
+                                ? "2nd"
+                                : idx === 2
+                                  ? "3rd"
+                                  : "4th";
+                          return (
+                            <option key={idx} value={String(idx)}>
+                              {ord} of {kicksCadence}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </div>
+                  )}
+
+                  {kicksCountMode === "custom" && (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-mist">Custom Count</span>
+                      <input
+                        aria-label="Auto-Fill Custom Count"
+                        data-testid="timeline-kicks-custom-count-input"
+                        type="number"
+                        min={1}
+                        max={512}
+                        step={1}
+                        value={kicksCustomCount}
+                        onChange={(e) =>
+                          setKicksCustomCount(
+                            Math.max(1, Math.floor(Number(e.target.value) || 1)),
+                          )
+                        }
+                        className="w-20 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
+                      />
+                    </div>
+                  )}
+
+                  {resolvedKicksMaxCount !== null && (
+                    <div className="text-[9px] text-fog">
+                      Counting from playhead ({displayPlayheadSec.toFixed(2)}s) forward
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="flex items-center gap-1 text-mist cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={kicksAutoDuration}
+                        onChange={(e) =>
+                          setKicksAutoDuration(e.target.checked)
+                        }
+                        className="accent-plum"
+                      />
+                      <span>Auto Dur</span>
+                    </label>
+                    <input
+                      aria-label="Auto-Fill Duration"
+                      type="number"
+                      min={0.05}
+                      max={4}
+                      step={0.05}
+                      disabled={kicksAutoDuration}
+                      value={kicksCustomDurationSec}
+                      onChange={(e) =>
+                        setKicksCustomDurationSec(
+                          Math.max(0.05, Number(e.target.value) || 0.2),
+                        )
+                      }
+                      className="w-20 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost disabled:opacity-40"
+                    />
+                  </div>
+
+                  <button
+                    type="button"
+                    data-testid="timeline-kicks-confirm-btn"
+                    disabled={
+                      !resolvedKicksBlockId || kicksFillTimes.length === 0
+                    }
+                    onClick={() => void handleAutoPlaceOnKicks()}
+                    className="w-full py-1.5 rounded bg-plum hover:bg-plum/90 text-frost font-semibold disabled:opacity-40 transition-colors"
+                  >
+                    Fill {kicksFillTimes.length}{" "}
+                    {kicksFillTimes.length === 1 ? "Hit" : "Hits"}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <input
+              ref={musicInputRef}
+              type="file"
+              accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a"
+              aria-label="Add Music File"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  void dropAudioFileToTrack(file, "__new__", displayPlayheadSec);
+                }
+                e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              data-testid="timeline-add-music-btn"
+              onClick={() => musicInputRef.current?.click()}
+              title="Add Music Track from Audio File (or drag and drop MP3/WAV/OGG/FLAC onto any track)"
+              className="flex items-center gap-1 px-1.5 py-1 rounded border border-steel bg-ink hover:border-cobalt font-mono text-[10px] text-frost"
+            >
+              <Music className="w-3 h-3 text-cobalt" />
+              <span>Music</span>
+            </button>
+          </div>
+
+          {/* Right: Independent Beat / Kick / Snare Visual & Snap Toggles */}
+          <div className="flex items-center gap-1 font-mono text-[10px]">
+            <HelpTooltip text="Toggle beat grid lines and beat snapping on/off independently.">
+              <button
+                type="button"
+                data-testid="timeline-toggle-beats"
+                aria-pressed={showBeats}
+                onClick={() => setShowBeats(!showBeats)}
+                className={`px-1.5 py-0.5 rounded border transition-colors ${
+                  showBeats
+                    ? "bg-slate-dark border-frost/70 text-frost font-semibold"
+                    : "bg-ink border-steel text-fog hover:text-mist"
+                }`}
+              >
+                Beats
+              </button>
+            </HelpTooltip>
+            <HelpTooltip text="Toggle Kick transient markers & Kick snapping independently.">
+              <button
+                type="button"
+                data-testid="timeline-toggle-kicks"
+                aria-pressed={showKicks}
+                onClick={() => setShowKicks(!showKicks)}
+                className={`px-1.5 py-0.5 rounded border transition-colors ${
+                  showKicks
+                    ? "bg-amber-500/20 border-amber-400 text-amber-300 font-semibold"
+                    : "bg-ink border-steel text-fog hover:text-mist"
+                }`}
+              >
+                Kicks
+              </button>
+            </HelpTooltip>
+            <HelpTooltip text="Toggle Snare transient markers & Snare snapping independently.">
+              <button
+                type="button"
+                data-testid="timeline-toggle-snares"
+                aria-pressed={showSnares}
+                onClick={() => setShowSnares(!showSnares)}
+                className={`px-1.5 py-0.5 rounded border transition-colors ${
+                  showSnares
+                    ? "bg-cyan-500/20 border-cyan-400 text-cyan-300 font-semibold"
+                    : "bg-ink border-steel text-fog hover:text-mist"
+                }`}
+              >
+                Snares
+              </button>
+            </HelpTooltip>
+          </div>
         </div>
       </div>
 
@@ -2186,6 +2820,26 @@ export function TimelineEditor({
                 className="pointer-events-none absolute top-0 bottom-0 w-0.5 bg-ember z-20"
               />
 
+              {/* Active Magnetic Snap Guide Line */}
+              {activeSnapGuideRef.current && (
+                <div
+                  data-testid="timeline-active-snap-guide"
+                  data-snap-kind={activeSnapGuideRef.current.kind}
+                  style={{
+                    left: `${(activeSnapGuideRef.current.time_sec / viewportDurationSec) * 100}%`,
+                  }}
+                  className={`pointer-events-none absolute top-0 bottom-0 w-0.5 z-30 ${
+                    activeSnapGuideRef.current.kind === "snare"
+                      ? "bg-cyan-400"
+                      : activeSnapGuideRef.current.kind === "kick"
+                        ? "bg-amber-400"
+                        : activeSnapGuideRef.current.kind === "beat"
+                          ? "bg-frost/80"
+                          : "bg-plum"
+                  }`}
+                />
+              )}
+
               {/* Interactive Zoom-Adaptive Time Ruler */}
               <div
                 data-testid="timeline-ruler"
@@ -2200,7 +2854,11 @@ export function TimelineEditor({
                     initialFadeOutSec: 0,
                   });
                 }}
-                className="relative h-7 shrink-0 border-b border-steel bg-ink cursor-ew-resize select-none"
+                className={`relative h-7 shrink-0 border-b border-steel bg-ink select-none ${
+                  clipDragState?.mode === "scrub"
+                    ? "cursor-ew-resize"
+                    : "cursor-pointer"
+                }`}
               >
                 {rulerTicks.map((tick, idx) => (
                   <div
@@ -2218,7 +2876,12 @@ export function TimelineEditor({
                 ))}
                 <div
                   style={{ left: `${playheadPct}%` }}
-                  className="absolute top-0 -translate-x-1/2 px-1 bg-ember text-void font-mono text-[9px] font-bold rounded-b whitespace-nowrap"
+                  className="absolute top-0 bottom-0 w-3 -translate-x-1/2 cursor-ew-resize z-10"
+                />
+                <div
+                  data-testid="timeline-playhead-handle"
+                  style={{ left: `${playheadPct}%` }}
+                  className="absolute top-0 -translate-x-1/2 px-1 bg-ember text-void font-mono text-[9px] font-bold rounded-b whitespace-nowrap cursor-ew-resize z-20"
                 >
                   {timeUnit === "beats"
                     ? `${secToBeats(displayPlayheadSec).toFixed(1)}b (${displayPlayheadSec.toFixed(2)}s)`
@@ -2232,6 +2895,11 @@ export function TimelineEditor({
                   key={track.id}
                   data-testid={`track-lane-${track.id}`}
                   data-track-lane-id={track.id}
+                  onClick={(e) => {
+                    if (e.target === e.currentTarget) {
+                      setSelectedClip(null);
+                    }
+                  }}
                   onDragOver={(e: DragEvent<HTMLDivElement>) => {
                     e.preventDefault();
                     if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
@@ -2266,38 +2934,44 @@ export function TimelineEditor({
                   title="Double-click or drop a Scene / Audio file here; drag clip to move, Alt+Drag to duplicate, or drag edges to trim/stretch"
                 >
                   {/* Beat Grid Vertical Lines (Neutral slate/white: bold bars, subtle beats) */}
-                  {beatGridMarkers.map((bt, bIdx) => {
-                    const isBar = bIdx % 4 === 0;
-                    if (!isBar && pxPerSec < 18) return null;
-                    return (
-                      <div
-                        key={`bg-${bIdx}`}
-                        data-testid={isBar ? "beat-grid-bar" : "beat-grid-sub"}
-                        style={{ left: `${(bt / viewportDurationSec) * 100}%` }}
-                        className={`pointer-events-none absolute top-0 bottom-0 ${
-                          isBar
-                            ? "border-l-2 border-frost/35"
-                            : "border-l border-steel/45"
-                        }`}
-                      />
-                    );
-                  })}
+                  {showBeats &&
+                    beatGridMarkers.map((bt, bIdx) => {
+                      const isBar = bIdx % 4 === 0;
+                      if (!isBar && pxPerSec < 18) return null;
+                      return (
+                        <div
+                          key={`bg-${bIdx}`}
+                          data-testid={isBar ? "beat-grid-bar" : "beat-grid-sub"}
+                          style={{ left: `${(bt / viewportDurationSec) * 100}%` }}
+                          className={`pointer-events-none absolute top-0 bottom-0 ${
+                            isBar
+                              ? "border-l-2 border-frost/35"
+                              : "border-l border-steel/45"
+                          }`}
+                        />
+                      );
+                    })}
 
                   {/* Optional Projected Transient Guidelines (Amber = Kick, Cyan = Snare) */}
                   {projectTransients &&
-                    timelineTransients.map((m, mIdx) => (
-                      <div
-                        key={`tr-${mIdx}`}
-                        style={{
-                          left: `${(m.time_sec / viewportDurationSec) * 100}%`,
-                        }}
-                        className={`pointer-events-none absolute top-0 bottom-0 border-l ${
-                          m.band === "kick"
-                            ? "border-amber-400/55"
-                            : "border-cyan-400/35"
-                        }`}
-                      />
-                    ))}
+                    timelineTransients
+                      .filter((m) =>
+                        m.band === "kick" ? showKicks : showSnares,
+                      )
+                      .map((m, mIdx) => (
+                        <div
+                          key={`tr-${mIdx}`}
+                          data-testid={`projected-transient-${m.band}`}
+                          style={{
+                            left: `${(m.time_sec / viewportDurationSec) * 100}%`,
+                          }}
+                          className={`pointer-events-none absolute top-0 bottom-0 border-l ${
+                            m.band === "kick"
+                              ? "border-amber-400/55"
+                              : "border-cyan-400/35"
+                          }`}
+                        />
+                      ))}
 
                   {/* Interactive Clip Blocks */}
                   {track.clips.map((rawClip, idx) => {
@@ -2328,6 +3002,15 @@ export function TimelineEditor({
                       ? audioAnalysisByClipKey[clip.audio_file]
                       : undefined;
                     const colors = getBlockColors(clip.ref_block);
+                    const ownerScene =
+                      !isMusicClip && clip.ref_block
+                        ? showState.scenes.find((s) =>
+                            s.block_refs.includes(clip.ref_block!),
+                          )
+                        : undefined;
+                    const bankColor = ownerScene?.bank
+                      ? bankColors[ownerScene.bank.trim()]
+                      : undefined;
                     const fadeInPct = Math.min(
                       50,
                       (clip.fade_in_sec / Math.max(0.01, clip.duration_sec)) *
@@ -2360,6 +3043,14 @@ export function TimelineEditor({
                           left: `${Math.max(0, leftPct)}%`,
                           width: `${widthPct}%`,
                           minWidth: "4px",
+                          ...(!isMusicClip && bankColor
+                            ? {
+                                ...(isSelected ? {} : { borderColor: bankColor }),
+                                backgroundColor: isSelected
+                                  ? `${bankColor}33`
+                                  : `${bankColor}20`,
+                              }
+                            : {}),
                         }}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -2384,6 +3075,8 @@ export function TimelineEditor({
                             clipDurationSec={clip.duration_sec}
                             clipWidthPx={(widthPct / 100) * viewportWidthPx}
                             showTransients={showTransients}
+                            showKicks={showKicks}
+                            showSnares={showSnares}
                             testId={`clip-waveform-${track.id}-${idx}`}
                           />
                         )}
@@ -2429,6 +3122,126 @@ export function TimelineEditor({
                             );
                           })()}
 
+                        {/* Scene Sequence Step Boundaries, Colors & Labels */}
+                        {!isMusicClip &&
+                          clip.ref_block &&
+                          (() => {
+                            const blk = showState.fx_library.find(
+                              (b) => b.id === clip.ref_block,
+                            );
+                            const seqEl = blk?.elements.find(
+                              (
+                                el,
+                              ): el is Extract<
+                                FxElementDef,
+                                { kind: "scene_sequence" }
+                              > => el.kind === "scene_sequence",
+                            );
+                            if (!seqEl || seqEl.steps.length === 0) return null;
+                            const totalDur = Math.max(0.05, clip.duration_sec);
+                            const phaseScale =
+                              clip.time_stretch &&
+                              clip.source_duration_sec &&
+                              clip.source_duration_sec > 1e-6 &&
+                              clip.duration_sec > 1e-6
+                                ? Math.max(
+                                    0.01,
+                                    clip.source_duration_sec / clip.duration_sec,
+                                  )
+                                : 1;
+                            const secPerBeat = 60 / Math.max(20, effectiveBpm);
+                            const stepDurs = seqEl.steps.map((st) =>
+                              (st.duration_unit === "seconds"
+                                ? Math.max(0.05, st.duration_value)
+                                : Math.max(0.05, st.duration_value) *
+                                  secPerBeat) / phaseScale,
+                            );
+                            const order: number[] = [];
+                            const n = seqEl.steps.length;
+                            if (seqEl.playback_mode === "bounce" && n >= 2) {
+                              for (let i = 0; i < n; i++) order.push(i);
+                              for (let i = n - 2; i >= 1; i--) order.push(i);
+                            } else {
+                              for (let i = 0; i < n; i++) order.push(i);
+                            }
+                            const segments: Array<{
+                              startSec: number;
+                              endSec: number;
+                              stepIdx: number;
+                              name: string;
+                              color: string;
+                            }> = [];
+                            let cursor = 0;
+                            let ordPos = 0;
+                            while (cursor < totalDur - 1e-4 && segments.length < 64) {
+                              const stepIdx = order[ordPos];
+                              const dur = stepDurs[stepIdx];
+                              const segEnd = Math.min(totalDur, cursor + dur);
+                              const refScene = showState.scenes.find(
+                                (s) => s.id === seqEl.steps[stepIdx].scene_id,
+                              );
+                              const stColors = refScene?.block_refs[0]
+                                ? getBlockColors(refScene.block_refs[0])
+                                : null;
+                              segments.push({
+                                startSec: cursor,
+                                endSec: segEnd,
+                                stepIdx,
+                                name:
+                                  refScene?.name ?? seqEl.steps[stepIdx].scene_id,
+                                color: stColors ? stColors[0] : "#FF5500",
+                              });
+                              cursor = segEnd;
+                              ordPos += 1;
+                              if (ordPos >= order.length) {
+                                if (seqEl.playback_mode === "one_shot") break;
+                                ordPos = 0;
+                              }
+                            }
+                            return (
+                              <div
+                                data-testid={`clip-seq-overlay-${track.id}-${idx}`}
+                                className="pointer-events-none absolute inset-0 z-[8]"
+                              >
+                                {segments.map((seg, sIdx) => {
+                                  const leftP = (seg.startSec / totalDur) * 100;
+                                  const widthP =
+                                    ((seg.endSec - seg.startSec) / totalDur) *
+                                    100;
+                                  return (
+                                    <div
+                                      key={`seq-seg-${sIdx}`}
+                                      style={{
+                                        left: `${leftP}%`,
+                                        width: `${widthP}%`,
+                                      }}
+                                      className="absolute top-0 bottom-0 overflow-hidden"
+                                    >
+                                      <div
+                                        className="h-1.5 w-full opacity-90"
+                                        style={{ backgroundColor: seg.color }}
+                                      />
+                                      {sIdx > 0 && (
+                                        <div
+                                          data-testid={`clip-seq-step-boundary-${track.id}-${idx}-${sIdx}`}
+                                          className="absolute left-0 top-0 bottom-0 border-l border-amber-300/80"
+                                        />
+                                      )}
+                                      {widthP >= 10 && (
+                                        <span
+                                          data-testid={`clip-seq-step-label-${track.id}-${idx}-${sIdx}`}
+                                          className="absolute bottom-0.5 left-1 right-1 truncate font-mono text-[8px] text-frost/85 drop-shadow"
+                                        >
+                                          {seg.name}
+                                        </span>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            );
+                          })()}
+
                         {/* Visual Fade-In / Fade-Out Envelope SVG */}
                         {!isMusicClip && (
                           <svg
@@ -2438,7 +3251,7 @@ export function TimelineEditor({
                           >
                             <polygon
                               points={`0,100 ${fadeInPct},0 ${100 - fadeOutPct},0 100,100`}
-                              fill="#FF5500"
+                              fill={bankColor ?? "#FF5500"}
                             />
                           </svg>
                         )}
@@ -2470,6 +3283,11 @@ export function TimelineEditor({
                             stretchToolActive
                               ? "Drag to time-stretch clip start"
                               : "Drag to trim clip start"
+                          }
+                          style={
+                            !stretchToolActive && !isMusicClip && bankColor
+                              ? { backgroundColor: `${bankColor}99` }
+                              : undefined
                           }
                           className={`w-2 shrink-0 cursor-ew-resize z-10 ${
                             stretchToolActive
@@ -2539,7 +3357,7 @@ export function TimelineEditor({
                                       colors[1],
                                       0.5,
                                     )}, ${colors[1]})`
-                                  : "#2255AA",
+                                  : (bankColor ?? "#2255AA"),
                             }}
                           />
                           <div className="flex items-center justify-between gap-1 text-[10px] font-mono text-frost bg-void/60 rounded px-1">
@@ -2554,33 +3372,39 @@ export function TimelineEditor({
                               </span>
                             ) : (
                               (() => {
-                                const ownerScene = showState.scenes.find(
-                                  (s) =>
-                                    clip.ref_block &&
-                                    s.block_refs.includes(clip.ref_block),
-                                );
                                 const clipBlock = clip.ref_block
                                   ? showState.fx_library.find(
                                       (b) => b.id === clip.ref_block,
                                     )
                                   : null;
-                                const mode = ownerScene
-                                  ? classifySceneMode(
-                                      ownerScene,
-                                      showState.fx_library,
-                                    )
-                                  : clipBlock?.elements[0]?.trait === "color"
-                                    ? clipBlock.elements[0].kind ===
-                                      "static_trait"
-                                      ? "color"
-                                      : "color_anim"
-                                    : "effect";
+                                const isSequenceBlock = Boolean(
+                                  clipBlock?.elements.some(
+                                    (e) => e.kind === "scene_sequence",
+                                  ),
+                                );
+                                const firstEl = clipBlock?.elements[0];
+                                const mode = isSequenceBlock
+                                  ? "sequence"
+                                  : ownerScene
+                                    ? classifySceneMode(
+                                        ownerScene,
+                                        showState.fx_library,
+                                      )
+                                    : firstEl &&
+                                        firstEl.kind !== "scene_sequence" &&
+                                        firstEl.trait === "color"
+                                      ? firstEl.kind === "static_trait"
+                                        ? "color"
+                                        : "color_anim"
+                                      : "effect";
                                 const tag =
-                                  mode === "color"
-                                    ? "COLOR"
-                                    : mode === "color_anim"
-                                      ? "COLOR ANIM"
-                                      : "EFFECT";
+                                  mode === "sequence"
+                                    ? "SEQUENCE"
+                                    : mode === "color"
+                                      ? "COLOR"
+                                      : mode === "color_anim"
+                                        ? "COLOR ANIM"
+                                        : "EFFECT";
                                 const label =
                                   ownerScene?.name ??
                                   clipBlock?.name ??
@@ -2666,6 +3490,11 @@ export function TimelineEditor({
                             stretchToolActive
                               ? "Drag to time-stretch clip end"
                               : "Drag to trim clip end"
+                          }
+                          style={
+                            !stretchToolActive && !isMusicClip && bankColor
+                              ? { backgroundColor: `${bankColor}99` }
+                              : undefined
                           }
                           className={`w-2 shrink-0 cursor-ew-resize z-10 ${
                             stretchToolActive

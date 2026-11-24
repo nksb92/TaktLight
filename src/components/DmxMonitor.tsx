@@ -1,10 +1,12 @@
-import { Activity, Lock, Unlock, X } from "lucide-react";
+import { Activity, ChevronLeft, ChevronRight, Lock, Unlock, X } from "lucide-react";
+import { resolveUniverseDisplayConfig } from "../lib/patchLogic";
 import {
   DisplayFormat,
   parkKey,
   UniverseConfig,
   useTaktStore,
 } from "../store/useTaktStore";
+import { HelpTooltip } from "./HelpTooltip";
 import { NumericSlider } from "./NumericSlider";
 
 const CHANNEL_INDICES = Array.from({ length: 512 }, (_, idx) => idx + 1);
@@ -53,6 +55,9 @@ export function DmxMonitor() {
   const toggleHistogram = useTaktStore((s) => s.toggleHistogram);
 
   const dmx = dmxByUniverse[selectedUniverseId] ?? new Uint8Array(512);
+  const { config: currentUniConfig, isPreview: isPreviewUniverse } =
+    resolveUniverseDisplayConfig(universes, selectedUniverseId);
+  const currentUniBadge = protocolBadge(currentUniConfig);
   const universeParkedCount = Object.keys(parkedChannels).filter((k) =>
     k.startsWith(`${selectedUniverseId}:`),
   ).length;
@@ -69,27 +74,40 @@ export function DmxMonitor() {
     <section className="bg-slate border-[1.5px] border-steel rounded-panel p-4 flex flex-col gap-4">
       {/* Header & Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="font-sans text-base font-semibold text-mist">
-          512 Channel DMX Monitor (U{selectedUniverseId}.001 to U
-          {selectedUniverseId}.512)
-        </h2>
+        <div className="flex items-center gap-2">
+          <h2 className="font-sans text-base font-semibold text-mist">
+            512 Channel DMX Monitor (U{selectedUniverseId}.001 to U
+            {selectedUniverseId}.512)
+          </h2>
+          {isPreviewUniverse && (
+            <span
+              data-testid="monitor-preview-universe-badge"
+              className="px-1.5 py-0.5 rounded bg-ink border border-dashed border-steel font-mono text-[10px] text-fog"
+            >
+              PREVIEW · {currentUniBadge.label}
+            </span>
+          )}
+        </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
-          <button
-            type="button"
-            onClick={toggleHistogram}
-            aria-pressed={histogramOpen}
-            className={`flex items-center gap-1.5 px-3 py-1 rounded-md border font-sans text-xs font-medium transition-colors ${
-              histogramOpen
-                ? "bg-ember/15 border-ember text-mist"
-                : "bg-ink border-steel text-fog hover:text-mist"
-            }`}
-          >
-            <Activity className="w-3.5 h-3.5 text-ember" />
-            <span>Jitter Histogram</span>
-          </button>
-          {/* Universe Tabs */}
-          <div className="flex items-center gap-1.5 bg-ink p-1 rounded-md border border-steel">
+          <HelpTooltip text="Toggle real-time engine loop jitter histogram (measures 44 Hz frame timing stability).">
+            <button
+              type="button"
+              onClick={toggleHistogram}
+              aria-pressed={histogramOpen}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-md border font-sans text-xs font-medium transition-colors ${
+                histogramOpen
+                  ? "bg-ember/15 border-ember text-mist"
+                  : "bg-ink border-steel text-fog hover:text-mist"
+              }`}
+            >
+              <Activity className="w-3.5 h-3.5 text-ember" />
+              <span>Jitter Histogram</span>
+            </button>
+          </HelpTooltip>
+
+          {/* Universe Tabs + Prev/Next Stepper (U1..U256) */}
+          <div className="flex items-center gap-1.5 bg-ink p-1 rounded-md border border-steel max-w-full overflow-x-auto">
             {universes.map((uni) => {
               const active = uni.id === selectedUniverseId;
               const badge = protocolBadge(uni);
@@ -100,7 +118,7 @@ export function DmxMonitor() {
                   data-testid={`universe-tab-${uni.id}`}
                   aria-pressed={active}
                   onClick={() => setSelectedUniverse(uni.id)}
-                  className={`flex items-center gap-2 px-2.5 py-1 rounded font-mono text-xs transition-colors ${
+                  className={`flex items-center gap-2 px-2.5 py-1 rounded font-mono text-xs shrink-0 transition-colors ${
                     active
                       ? "bg-slate text-mist border border-ember"
                       : "text-fog hover:text-mist border border-transparent"
@@ -115,26 +133,73 @@ export function DmxMonitor() {
                 </button>
               );
             })}
+
+            <div className="flex items-center gap-0.5 pl-1 border-l border-steel/70 shrink-0">
+              <button
+                type="button"
+                data-testid="monitor-prev-universe"
+                aria-label="Previous Universe"
+                disabled={selectedUniverseId <= 1}
+                onClick={() =>
+                  setSelectedUniverse(Math.max(1, selectedUniverseId - 1))
+                }
+                title="Previous Universe"
+                className="p-1 rounded text-mist hover:bg-slate-dark disabled:opacity-40"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+              <input
+                type="number"
+                data-testid="monitor-universe-input"
+                aria-label="Monitor Universe Number"
+                min={1}
+                max={256}
+                value={selectedUniverseId}
+                onChange={(e) => {
+                  const val = Math.max(
+                    1,
+                    Math.min(256, Number(e.target.value) || 1),
+                  );
+                  setSelectedUniverse(val);
+                }}
+                className="w-11 bg-pitch border border-steel rounded px-1 py-0.5 text-center font-mono text-xs text-frost"
+              />
+              <button
+                type="button"
+                data-testid="monitor-next-universe"
+                aria-label="Next Universe"
+                disabled={selectedUniverseId >= 256}
+                onClick={() =>
+                  setSelectedUniverse(Math.min(256, selectedUniverseId + 1))
+                }
+                title="Next Universe (preview or auto-create on park)"
+                className="p-1 rounded text-mist hover:bg-slate-dark disabled:opacity-40"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           {/* Display Format Switcher */}
-          <div className="flex items-center gap-1 bg-ink p-1 rounded-md border border-steel">
-            {(["DEC", "HEX", "PCT"] as DisplayFormat[]).map((fmt) => (
-              <button
-                key={fmt}
-                type="button"
-                aria-pressed={displayFormat === fmt}
-                onClick={() => setDisplayFormat(fmt)}
-                className={`px-2.5 py-1 rounded font-mono text-xs transition-colors ${
-                  displayFormat === fmt
-                    ? "bg-ember text-frost font-semibold"
-                    : "text-fog hover:text-mist"
-                }`}
-              >
-                {fmt}
-              </button>
-            ))}
-          </div>
+          <HelpTooltip text="Switch DMX cell display between Decimal (0–255), Hexadecimal (00–FF), and Percentage (0–100%).">
+            <div className="flex items-center gap-1 bg-ink p-1 rounded-md border border-steel">
+              {(["DEC", "HEX", "PCT"] as DisplayFormat[]).map((fmt) => (
+                <button
+                  key={fmt}
+                  type="button"
+                  aria-pressed={displayFormat === fmt}
+                  onClick={() => setDisplayFormat(fmt)}
+                  className={`px-2.5 py-1 rounded font-mono text-xs transition-colors ${
+                    displayFormat === fmt
+                      ? "bg-ember text-frost font-semibold"
+                      : "text-fog hover:text-mist"
+                  }`}
+                >
+                  {fmt}
+                </button>
+              ))}
+            </div>
+          </HelpTooltip>
 
           {/* Clear Parked */}
           <button

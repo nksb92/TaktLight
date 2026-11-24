@@ -15,11 +15,12 @@ import {
   type FixtureInstance,
   getFixtureFootprint,
   getUniverseFreeStats,
-  inheritNextUniverse,
   previewPlacement,
+  resolveUniverseDisplayConfig,
   type WhiteMode,
 } from "../lib/patchLogic";
 import { type UniverseConfig, useTaktStore } from "../store/useTaktStore";
+import { HelpTooltip } from "./HelpTooltip";
 
 interface CellOwnership {
   fixture: FixtureInstance;
@@ -36,34 +37,6 @@ function formatFootprintLabel(inst: FixtureInstance): string {
   const headStr = `U${fp.head.universe}.${pad3(fp.head.startAddress)} to U${fp.head.universe}.${pad3(fp.head.endAddress)}`;
   if (!fp.tail) return headStr;
   return `${headStr} + U${fp.tail.universe}.${pad3(fp.tail.startAddress)} to U${fp.tail.universe}.${pad3(fp.tail.endAddress)}`;
-}
-
-function resolveUniverseDisplayConfig(
-  universes: UniverseConfig[],
-  targetId: number,
-): { config: UniverseConfig; isPreview: boolean } {
-  const existing = universes.find((u) => u.id === targetId);
-  if (existing) return { config: existing, isPreview: false };
-
-  const sorted = [...universes].sort((a, b) => a.id - b.id);
-  let base: UniverseConfig =
-    sorted[sorted.length - 1] ?? {
-      id: 1,
-      review_output: false,
-      protocol: {
-        protocol: "art_net",
-        mode: { mode: "broadcast" },
-        net: 0,
-        subnet: 0,
-        uni: 0,
-      },
-    };
-  let curId = base.id;
-  while (curId < targetId) {
-    base = inheritNextUniverse(base, curId + 1);
-    curId += 1;
-  }
-  return { config: { ...base, review_output: false }, isPreview: true };
 }
 
 function formatProtocolSublabel(config: UniverseConfig): string {
@@ -100,6 +73,7 @@ export function PatchView() {
   const redoShow = useTaktStore((s) => s.redoShow);
   const exportShowXml = useTaktStore((s) => s.exportShowXml);
   const importShowXml = useTaktStore((s) => s.importShowXml);
+  const openProjectFromFile = useTaktStore((s) => s.openProjectFromFile);
   const selectFixtureInstance = useTaktStore((s) => s.selectFixtureInstance);
   const setFocusedPatchUniverse = useTaktStore(
     (s) => s.setFocusedPatchUniverse,
@@ -140,6 +114,14 @@ export function PatchView() {
   const [xmlError, setXmlError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const [pendingDrag, setPendingDrag] = useState<{
+    fixtureId: string;
+    startX: number;
+    startY: number;
+    universe: number;
+    address: number;
+  } | null>(null);
+
   useEffect(() => {
     if (!patchContextMenu) return;
     const close = () => setPatchContextMenu(null);
@@ -148,8 +130,9 @@ export function PatchView() {
   }, [patchContextMenu]);
 
   useEffect(() => {
-    if (!pointerDragging || !movingFixtureId) return;
-    let latestTarget = hoverTarget;
+    if (!pendingDrag) return;
+    let dragging = false;
+    let latestTarget: { universe: number; address: number } | null = null;
 
     const resolveCellAt = (
       x: number,
@@ -168,6 +151,16 @@ export function PatchView() {
     };
 
     const onPointerMove = (e: PointerEvent) => {
+      if (!dragging) {
+        const dist = Math.hypot(
+          e.clientX - pendingDrag.startX,
+          e.clientY - pendingDrag.startY,
+        );
+        if (dist < 5) return;
+        dragging = true;
+        setPointerDragging(true);
+        setMovingFixtureId(pendingDrag.fixtureId);
+      }
       const hit = resolveCellAt(e.clientX, e.clientY);
       if (hit) {
         latestTarget = hit;
@@ -176,13 +169,16 @@ export function PatchView() {
     };
 
     const onPointerUp = (e: PointerEvent) => {
-      const hit = resolveCellAt(e.clientX, e.clientY) ?? latestTarget;
-      if (hit) {
-        void moveFixturePatch(movingFixtureId, hit.universe, hit.address);
+      if (dragging) {
+        const hit = resolveCellAt(e.clientX, e.clientY) ?? latestTarget;
+        if (hit) {
+          void moveFixturePatch(pendingDrag.fixtureId, hit.universe, hit.address);
+        }
+        setPointerDragging(false);
+        setMovingFixtureId(null);
+        setHoverTarget(null);
       }
-      setPointerDragging(false);
-      setMovingFixtureId(null);
-      setHoverTarget(null);
+      setPendingDrag(null);
     };
 
     window.addEventListener("pointermove", onPointerMove);
@@ -193,7 +189,7 @@ export function PatchView() {
       window.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("pointercancel", onPointerUp);
     };
-  }, [hoverTarget, moveFixturePatch, movingFixtureId, pointerDragging]);
+  }, [moveFixturePatch, pendingDrag]);
 
   useEffect(() => {
     if (!activeProfile) return;
@@ -335,6 +331,17 @@ export function PatchView() {
     return map;
   }, [showState.patch]);
 
+  const fixtureOrderIndexById = useMemo(() => {
+    const sorted = [...showState.patch].sort(
+      (a, b) => a.universe - b.universe || a.address - b.address || a.id.localeCompare(b.id),
+    );
+    const map = new Map<string, number>();
+    sorted.forEach((fx, idx) => {
+      map.set(fx.id, idx);
+    });
+    return map;
+  }, [showState.patch]);
+
   const selectedFixture = useMemo(
     () =>
       showState.patch.find((f) => f.id === selectedFixtureInstanceId) ??
@@ -378,6 +385,23 @@ export function PatchView() {
       } catch {
         // Browser preview still renders the exported XML block
       }
+    }
+  };
+
+  const handleImportClick = async () => {
+    setXmlError(null);
+    try {
+      const result = await openProjectFromFile();
+      if (result === "unsupported") {
+        fileInputRef.current?.click();
+      } else if (result === "opened") {
+        const xml = await exportShowXml();
+        setExportedXml(xml);
+      }
+    } catch (err) {
+      setXmlError(
+        err instanceof Error ? err.message : "Failed to import .takt.xml show",
+      );
     }
   };
 
@@ -443,28 +467,29 @@ export function PatchView() {
             </button>
           </div>
 
-          <button
-            type="button"
-            role="switch"
-            data-testid="toggle-rollover-split"
-            aria-checked={rolloverEnabled}
-            onClick={() => void setRolloverEnabled(!rolloverEnabled)}
-            title="Toggle universe spillover split mode (Shortcut: R)"
-            className="flex items-center gap-2 px-2.5 py-1 rounded-md border border-steel bg-ink font-mono text-xs font-semibold text-mist hover:border-ember transition-colors"
-          >
-            <span
-              className={`relative inline-flex w-8 h-4 rounded-full transition-colors ${
-                rolloverEnabled ? "bg-ember" : "bg-slate-dark border border-steel"
-              }`}
+          <HelpTooltip text="When ON, fixtures patched near channel 512 automatically spill remaining channels into the next universe. Shortcut: R.">
+            <button
+              type="button"
+              role="switch"
+              data-testid="toggle-rollover-split"
+              aria-checked={rolloverEnabled}
+              onClick={() => void setRolloverEnabled(!rolloverEnabled)}
+              className="flex items-center gap-2 px-2.5 py-1 rounded-md border border-steel bg-ink font-mono text-xs font-semibold text-mist hover:border-ember transition-colors"
             >
               <span
-                className={`inline-block w-3 h-3 rounded-full bg-frost transition-transform mt-0.5 ${
-                  rolloverEnabled ? "translate-x-4" : "translate-x-0.5"
+                className={`relative inline-flex w-8 h-4 rounded-full transition-colors ${
+                  rolloverEnabled ? "bg-ember" : "bg-slate-dark border border-steel"
                 }`}
-              />
-            </span>
-            <span>{rolloverEnabled ? "Rollover: ON" : "Rollover: OFF"}</span>
-          </button>
+              >
+                <span
+                  className={`inline-block w-3 h-3 rounded-full bg-frost transition-transform mt-0.5 ${
+                    rolloverEnabled ? "translate-x-4" : "translate-x-0.5"
+                  }`}
+                />
+              </span>
+              <span>{rolloverEnabled ? "Rollover: ON" : "Rollover: OFF"}</span>
+            </button>
+          </HelpTooltip>
 
           <div className="flex items-center gap-1">
             <button
@@ -491,6 +516,25 @@ export function PatchView() {
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
+          {movingFixture && (
+            <div className="flex items-center gap-2 mr-1">
+              <span className="px-2 py-0.5 rounded bg-ember/20 border border-ember text-ember font-mono text-xs">
+                Moving {movingFixture.name}: click any channel cell or press Esc to cancel
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setMovingFixtureId(null);
+                  setPointerDragging(false);
+                  setPendingDrag(null);
+                  setHoverTarget(null);
+                }}
+                className="px-2 py-1 rounded bg-ink border border-steel text-xs text-fog hover:text-mist"
+              >
+                Cancel Move
+              </button>
+            </div>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -503,7 +547,7 @@ export function PatchView() {
             type="button"
             aria-label="Import .takt.xml"
             title="Import .takt.xml"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => void handleImportClick()}
             className="p-1.5 rounded-md bg-ink border border-steel text-mist hover:border-cobalt"
           >
             <Upload className="w-3.5 h-3.5 text-cobalt" />
@@ -529,51 +573,24 @@ export function PatchView() {
         </div>
       )}
 
-      {/* Conditional Cross Protocol Warning or Move Banner */}
-      {((!rolloverEnabled &&
+      {/* Conditional Cross Protocol Warning */}
+      {!rolloverEnabled &&
         (crossProtocolWarning ||
-          showState.patch.some((inst) => getFixtureFootprint(inst).tail !== null))) ||
-        movingFixture) && (
+          showState.patch.some((inst) => getFixtureFootprint(inst).tail !== null)) && (
         <div className="bg-slate-dark border border-steel rounded-panel px-3 py-2 flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2.5 text-xs">
-            {!rolloverEnabled &&
-              (crossProtocolWarning ||
-                showState.patch.some((inst) => getFixtureFootprint(inst).tail !== null)) && (
-              <>
-                <span className="px-2 py-0.5 rounded bg-signal/20 border border-signal text-signal font-mono font-semibold flex items-center gap-1">
-                  <AlertTriangle className="w-3.5 h-3.5" />
-                  <span>CROSS PROTOCOL SPLIT</span>
-                </span>
-                <button
-                  type="button"
-                  data-testid="resolve-split-fixtures-button"
-                  onClick={() => void resolveSplitFixtures()}
-                  className="px-2.5 py-0.5 rounded bg-ember hover:bg-burnt text-frost font-mono text-xs font-semibold transition-colors"
-                >
-                  Move Split Fixtures to Valid Spot
-                </button>
-              </>
-            )}
-            {movingFixture && (
-              <span className="px-2 py-0.5 rounded bg-ember/20 border border-ember text-ember font-mono">
-                Moving {movingFixture.name}: click any channel cell or press Esc to cancel
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            {movingFixture && (
-              <button
-                type="button"
-                onClick={() => {
-                  setMovingFixtureId(null);
-                  setPointerDragging(false);
-                  setHoverTarget(null);
-                }}
-                className="px-2 py-1 rounded bg-ink border border-steel text-xs text-fog hover:text-mist"
-              >
-                Cancel Move
-              </button>
-            )}
+            <span className="px-2 py-0.5 rounded bg-signal/20 border border-signal text-signal font-mono font-semibold flex items-center gap-1">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              <span>CROSS PROTOCOL SPLIT</span>
+            </span>
+            <button
+              type="button"
+              data-testid="resolve-split-fixtures-button"
+              onClick={() => void resolveSplitFixtures()}
+              className="px-2.5 py-0.5 rounded bg-ember hover:bg-burnt text-frost font-mono text-xs font-semibold transition-colors"
+            >
+              Move Split Fixtures to Valid Spot
+            </button>
           </div>
         </div>
       )}
@@ -1002,14 +1019,23 @@ export function PatchView() {
 
                   let cellBg = "bg-ink text-fog/60 hover:bg-slate-dark";
                   if (owner) {
+                    const altTint =
+                      (fixtureOrderIndexById.get(owner.fixture.id) ?? 0) % 2 === 1;
+                    const isFixtureStart =
+                      owner.segment === "head" && ch === owner.fixture.address;
+
                     if (isSelected) {
                       cellBg = "bg-ember text-frost font-semibold";
-                    } else if (owner.isSplit) {
-                      cellBg = rolloverEnabled
-                        ? "bg-cobalt/25 border border-dashed border-cobalt/80 text-mist"
-                        : "bg-signal/30 border border-signal text-frost";
+                    } else if (owner.isSplit && !rolloverEnabled) {
+                      cellBg = "bg-signal/30 border border-signal text-frost";
+                    } else if (altTint) {
+                      cellBg = isFixtureStart
+                        ? "bg-teal-500/25 text-frost font-bold"
+                        : "bg-teal-500/20 text-mist";
                     } else {
-                      cellBg = "bg-cobalt/25 border border-cobalt/60 text-mist";
+                      cellBg = isFixtureStart
+                        ? "bg-cobalt/35 text-frost font-bold"
+                        : "bg-cobalt/25 text-mist";
                     }
                   }
 
@@ -1038,9 +1064,13 @@ export function PatchView() {
                         if (e.button !== 0 || !owner) return;
                         e.preventDefault();
                         selectFixtureInstance(owner.fixture.id);
-                        setMovingFixtureId(owner.fixture.id);
-                        setPointerDragging(true);
-                        setHoverTarget({ universe: uniId, address: ch });
+                        setPendingDrag({
+                          fixtureId: owner.fixture.id,
+                          startX: e.clientX,
+                          startY: e.clientY,
+                          universe: uniId,
+                          address: ch,
+                        });
                       }}
                       onContextMenu={(e) => {
                         if (!owner) return;
@@ -1199,9 +1229,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-gamma"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  Gamma
+                  <span>Gamma</span>
+                  <HelpTooltip
+                    testId="cal-help-gamma"
+                    text="Perceptual dimming curve exponent (1.0 = linear DMX, 2.2 = standard smooth LED fade curve at low brightness)."
+                  />
                 </label>
                 <input
                   id="cal-gamma"
@@ -1226,9 +1260,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-min-dimmer"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  Min Dimmer DMX
+                  <span>Min Dimmer DMX</span>
+                  <HelpTooltip
+                    testId="cal-help-min-dimmer"
+                    text="Lowest non-zero DMX value (0–254) where the LEDs visibly ignite. Raises the bottom floor to eliminate dead low-end fades."
+                  />
                 </label>
                 <input
                   id="cal-min-dimmer"
@@ -1252,9 +1290,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-max-dimmer"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  Max Dimmer DMX
+                  <span>Max Dimmer DMX</span>
+                  <HelpTooltip
+                    testId="cal-help-max-dimmer"
+                    text="Upper DMX ceiling (1–255) for dimmer output. Useful to match brightness across different fixture models or cap peak output."
+                  />
                 </label>
                 <input
                   id="cal-max-dimmer"
@@ -1278,9 +1320,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-white-mode"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  White Mode
+                  <span>White Mode</span>
+                  <HelpTooltip
+                    testId="cal-help-white-mode"
+                    text="Controls how RGBW fixtures use their White LED: 'replace' moves shared RGB into W, 'add' boosts W alongside RGB, 'off' uses RGB only."
+                  />
                 </label>
                 <select
                   id="cal-white-mode"
@@ -1300,9 +1346,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-white-gain"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  White Gain
+                  <span>White Gain</span>
+                  <HelpTooltip
+                    testId="cal-help-white-gain"
+                    text="Multiplier (0.0–2.0) applied to the derived White channel to balance white LED intensity against RGB."
+                  />
                 </label>
                 <input
                   id="cal-white-gain"

@@ -27,6 +27,8 @@ import {
   amplitudeOffsetToRangePct,
   buildCurve1DSvgPreview,
   buildStepChasePreviewBlocks,
+  computeSceneSequenceDurationSec,
+  computeTargetGizmoBounds,
   DEFAULT_COLOR_PALETTES,
   type DurationUnit,
   type FxBlockDef,
@@ -39,12 +41,29 @@ import {
   sampleOklabStopsLinear,
   sampleValueStops,
   type SceneDef,
+  type SceneSequenceStepDef,
+  type SequencePlaybackMode,
   type Shader2DKind,
   spatialFreqToPatternScale,
   type Waveform1D,
 } from "../lib/mixerLogic";
-import type { OrderRuleStr } from "../lib/patchLogic";
-import { useTaktStore } from "../store/useTaktStore";
+import { expandTargetRange, type OrderRuleStr } from "../lib/patchLogic";
+import { DEFAULT_STUDIO_LAYOUT, useTaktStore } from "../store/useTaktStore";
+import { HelpTooltip } from "./HelpTooltip";
+import { SplitHandle } from "./SplitHandle";
+
+const BANK_COLOR_PRESETS = [
+  "#FBBF24", // Amber
+  "#FF5500", // Ember
+  "#EF4444", // Red
+  "#EC4899", // Pink
+  "#A855F7", // Purple
+  "#3B82F6", // Blue
+  "#06B6D4", // Cyan
+  "#22C55E", // Green
+  "#84CC16", // Lime
+  "#94A3B8", // Slate
+] as const;
 import { ColorPaletteBuilderModal } from "./ColorPaletteBuilderModal";
 import { NumericSlider } from "./NumericSlider";
 import { TimelineRightInspector } from "./TimelineRightInspector";
@@ -57,7 +76,8 @@ type DaslightFxSubmenu =
   | "chaser_fx"
   | "value_fx"
   | "curve_fx"
-  | "mappings";
+  | "mappings"
+  | "scene_sequence";
 type InspectorRailTab = "fx" | "properties" | "settings";
 
 function slugId(prefix: string, name: string, existingIds: string[]): string {
@@ -87,9 +107,16 @@ export function classifySceneMode(
   const primary =
     blk.elements.length === 1
       ? blk.elements[0]
-      : (blk.elements.find((e) => e.trait !== "dimmer") ?? blk.elements[0]);
+      : (blk.elements.find(
+          (e) => e.kind === "scene_sequence" || e.trait !== "dimmer",
+        ) ?? blk.elements[0]);
+  if (primary.kind === "scene_sequence") return "effect";
   if (primary.trait === "color") {
-    return primary.kind === "static_trait" ? "color" : "color_anim";
+    if (primary.kind === "static_trait") return "color";
+    if (primary.kind === "spatial_shader_2d" && primary.rate_cycles === 0) {
+      return "color";
+    }
+    return "color_anim";
   }
   return "effect";
 }
@@ -105,6 +132,9 @@ function isStaticDockElement(el: FxElementDef): boolean {
 
 function classifyElementSubmenu(el: FxElementDef | undefined): DaslightFxSubmenu {
   if (!el) return "curve_fx";
+  if (el.kind === "scene_sequence") {
+    return "scene_sequence";
+  }
   if (el.kind === "spatial_shader_2d") {
     return el.trait === "color" ? "color_mappings" : "mappings";
   }
@@ -143,6 +173,8 @@ function describeElementShort(el: FxElementDef | undefined): string {
       return "CURVE FX";
     case "mappings":
       return "MAPPINGS";
+    case "scene_sequence":
+      return "SEQUENCE";
   }
 }
 
@@ -160,6 +192,8 @@ function submenuLabel(submenu: DaslightFxSubmenu): string {
       return "CURVE FX";
     case "mappings":
       return "MAPPINGS";
+    case "scene_sequence":
+      return "SCENE SEQUENCE";
   }
 }
 
@@ -172,6 +206,7 @@ function buildElementFromForm(params: {
   offset: number;
   timingMode: "cycles" | "beats" | "hz";
   rateCycles: number;
+  phaseOffset?: number;
   rateBeats: number;
   speedHz: number;
   phaseDeg: number;
@@ -187,6 +222,8 @@ function buildElementFromForm(params: {
   directionDeg: number;
   centerX: number;
   centerY: number;
+  boxHalfX?: number | null;
+  boxHalfY?: number | null;
   paletteRef: string;
   inlineColors: string[];
   valueStops: number[];
@@ -199,11 +236,14 @@ function buildElementFromForm(params: {
   staticStart: number;
   staticEnd: number;
   order: OrderRuleStr;
+  sequencePlaybackMode?: SequencePlaybackMode;
+  sequenceSteps?: SceneSequenceStepDef[];
 }): FxElementDef {
   const paletteRef = params.paletteRef.trim() ? params.paletteRef.trim() : null;
   const useHz = params.timingMode === "hz";
   const useBeats = params.timingMode === "beats";
   const rateCycles = Math.max(0.1, params.rateCycles || 1);
+  const spatialRateCycles = Math.max(0, params.rateCycles ?? 1);
   switch (params.kind) {
     case "curve_1d":
       return {
@@ -273,7 +313,8 @@ function buildElementFromForm(params: {
         palette_ref: paletteRef,
         rate_beats: useBeats ? params.rateBeats : null,
         speed_hz: useHz ? params.speedHz : null,
-        rate_cycles: !useHz && !useBeats ? rateCycles : null,
+        rate_cycles: !useHz && !useBeats ? spatialRateCycles : null,
+        phase_offset: params.phaseOffset ?? 0,
         spatial_freq: params.spatialFreq,
         color_width: params.colorWidth,
         gradient: params.gradient,
@@ -284,6 +325,14 @@ function buildElementFromForm(params: {
         direction_deg: params.directionDeg,
         center_x: params.centerX,
         center_y: params.centerY,
+        ...(params.boxHalfX != null ? { box_half_x: params.boxHalfX } : {}),
+        ...(params.boxHalfY != null ? { box_half_y: params.boxHalfY } : {}),
+      };
+    case "scene_sequence":
+      return {
+        kind: "scene_sequence",
+        playback_mode: params.sequencePlaybackMode ?? "loop",
+        steps: params.sequenceSteps ?? [],
       };
   }
 }
@@ -311,8 +360,10 @@ export function SceneAndFxManager({
   const multiSelectedSceneIds = useTaktStore((s) => s.multiSelectedSceneIds);
   const sceneBanks = useTaktStore((s) => s.sceneBanks);
   const stackableBanks = useTaktStore((s) => s.stackableBanks);
+  const bankColors = useTaktStore((s) => s.bankColors);
   const flashSceneIds = useTaktStore((s) => s.flashSceneIds);
   const mappingOverlayMode = useTaktStore((s) => s.mappingOverlayMode);
+  const draggingSceneId = useTaktStore((s) => s.draggingSceneId);
   const keyBindings = useTaktStore((s) => s.keyBindings);
   const midiBindings = useTaktStore((s) => s.midiBindings);
 
@@ -335,9 +386,11 @@ export function SceneAndFxManager({
     (s) => s.convertSceneToTimeline,
   );
   const createSceneBank = useTaktStore((s) => s.createSceneBank);
+  const reorderSceneBanks = useTaktStore((s) => s.reorderSceneBanks);
   const renameSceneBank = useTaktStore((s) => s.renameSceneBank);
   const deleteSceneBank = useTaktStore((s) => s.deleteSceneBank);
   const toggleBankStackable = useTaktStore((s) => s.toggleBankStackable);
+  const setBankColor = useTaktStore((s) => s.setBankColor);
   const duplicateScene = useTaktStore((s) => s.duplicateScene);
   const batchUpdateSelectedScenes = useTaktStore(
     (s) => s.batchUpdateSelectedScenes,
@@ -352,12 +405,19 @@ export function SceneAndFxManager({
   const setActiveShaderGizmoBlockId = useTaktStore(
     (s) => s.setActiveShaderGizmoBlockId,
   );
+  const studioLayout = useTaktStore((s) => s.studioLayout);
+  const setStudioLayout = useTaktStore((s) => s.setStudioLayout);
+  const gizmoAutoFit = useTaktStore((s) => s.gizmoAutoFit);
+  const setGizmoAutoFit = useTaktStore((s) => s.setGizmoAutoFit);
 
   // Bank UI state
   const [selectedBankFilter, setSelectedBankFilter] = useState<string>("all");
   const [paletteBuilderOpen, setPaletteBuilderOpen] = useState<boolean>(false);
   const [renamingBank, setRenamingBank] = useState<string | null>(null);
   const [renameBankValue, setRenameBankValue] = useState("");
+  const [draggingBank, setDraggingBank] = useState<string | null>(null);
+  const [dragOverBank, setDragOverBank] = useState<string | null>(null);
+  const [dragOverSceneBank, setDragOverSceneBank] = useState<string | null>(null);
   const [renamingSceneId, setRenamingSceneId] = useState<string | null>(null);
   const [renameSceneValue, setRenameSceneValue] = useState("");
   const [bankContextMenu, setBankContextMenu] = useState<{
@@ -394,6 +454,8 @@ export function SceneAndFxManager({
     "cycles",
   );
   const [fxRateCycles, setFxRateCycles] = useState(1.0);
+  const [fxPhaseOffset, setFxPhaseOffset] = useState(0.0);
+  const lastNonZeroRateRef = useRef(1.0);
   const [fxRateBeats, setFxRateBeats] = useState(2.0);
   const [fxSpeedHz, setFxSpeedHz] = useState(1.0);
   const [fxPhaseDeg, setFxPhaseDeg] = useState(0);
@@ -425,6 +487,11 @@ export function SceneAndFxManager({
   const [fxStaticStart, setFxStaticStart] = useState(0.0);
   const [fxStaticEnd, setFxStaticEnd] = useState(1.0);
   const [fxOrder, setFxOrder] = useState<OrderRuleStr>("linear");
+  const [fxSeqPlaybackMode, setFxSeqPlaybackMode] =
+    useState<SequencePlaybackMode>("loop");
+  const [fxSeqSteps, setFxSeqSteps] = useState<SceneSequenceStepDef[]>([]);
+  const [seqDropNotice, setSeqDropNotice] = useState<string | null>(null);
+  const [seqAddSceneId, setSeqAddSceneId] = useState<string>("");
 
   // Legacy Slice 5 programmatic form state (zero fades by default)
   const [sceneName, setSceneName] = useState("Main Wash");
@@ -451,6 +518,31 @@ export function SceneAndFxManager({
     window.addEventListener("click", close);
     return () => window.removeEventListener("click", close);
   }, [bankContextMenu, sceneContextMenu]);
+
+  useEffect(() => {
+    if (!draggingSceneId) {
+      setDragOverSceneBank(null);
+    }
+  }, [draggingSceneId]);
+
+  useEffect(() => {
+    const onSceneBankDrop = (e: Event) => {
+      const detail = (
+        e as CustomEvent<{ sceneId: string; targetBank: string }>
+      ).detail;
+      if (!detail?.sceneId || !detail?.targetBank) return;
+      setDragOverSceneBank(null);
+      const target = showState.scenes.find((s) => s.id === detail.sceneId);
+      if (!target) return;
+      const nextBank = detail.targetBank.trim();
+      if (!nextBank || target.bank?.trim() === nextBank) return;
+      void upsertScene({ ...target, bank: nextBank });
+    };
+    window.addEventListener("takt:scene-bank-drop", onSceneBankDrop);
+    return () => {
+      window.removeEventListener("takt:scene-bank-drop", onSceneBankDrop);
+    };
+  }, [showState.scenes, upsertScene]);
 
   const selectedScene = useMemo(
     () =>
@@ -595,6 +687,41 @@ export function SceneAndFxManager({
     return opts;
   }, [showState.groups, showState.patch]);
 
+  const targetBeamCount = useMemo(() => {
+    const rawTarget = (
+      selectedScene?.target_group ??
+      selectedScenePrimaryBlock?.target_group ??
+      "all"
+    ).trim();
+    if (!rawTarget || rawTarget === "all" || rawTarget === "*") {
+      return compiledCells.length;
+    }
+    const grp = showState.groups.find((g) => g.id === rawTarget);
+    const refs = grp ? grp.targets : [rawTarget];
+    const keys = new Set<string>();
+    for (const ref of refs) {
+      const trimmed = ref.trim();
+      const colonIdx = trimmed.indexOf(":");
+      const fxId = colonIdx === -1 ? trimmed : trimmed.slice(0, colonIdx).trim();
+      const fx = showState.patch.find((f) => f.id === fxId);
+      if (!fx) continue;
+      const detail = fixtureDetailsCache[fx.profile];
+      const mode = detail?.expanded_modes.find((m) => m.name === fx.mode);
+      const cellCount = mode?.cells.length ?? 1;
+      for (const cIdx of expandTargetRange(trimmed, cellCount)) {
+        keys.add(`${fxId}:${cIdx}`);
+      }
+    }
+    return keys.size;
+  }, [
+    compiledCells.length,
+    fixtureDetailsCache,
+    selectedScene,
+    selectedScenePrimaryBlock,
+    showState.groups,
+    showState.patch,
+  ]);
+
   const effectiveBlockRef = useMemo(() => {
     if (
       sceneBlockRef &&
@@ -621,6 +748,12 @@ export function SceneAndFxManager({
     const el = procEls[clampedIdx];
     if (!el) return;
     setFxKind(el.kind);
+    if (el.kind === "scene_sequence") {
+      setFxSeqPlaybackMode(el.playback_mode ?? "loop");
+      setFxSeqSteps(el.steps ?? []);
+      setSeqDropNotice(null);
+      return;
+    }
     setFxTrait(el.trait);
     setFxOp(el.op);
     if (el.palette_ref) {
@@ -696,6 +829,10 @@ export function SceneAndFxManager({
       setFxDirectionDeg(el.direction_deg);
       setFxCenterX(el.center_x);
       setFxCenterY(el.center_y);
+      setFxPhaseOffset(el.phase_offset ?? 0);
+      if ((el.rate_cycles ?? 1) > 0) {
+        lastNonZeroRateRef.current = el.rate_cycles ?? 1;
+      }
       if (el.inline_colors && el.inline_colors.length > 0) {
         setFxInlineColors(el.inline_colors);
       }
@@ -761,6 +898,7 @@ export function SceneAndFxManager({
     offset: number;
     timingMode: "cycles" | "beats" | "hz";
     rateCycles: number;
+    phaseOffset: number;
     rateBeats: number;
     speedHz: number;
     phaseDeg: number;
@@ -776,6 +914,8 @@ export function SceneAndFxManager({
     directionDeg: number;
     centerX: number;
     centerY: number;
+    boxHalfX: number | null;
+    boxHalfY: number | null;
     paletteRef: string;
     inlineColors: string[];
     valueStops: number[];
@@ -790,6 +930,8 @@ export function SceneAndFxManager({
     targetGroup: string;
     durationBeats: number;
     loopBlock: boolean;
+    sequencePlaybackMode: SequencePlaybackMode;
+    sequenceSteps: SceneSequenceStepDef[];
   }>;
 
   const getSceneBlockDurationFields = (sc: SceneDef, fallbackBeats: number) => {
@@ -841,6 +983,7 @@ export function SceneAndFxManager({
       offset: overrides.offset ?? fxOffset,
       timingMode: overrides.timingMode ?? fxTimingMode,
       rateCycles: overrides.rateCycles ?? fxRateCycles,
+      phaseOffset: overrides.phaseOffset ?? fxPhaseOffset,
       rateBeats: overrides.rateBeats ?? fxRateBeats,
       speedHz: overrides.speedHz ?? fxSpeedHz,
       phaseDeg: overrides.phaseDeg ?? fxPhaseDeg,
@@ -858,6 +1001,14 @@ export function SceneAndFxManager({
         overrides.directionDeg ?? liveSpatial?.direction_deg ?? fxDirectionDeg,
       centerX: overrides.centerX ?? liveSpatial?.center_x ?? fxCenterX,
       centerY: overrides.centerY ?? liveSpatial?.center_y ?? fxCenterY,
+      boxHalfX:
+        overrides.boxHalfX !== undefined
+          ? overrides.boxHalfX
+          : (liveSpatial?.box_half_x ?? null),
+      boxHalfY:
+        overrides.boxHalfY !== undefined
+          ? overrides.boxHalfY
+          : (liveSpatial?.box_half_y ?? null),
       paletteRef:
         overrides.paletteRef !== undefined
           ? overrides.paletteRef
@@ -884,6 +1035,9 @@ export function SceneAndFxManager({
       durationBeats: overrides.durationBeats ?? fxDurationBeats,
       loopBlock:
         overrides.loopBlock !== undefined ? overrides.loopBlock : fxLoop,
+      sequencePlaybackMode:
+        overrides.sequencePlaybackMode ?? fxSeqPlaybackMode,
+      sequenceSteps: overrides.sequenceSteps ?? fxSeqSteps,
     };
 
     const isColorTarget = snap.trait === "color";
@@ -1030,6 +1184,18 @@ export function SceneAndFxManager({
       ...(firstPal.colors ?? [firstPal.hex_start, firstPal.hex_end]),
     ];
 
+    const computeInitialGizmoBounds = (targetOverride?: string) => {
+      const st = useTaktStore.getState();
+      return computeTargetGizmoBounds({
+        compiledCells: st.compiledCells,
+        patch: st.showState.patch,
+        groups: st.showState.groups,
+        targetGroup:
+          targetOverride ?? selectedScene?.target_group ?? fxTargetGroup,
+        fallbackFixtureIds: st.selectedFixtureIds,
+      });
+    };
+
     let elem: FxElementDef;
     switch (tile) {
       case "color_fx":
@@ -1113,7 +1279,8 @@ export function SceneAndFxManager({
           order: "linear",
         };
         break;
-      case "mappings":
+      case "mappings": {
+        const bounds = computeInitialGizmoBounds();
         elem = {
           kind: "spatial_shader_2d",
           trait: "dimmer",
@@ -1123,17 +1290,21 @@ export function SceneAndFxManager({
           rate_beats: null,
           speed_hz: null,
           rate_cycles: 1,
-          spatial_freq: 1.0,
+          spatial_freq: bounds.spatialFreq,
           color_width: 1,
           gradient: 1,
           transform: null,
           value_stops: [1, 0],
           direction_deg: 0,
-          center_x: 0.5,
-          center_y: 0.5,
+          center_x: bounds.centerX,
+          center_y: bounds.centerY,
+          box_half_x: bounds.boxHalfX,
+          box_half_y: bounds.boxHalfY,
         };
         break;
-      case "color_mappings":
+      }
+      case "color_mappings": {
+        const bounds = computeInitialGizmoBounds();
         elem = {
           kind: "spatial_shader_2d",
           trait: "color",
@@ -1144,16 +1315,27 @@ export function SceneAndFxManager({
           rate_beats: null,
           speed_hz: null,
           rate_cycles: 1,
-          spatial_freq: 1.0,
+          spatial_freq: bounds.spatialFreq,
           color_width: 1,
           gradient: 1,
           grayscale: false,
           transform: null,
           direction_deg: 0,
-          center_x: 0.5,
-          center_y: 0.5,
+          center_x: bounds.centerX,
+          center_y: bounds.centerY,
+          box_half_x: bounds.boxHalfX,
+          box_half_y: bounds.boxHalfY,
         };
         break;
+      }
+      case "scene_sequence": {
+        elem = {
+          kind: "scene_sequence",
+          playback_mode: "loop",
+          steps: [],
+        };
+        break;
+      }
     }
 
     if (
@@ -1224,6 +1406,115 @@ export function SceneAndFxManager({
     }
   };
 
+  const commitSequenceSteps = async (
+    nextSteps: SceneSequenceStepDef[],
+    nextMode: SequencePlaybackMode = fxSeqPlaybackMode,
+    explicitBlockId?: string,
+  ) => {
+    const targetBlock = explicitBlockId
+      ? showState.fx_library.find((b) => b.id === explicitBlockId) ??
+        selectedScenePrimaryBlock
+      : selectedScenePrimaryBlock;
+    setFxSeqSteps(nextSteps);
+    setFxSeqPlaybackMode(nextMode);
+    if (!targetBlock) {
+      await syncSelectedSceneBlock({
+        kind: "scene_sequence",
+        sequencePlaybackMode: nextMode,
+        sequenceSteps: nextSteps,
+      });
+      return;
+    }
+    const existingStatic = targetBlock.elements.filter(isStaticDockElement);
+    const existingProc = targetBlock.elements.filter(
+      (el) => !isStaticDockElement(el),
+    );
+    const seqElem: FxElementDef = {
+      kind: "scene_sequence",
+      playback_mode: nextMode,
+      steps: nextSteps,
+    };
+    const seqIdx = existingProc.findIndex((el) => el.kind === "scene_sequence");
+    const nextProc =
+      seqIdx >= 0
+        ? existingProc.map((el, i) => (i === seqIdx ? seqElem : el))
+        : [...existingProc, seqElem];
+    await upsertFxBlock({
+      ...targetBlock,
+      elements: [...existingStatic, ...nextProc],
+    });
+  };
+
+  const addSceneStepToSequence = async (
+    sceneId: string,
+    targetBlockId?: string,
+    insertIndex?: number,
+  ) => {
+    const droppedScene = showState.scenes.find((s) => s.id === sceneId);
+    if (!droppedScene) return;
+    if (droppedScene.timeline_ref) {
+      setSeqDropNotice(
+        "Cannot add a Timeline Super-Scene into a Scene Sequence.",
+      );
+      return;
+    }
+    const effectiveBlockId =
+      targetBlockId || selectedScenePrimaryBlock?.id || "";
+    if (
+      (selectedScene && droppedScene.id === selectedScene.id) ||
+      (effectiveBlockId && droppedScene.block_refs.includes(effectiveBlockId))
+    ) {
+      setSeqDropNotice("Cannot drop a Scene Sequence onto itself.");
+      return;
+    }
+    setSeqDropNotice(null);
+    const blk = effectiveBlockId
+      ? showState.fx_library.find((b) => b.id === effectiveBlockId) ??
+        selectedScenePrimaryBlock
+      : selectedScenePrimaryBlock;
+    const seqEl = blk?.elements.find(
+      (el): el is Extract<FxElementDef, { kind: "scene_sequence" }> =>
+        el.kind === "scene_sequence",
+    );
+    const baseSteps = seqEl ? [...seqEl.steps] : [...fxSeqSteps];
+    const baseMode = seqEl?.playback_mode ?? fxSeqPlaybackMode;
+    const newStep: SceneSequenceStepDef = {
+      scene_id: droppedScene.id,
+      duration_value: Math.max(0.05, droppedScene.duration_value ?? 4),
+      duration_unit: droppedScene.duration_unit ?? "beats",
+      fade_sec: 0,
+    };
+    if (
+      insertIndex !== undefined &&
+      insertIndex >= 0 &&
+      insertIndex <= baseSteps.length
+    ) {
+      baseSteps.splice(insertIndex, 0, newStep);
+    } else {
+      baseSteps.push(newStep);
+    }
+    await commitSequenceSteps(baseSteps, baseMode, effectiveBlockId || undefined);
+  };
+
+  useEffect(() => {
+    const onSequenceDrop = (ev: Event) => {
+      const ce = ev as CustomEvent<{
+        sceneId: string;
+        targetBlockId?: string;
+        insertIndex?: number;
+      }>;
+      if (!ce.detail?.sceneId) return;
+      void addSceneStepToSequence(
+        ce.detail.sceneId,
+        ce.detail.targetBlockId,
+        ce.detail.insertIndex,
+      );
+    };
+    window.addEventListener("takt:scene-sequence-drop", onSequenceDrop);
+    return () =>
+      window.removeEventListener("takt:scene-sequence-drop", onSequenceDrop);
+  });
+
   // Legacy Slice 5 programmatic save handlers
   const handleSaveFxBlock = async () => {
     const id = slugId(
@@ -1241,6 +1532,7 @@ export function SceneAndFxManager({
       offset: fxOffset,
       timingMode: fxTimingMode,
       rateCycles: fxRateCycles,
+      phaseOffset: fxPhaseOffset,
       rateBeats: fxRateBeats,
       speedHz: fxSpeedHz,
       phaseDeg: fxPhaseDeg,
@@ -1329,6 +1621,43 @@ export function SceneAndFxManager({
             el.inline_colors[el.inline_colors.length - 1],
           ];
         }
+        if (el.kind === "scene_sequence") {
+          for (const st of el.steps) {
+            const stScene = showState.scenes.find((s) => s.id === st.scene_id);
+            if (!stScene || stScene.id === sc.id) continue;
+            const stBlk = stScene.block_refs[0]
+              ? showState.fx_library.find((b) => b.id === stScene.block_refs[0])
+              : null;
+            if (!stBlk) continue;
+            for (const subEl of stBlk.elements) {
+              if (subEl.kind === "scene_sequence") continue;
+              if (
+                "inline_colors" in subEl &&
+                subEl.inline_colors &&
+                subEl.inline_colors.length >= 2
+              ) {
+                return [
+                  subEl.inline_colors[0],
+                  subEl.inline_colors[subEl.inline_colors.length - 1],
+                ];
+              }
+              if (subEl.palette_ref) {
+                const cp = showState.color_palettes.find(
+                  (p) => p.id === subEl.palette_ref,
+                );
+                if (cp) return [cp.hex_start, cp.hex_end];
+              }
+              if (
+                subEl.kind === "static_trait" &&
+                subEl.trait === "color" &&
+                subEl.hex_start
+              ) {
+                return [subEl.hex_start, subEl.hex_end ?? subEl.hex_start];
+              }
+            }
+          }
+          continue;
+        }
         if (el.palette_ref) {
           const cp = showState.color_palettes.find(
             (p) => p.id === el.palette_ref,
@@ -1372,7 +1701,7 @@ export function SceneAndFxManager({
 
   const patternScaleValue = spatialFreqToPatternScale(fxSpatialFreq);
 
-  const renderSceneTile = (scene: SceneDef) => {
+  const renderSceneTile = (scene: SceneDef, bankColor?: string) => {
     const inst = activeById.get(scene.id);
     const isActive = Boolean(inst && inst.release_t_sec === null);
     const isSelected = selectedScene?.id === scene.id;
@@ -1388,7 +1717,9 @@ export function SceneAndFxManager({
     const primaryEl =
       procInBlk[0] ??
       (blk && blk.elements.length > 0
-        ? (blk.elements.find((e) => e.trait === "color") ?? blk.elements[0])
+        ? (blk.elements.find(
+            (e) => e.kind !== "scene_sequence" && e.trait === "color",
+          ) ?? blk.elements[0])
         : undefined);
     const typeLabel = describeElementShort(primaryEl);
     const keyBind = keyBindings[scene.id];
@@ -1400,6 +1731,17 @@ export function SceneAndFxManager({
         ? "border-pine bg-pine/15"
         : "border-steel bg-ink hover:border-fog";
 
+    const tileThemeStyle = bankColor
+      ? {
+          borderColor: isSelected || isActive ? bankColor : `${bankColor}66`,
+          backgroundColor: isActive
+            ? `${bankColor}30`
+            : isSelected
+              ? `${bankColor}24`
+              : `${bankColor}12`,
+        }
+      : undefined;
+
     const mappingActiveRing =
       mappingOverlayMode === "key"
         ? "ring-2 ring-signal/80"
@@ -1409,18 +1751,21 @@ export function SceneAndFxManager({
 
     const accentColor = colors
       ? colors[0]
-      : isActive
-        ? "#FF5500"
-        : isSelected
-          ? "#EAB308"
-          : "#4A5A6A";
+      : bankColor
+        ? bankColor
+        : isActive
+          ? "#FF5500"
+          : isSelected
+            ? "#EAB308"
+            : "#4A5A6A";
 
     return (
       <div
         key={scene.id}
         data-testid={`scene-tile-${scene.id}`}
+        style={tileThemeStyle}
         onPointerDown={(e) => {
-          if (e.button !== 0 || scene.timeline_ref) return;
+          if (e.button !== 0) return;
           const target = e.target as HTMLElement | null;
           if (target?.closest("button, input")) return;
           e.preventDefault();
@@ -1439,7 +1784,7 @@ export function SceneAndFxManager({
           isMultiSelected && multiSelectedSceneIds.length > 1
             ? "ring-2 ring-frost"
             : ""
-        }`}
+        } ${draggingSceneId === scene.id ? "opacity-50" : ""}`}
       >
         {/* Minimalist Play / Stop / Flash Trigger Pill */}
         <div className="flex items-center pl-1.5 shrink-0">
@@ -1477,6 +1822,11 @@ export function SceneAndFxManager({
                 }
               }}
               title={isActive ? "Stop Scene" : "Play Scene"}
+              style={
+                !isActive && bankColor
+                  ? { borderColor: `${bankColor}77` }
+                  : undefined
+              }
               className={`w-6 h-6 rounded flex items-center justify-center transition-colors ${
                 isActive
                   ? "bg-signal hover:bg-signal/85 text-frost"
@@ -1705,7 +2055,7 @@ export function SceneAndFxManager({
       )}
 
       {/* Daslight 5 Upper Split: Left = Bank Tabs + Columns (~80%), Right = FX Inspector + Tool Rail (~20%) */}
-      <div className="flex-1 min-h-0 flex flex-col xl:flex-row gap-1.5 items-stretch">
+      <div className="flex-1 min-h-0 flex flex-col xl:flex-row gap-1.5 xl:gap-0 items-stretch">
         {/* LEFT: BANK TABS & BANK COLUMNS */}
         <section
           data-testid="daslight-scene-banks"
@@ -1726,24 +2076,108 @@ export function SceneAndFxManager({
               >
                 All ({allBanks.length})
               </button>
-              {allBanks.map((b) => (
+              {allBanks.map((b) => {
+                const tabColor = bankColors[b];
+                return (
                 <button
                   key={b}
                   type="button"
+                  data-testid={`bank-tab-${b}`}
+                  data-bank-drop-target={b}
+                  draggable
+                  onPointerEnter={() => {
+                    if (draggingSceneId) setDragOverSceneBank(b);
+                  }}
+                  onPointerLeave={(e) => {
+                    if (
+                      dragOverSceneBank === b &&
+                      !e.currentTarget.contains(e.relatedTarget as Node | null)
+                    ) {
+                      setDragOverSceneBank(null);
+                    }
+                  }}
+                  onDragStart={(e) => {
+                    setDraggingBank(b);
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData("application/x-taktlight-bank", b);
+                  }}
+                  onDragOver={(e) => {
+                    if (
+                      draggingBank ||
+                      e.dataTransfer.types.includes(
+                        "application/x-taktlight-bank",
+                      )
+                    ) {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = "move";
+                      if (dragOverBank !== b) setDragOverBank(b);
+                    }
+                  }}
+                  onDragLeave={() => {
+                    if (dragOverBank === b) setDragOverBank(null);
+                  }}
+                  onDrop={(e) => {
+                    const srcBank =
+                      draggingBank ||
+                      e.dataTransfer.getData("application/x-taktlight-bank");
+                    if (srcBank) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      reorderSceneBanks(srcBank, b);
+                    }
+                    setDraggingBank(null);
+                    setDragOverBank(null);
+                  }}
+                  onDragEnd={() => {
+                    setDraggingBank(null);
+                    setDragOverBank(null);
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setBankContextMenu({
+                      bank: b,
+                      x: e.clientX,
+                      y: e.clientY,
+                    });
+                  }}
                   aria-pressed={selectedBankFilter === b}
                   onClick={() => setSelectedBankFilter(b)}
-                  className={`px-2.5 py-0.5 rounded border transition-colors flex items-center gap-1 ${
+                  title={`Filter by ${b} (drag to reorder · right-click for options)`}
+                  style={
+                    tabColor
+                      ? {
+                          borderColor:
+                            selectedBankFilter === b ? tabColor : `${tabColor}77`,
+                          backgroundColor:
+                            selectedBankFilter === b ? `${tabColor}24` : undefined,
+                        }
+                      : undefined
+                  }
+                  className={`px-2.5 py-0.5 rounded border transition-colors flex items-center gap-1.5 cursor-grab active:cursor-grabbing ${
                     selectedBankFilter === b
                       ? "bg-ink text-frost border-amber-400 font-semibold"
                       : "bg-slate-dark text-mist border-steel hover:border-fog"
-                  }`}
+                  } ${
+                    (dragOverBank === b && draggingBank !== b) ||
+                    (draggingSceneId && dragOverSceneBank === b)
+                      ? "ring-2 ring-ember border-ember"
+                      : ""
+                  } ${draggingBank === b ? "opacity-50" : ""}`}
                 >
+                  {tabColor && (
+                    <span
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ backgroundColor: tabColor }}
+                    />
+                  )}
                   <span>{b}</span>
                   {stackableBanks[b] && (
                     <Layers className="w-2.5 h-2.5 text-plum" />
                   )}
                 </button>
-              ))}
+                );
+              })}
 
               {/* Compact + Button to Instantly Create New Bank */}
               <button
@@ -1830,14 +2264,90 @@ export function SceneAndFxManager({
           <div className="flex-1 min-h-0 overflow-auto p-2 flex flex-wrap items-start gap-2 bg-pitch">
             {bankedColumns.map(([bName, scenesInBank]) => {
               const isStackable = Boolean(stackableBanks[bName]);
+              const bankColor = bankColors[bName];
               return (
                 <div
                   key={bName}
                   data-testid={`bank-column-${bName}`}
-                  className="w-[165px] min-h-[150px] bg-slate-dark border border-steel border-t-2 border-t-amber-400/90 rounded flex flex-col overflow-hidden shrink-0"
+                  data-bank-drop-target={bName}
+                  onPointerEnter={() => {
+                    if (draggingSceneId) setDragOverSceneBank(bName);
+                  }}
+                  style={
+                    bankColor
+                      ? {
+                          borderColor: `${bankColor}55`,
+                          borderTopColor: bankColor,
+                        }
+                      : undefined
+                  }
+                  onDragOver={(e) => {
+                    if (
+                      draggingBank ||
+                      e.dataTransfer.types.includes(
+                        "application/x-taktlight-bank",
+                      )
+                    ) {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = "move";
+                      if (dragOverBank !== bName) setDragOverBank(bName);
+                    }
+                  }}
+                  onDragLeave={(e) => {
+                    if (
+                      !e.currentTarget.contains(e.relatedTarget as Node | null) &&
+                      dragOverBank === bName
+                    ) {
+                      setDragOverBank(null);
+                    }
+                  }}
+                  onPointerLeave={(e) => {
+                    if (
+                      dragOverSceneBank === bName &&
+                      !e.currentTarget.contains(e.relatedTarget as Node | null)
+                    ) {
+                      setDragOverSceneBank(null);
+                    }
+                  }}
+                  onDrop={(e) => {
+                    const srcBank =
+                      draggingBank ||
+                      e.dataTransfer.getData("application/x-taktlight-bank");
+                    if (srcBank) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      reorderSceneBanks(srcBank, bName);
+                    }
+                    setDraggingBank(null);
+                    setDragOverBank(null);
+                  }}
+                  className={`w-[165px] min-h-[150px] bg-slate-dark border border-steel border-t-2 border-t-amber-400/90 rounded flex flex-col overflow-hidden shrink-0 transition-opacity ${
+                    (dragOverBank === bName && draggingBank !== bName) ||
+                    (draggingSceneId && dragOverSceneBank === bName)
+                      ? "ring-2 ring-ember border-ember"
+                      : ""
+                  } ${draggingBank === bName ? "opacity-50" : ""}`}
                 >
-                  {/* Bank Header (Right-click for Stackable / Rename / Delete) */}
+                  {/* Bank Header (Drag to reorder · Right-click for Stackable / Rename / Delete) */}
                   <div
+                    data-testid={`bank-header-${bName}`}
+                    draggable={renamingBank !== bName}
+                    onDragStart={(e) => {
+                      if (renamingBank === bName) {
+                        e.preventDefault();
+                        return;
+                      }
+                      setDraggingBank(bName);
+                      e.dataTransfer.effectAllowed = "move";
+                      e.dataTransfer.setData(
+                        "application/x-taktlight-bank",
+                        bName,
+                      );
+                    }}
+                    onDragEnd={() => {
+                      setDraggingBank(null);
+                      setDragOverBank(null);
+                    }}
                     onContextMenu={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
@@ -1847,8 +2357,16 @@ export function SceneAndFxManager({
                         y: e.clientY,
                       });
                     }}
-                    title="Right-click for Bank Options (Stackable / Overlay Mode)"
-                    className="bg-slate border-b border-steel/70 px-2 py-1 flex flex-col gap-1 cursor-context-menu"
+                    title="Drag to reorder bank · Right-click for Bank Options"
+                    style={
+                      bankColor
+                        ? {
+                            backgroundColor: `${bankColor}1A`,
+                            borderBottomColor: `${bankColor}44`,
+                          }
+                        : undefined
+                    }
+                    className="bg-slate border-b border-steel/70 px-2 py-1 flex flex-col gap-1 cursor-grab active:cursor-grabbing"
                   >
                     <div className="flex items-center justify-between gap-1">
                       {renamingBank === bName ? (
@@ -1874,6 +2392,13 @@ export function SceneAndFxManager({
                         />
                       ) : (
                         <div className="flex items-center gap-1 min-w-0">
+                          {bankColor && (
+                            <span
+                              data-testid={`bank-color-dot-${bName}`}
+                              className="w-2 h-2 rounded-full shrink-0"
+                              style={{ backgroundColor: bankColor }}
+                            />
+                          )}
                           <span
                             data-testid={`bank-name-${bName}`}
                             onDoubleClick={(e) => {
@@ -1896,7 +2421,23 @@ export function SceneAndFxManager({
                           )}
                         </div>
                       )}
-                      <ChevronDown className="w-3 h-3 text-fog shrink-0" />
+                      <button
+                        type="button"
+                        data-testid={`bank-menu-btn-${bName}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          setBankContextMenu({
+                            bank: bName,
+                            x: rect.left,
+                            y: rect.bottom + 4,
+                          });
+                        }}
+                        title="Bank Options (Recolor, Stackable, Rename, Delete)"
+                        className="p-0.5 rounded text-fog hover:text-frost hover:bg-ink shrink-0"
+                      >
+                        <ChevronDown className="w-3 h-3" />
+                      </button>
                     </div>
 
                     {/* Mini Bank Transport Strip: Pause/Stop All + Quick Add Scene */}
@@ -1928,7 +2469,7 @@ export function SceneAndFxManager({
                         Empty bank. Click +
                       </div>
                     ) : (
-                      scenesInBank.map(renderSceneTile)
+                      scenesInBank.map((sc) => renderSceneTile(sc, bankColor))
                     )}
                   </div>
                 </div>
@@ -1939,10 +2480,32 @@ export function SceneAndFxManager({
 
         {/* RIGHT: DASLIGHT 5 SCENE / FX INSPECTOR + FAR-RIGHT TOOL RAIL */}
         {showRightInspector && (
-          <section
-            data-testid="daslight-fx-rack"
-            className="xl:w-[275px] shrink-0 bg-slate-dark border border-steel rounded flex min-h-0 overflow-hidden"
-          >
+          <>
+            <SplitHandle
+              orientation="vertical"
+              testId="split-scene-inspector"
+              ariaLabel="Resize Scene Banks and FX Inspector"
+              className="hidden xl:flex"
+              onDragDelta={(deltaPx) =>
+                setStudioLayout({
+                  inspectorWidthPx:
+                    useTaktStore.getState().studioLayout.inspectorWidthPx -
+                    deltaPx,
+                })
+              }
+              onDoubleClick={() =>
+                setStudioLayout({
+                  inspectorWidthPx: DEFAULT_STUDIO_LAYOUT.inspectorWidthPx,
+                })
+              }
+            />
+            <section
+              data-testid="daslight-fx-rack"
+              style={{
+                ["--inspector-w" as string]: `${studioLayout.inspectorWidthPx}px`,
+              }}
+              className="w-full xl:w-[var(--inspector-w)] shrink-0 bg-slate-dark border border-steel rounded flex min-h-0 overflow-hidden"
+            >
             {/* Inspector Main Body */}
             <div className="flex-1 min-w-0 flex flex-col min-h-0">
               {/* Inspector Top Scene Header */}
@@ -2003,7 +2566,10 @@ export function SceneAndFxManager({
                   data-testid="scene-target-bar"
                   className="shrink-0 bg-pitch border-b border-steel/70 px-2.5 py-1 flex items-center justify-between gap-2 font-mono text-[10px]"
                 >
-                  <span className="text-fog uppercase shrink-0">Target</span>
+                  <span className="text-fog uppercase shrink-0 flex items-center gap-1">
+                    <span>Target</span>
+                    <HelpTooltip text="Selects which fixtures or group this scene drives. Updates both the Scene and its FX block." />
+                  </span>
                   <select
                     aria-label="Scene Target"
                     data-testid="scene-target-select"
@@ -2020,9 +2586,31 @@ export function SceneAndFxManager({
                         target_group: nextTarget === "all" ? null : nextTarget,
                       });
                       if (selectedScenePrimaryBlock) {
+                        const st = useTaktStore.getState();
+                        const nextElements = st.gizmoAutoFit
+                          ? selectedScenePrimaryBlock.elements.map((el) => {
+                              if (el.kind !== "spatial_shader_2d") return el;
+                              const b = computeTargetGizmoBounds({
+                                compiledCells: st.compiledCells,
+                                patch: st.showState.patch,
+                                groups: st.showState.groups,
+                                targetGroup: nextTarget,
+                                fallbackFixtureIds: st.selectedFixtureIds,
+                              });
+                              return {
+                                ...el,
+                                center_x: b.centerX,
+                                center_y: b.centerY,
+                                box_half_x: b.boxHalfX,
+                                box_half_y: b.boxHalfY,
+                                spatial_freq: b.spatialFreq,
+                              };
+                            })
+                          : selectedScenePrimaryBlock.elements;
                         void upsertFxBlock({
                           ...selectedScenePrimaryBlock,
                           target_group: nextTarget,
+                          elements: nextElements,
                         });
                       }
                     }}
@@ -2034,6 +2622,12 @@ export function SceneAndFxManager({
                       </option>
                     ))}
                   </select>
+                  <span
+                    data-testid="scene-target-beam-count"
+                    className="text-fog shrink-0"
+                  >
+                    {targetBeamCount}b
+                  </span>
                 </div>
               )}
 
@@ -2113,6 +2707,21 @@ export function SceneAndFxManager({
                           >
                             MAPPINGS
                           </button>
+                          <button
+                            type="button"
+                            data-testid="fx-picker-tile-scene_sequence"
+                            title="Chain existing scenes into a timeline-compatible step sequence"
+                            onClick={() =>
+                              void pickDaslightFxTile(
+                                "scene_sequence",
+                                fxAppendMode,
+                              )
+                            }
+                            className="col-span-2 h-11 rounded bg-ember/15 border border-ember/60 hover:border-ember hover:bg-ember/25 font-mono text-[11px] font-semibold text-frost flex items-center justify-center gap-1.5 px-2 transition-colors"
+                          >
+                            <Layers className="w-3.5 h-3.5 text-ember" />
+                            <span>SCENE SEQUENCE</span>
+                          </button>
                           {!fxAppendMode && (
                             <button
                               type="button"
@@ -2157,7 +2766,7 @@ export function SceneAndFxManager({
                             {selectedScenePrimaryBlock &&
                               proceduralElements.map((el, idx) => (
                                 <button
-                                  key={`${el.kind}-${el.trait}-${idx}`}
+                                  key={`${el.kind}-${"trait" in el ? el.trait : "seq"}-${idx}`}
                                   type="button"
                                   data-testid={`fx-stack-tab-${idx}`}
                                   onClick={() => {
@@ -2435,6 +3044,7 @@ export function SceneAndFxManager({
                                 </label>
 
                                 <NumericSlider
+                                  layout="stacked"
                                   label="Color Width"
                                   ariaLabel="Color Width"
                                   value={fxColorWidth}
@@ -2452,6 +3062,7 @@ export function SceneAndFxManager({
                                 />
 
                                 <NumericSlider
+                                  layout="stacked"
                                   label="Angle"
                                   ariaLabel="Color FX Angle"
                                   value={fxAngleDeg}
@@ -2523,6 +3134,7 @@ export function SceneAndFxManager({
                                 </div>
 
                                 <NumericSlider
+                                  layout="stacked"
                                   label="Rotation"
                                   ariaLabel="Mapping Rotation"
                                   value={fxDirectionDeg}
@@ -2541,6 +3153,7 @@ export function SceneAndFxManager({
                                 />
 
                                 <NumericSlider
+                                  layout="stacked"
                                   label="Color Width"
                                   ariaLabel="Color Width"
                                   value={fxColorWidth}
@@ -2558,12 +3171,13 @@ export function SceneAndFxManager({
                                 />
 
                                 <NumericSlider
+                                  layout="stacked"
                                   label="Scale"
                                   ariaLabel="Pattern Scale Slider"
                                   value={patternScaleValue}
                                   defaultValue={1}
                                   min={0.25}
-                                  max={4}
+                                  max={10}
                                   step={0.05}
                                   unit="×"
                                   precision={2}
@@ -2579,6 +3193,7 @@ export function SceneAndFxManager({
                             )}
 
                             <NumericSlider
+                              layout="stacked"
                               label="Gradient"
                               ariaLabel="Gradient"
                               value={Math.round(fxGradient * 100)}
@@ -2596,16 +3211,49 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Rate"
                               ariaLabel="FX Rate Cycles"
                               value={fxRateCycles}
                               defaultValue={1}
-                              min={0.25}
+                              min={0}
                               max={8}
                               step={0.25}
                               unit="×"
                               precision={2}
+                              headerExtra={
+                                <button
+                                  type="button"
+                                  data-testid="spatial-static-toggle"
+                                  aria-pressed={fxRateCycles === 0}
+                                  onClick={() => {
+                                    const nextRate =
+                                      fxRateCycles === 0
+                                        ? Math.max(0.25, lastNonZeroRateRef.current || 1)
+                                        : 0;
+                                    if (fxRateCycles > 0) {
+                                      lastNonZeroRateRef.current = fxRateCycles;
+                                    }
+                                    setFxTimingMode("cycles");
+                                    setFxRateCycles(nextRate);
+                                    void syncSelectedSceneBlock({
+                                      timingMode: "cycles",
+                                      rateCycles: nextRate,
+                                    });
+                                  }}
+                                  className={`px-1.5 py-0.5 rounded border text-[9px] font-mono shrink-0 ${
+                                    fxRateCycles === 0
+                                      ? "bg-amber/20 border-amber text-amber"
+                                      : "bg-ink border-steel text-fog hover:text-frost"
+                                  }`}
+                                >
+                                  Static
+                                </button>
+                              }
                               onChange={(rc) => {
+                                if (rc > 0) {
+                                  lastNonZeroRateRef.current = rc;
+                                }
                                 setFxTimingMode("cycles");
                                 setFxRateCycles(rc);
                                 void syncSelectedSceneBlock({
@@ -2615,29 +3263,72 @@ export function SceneAndFxManager({
                               }}
                             />
 
+                            <NumericSlider
+                              layout="stacked"
+                              label="Phase Offset"
+                              ariaLabel="Spatial Phase Offset"
+                              value={Math.round(fxPhaseOffset * 100)}
+                              defaultValue={0}
+                              min={0}
+                              max={100}
+                              step={1}
+                              unit="%"
+                              precision={0}
+                              onChange={(pct) => {
+                                const po = pct / 100;
+                                setFxPhaseOffset(po);
+                                void syncSelectedSceneBlock({
+                                  phaseOffset: po,
+                                });
+                              }}
+                            />
+
                             <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-steel/40">
-                              <span className="text-fog">Beams</span>
-                              <select
-                                aria-label="Inspector Target Group"
-                                value={fxTargetGroup}
-                                onChange={(e) => {
-                                  const tg = e.target.value;
-                                  setFxTargetGroup(tg);
+                              <button
+                                type="button"
+                                data-testid="inspector-gizmo-fit-btn"
+                                onClick={() => {
+                                  if (!selectedScenePrimaryBlock) return;
+                                  const st = useTaktStore.getState();
+                                  const b = computeTargetGizmoBounds({
+                                    compiledCells: st.compiledCells,
+                                    patch: st.showState.patch,
+                                    groups: st.showState.groups,
+                                    targetGroup:
+                                      selectedScene?.target_group ??
+                                      selectedScenePrimaryBlock.target_group ??
+                                      fxTargetGroup,
+                                    fallbackFixtureIds: st.selectedFixtureIds,
+                                  });
+                                  setFxCenterX(b.centerX);
+                                  setFxCenterY(b.centerY);
+                                  setFxSpatialFreq(b.spatialFreq);
                                   void syncSelectedSceneBlock({
-                                    targetGroup: tg,
+                                    centerX: b.centerX,
+                                    centerY: b.centerY,
+                                    boxHalfX: b.boxHalfX,
+                                    boxHalfY: b.boxHalfY,
+                                    spatialFreq: b.spatialFreq,
                                   });
                                 }}
-                                className="flex-1 min-w-0 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
+                                title="Resize and center the 2D shader gizmo around the targeted fixtures"
+                                className="flex-1 py-1 rounded border border-cobalt bg-cobalt/15 hover:bg-cobalt/30 text-frost font-semibold"
                               >
-                                {targetOptions.map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label}
-                                  </option>
-                                ))}
-                              </select>
-                              <span className="text-fog shrink-0">
-                                {compiledCells.length} Beam(s)
-                              </span>
+                                Fit Gizmo to Targets
+                              </button>
+                              <button
+                                type="button"
+                                aria-pressed={gizmoAutoFit}
+                                onClick={() => setGizmoAutoFit(!gizmoAutoFit)}
+                                title="Automatically refit the 2D gizmo whenever targeted fixtures move"
+                                className={`px-2 py-1 rounded border ${
+                                  gizmoAutoFit
+                                    ? "border-plum bg-plum/25 text-frost font-semibold"
+                                    : "border-steel bg-ink text-fog hover:text-mist"
+                                }`}
+                              >
+                                Auto
+                              </button>
                             </div>
                           </div>
                         )}
@@ -2696,6 +3387,7 @@ export function SceneAndFxManager({
 
                             {fxFade > 0 && (
                               <NumericSlider
+                                layout="stacked"
                                 label="Fade"
                                 ariaLabel="Step Softness Pct"
                                 value={Math.round(fxFade * 100)}
@@ -2714,6 +3406,7 @@ export function SceneAndFxManager({
                             )}
 
                             <NumericSlider
+                              layout="stacked"
                               label="Nb pixels on"
                               ariaLabel="Nb pixels on"
                               value={fxPixelsOn}
@@ -2732,6 +3425,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Rate"
                               ariaLabel="FX Rate Cycles"
                               value={fxRateCycles}
@@ -2770,29 +3464,6 @@ export function SceneAndFxManager({
                                   <option value="mirror">Mirror</option>
                                   <option value="odd_even">Odd / Even</option>
                                   <option value="blocks(2)">Blocks (2)</option>
-                                </select>
-                              </label>
-                              <label className="flex flex-col gap-0.5">
-                                <span className="text-fog">
-                                  Beams ({compiledCells.length})
-                                </span>
-                                <select
-                                  aria-label="Inspector Target Group"
-                                  value={fxTargetGroup}
-                                  onChange={(e) => {
-                                    const tg = e.target.value;
-                                    setFxTargetGroup(tg);
-                                    void syncSelectedSceneBlock({
-                                      targetGroup: tg,
-                                    });
-                                  }}
-                                  className="bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
-                                >
-                                  {targetOptions.map((opt) => (
-                                    <option key={opt.value} value={opt.value}>
-                                      {opt.label}
-                                    </option>
-                                  ))}
                                 </select>
                               </label>
                             </div>
@@ -2913,6 +3584,7 @@ export function SceneAndFxManager({
                                   </div>
 
                                   <NumericSlider
+                                    layout="stacked"
                                     label="Stop Level"
                                     ariaLabel="Value Stop Level"
                                     value={Math.round(stops[safeIdx] * 100)}
@@ -2960,6 +3632,7 @@ export function SceneAndFxManager({
                             </label>
 
                             <NumericSlider
+                              layout="stacked"
                               label="Rate"
                               ariaLabel="FX Rate Cycles"
                               value={fxRateCycles}
@@ -2980,6 +3653,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Phase"
                               ariaLabel="FX Phase"
                               value={fxPhaseDeg}
@@ -2996,6 +3670,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Phasing"
                               ariaLabel="Curve Phasing"
                               value={fxPhaseSpreadDeg}
@@ -3014,6 +3689,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Gradient"
                               ariaLabel="Gradient"
                               value={Math.round(fxGradient * 100)}
@@ -3029,31 +3705,6 @@ export function SceneAndFxManager({
                                 void syncSelectedSceneBlock({ gradient: gr });
                               }}
                             />
-
-                            <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-steel/40">
-                              <span className="text-fog">Beams</span>
-                              <select
-                                aria-label="Inspector Target Group"
-                                value={fxTargetGroup}
-                                onChange={(e) => {
-                                  const tg = e.target.value;
-                                  setFxTargetGroup(tg);
-                                  void syncSelectedSceneBlock({
-                                    targetGroup: tg,
-                                  });
-                                }}
-                                className="flex-1 min-w-0 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
-                              >
-                                {targetOptions.map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label}
-                                  </option>
-                                ))}
-                              </select>
-                              <span className="text-fog shrink-0">
-                                {compiledCells.length} Beam(s)
-                              </span>
-                            </div>
                           </div>
                         )}
 
@@ -3113,6 +3764,7 @@ export function SceneAndFxManager({
                             </svg>
 
                             <NumericSlider
+                              layout="stacked"
                               label="Rate"
                               ariaLabel="FX Rate Cycles"
                               value={fxRateCycles}
@@ -3133,6 +3785,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Size"
                               ariaLabel="Curve Output Max Pct"
                               value={curveRange.maxPct}
@@ -3159,6 +3812,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Phase"
                               ariaLabel="Curve Phase"
                               value={fxPhaseDeg}
@@ -3175,6 +3829,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Offset"
                               ariaLabel="Curve Output Min Pct"
                               value={curveRange.minPct}
@@ -3201,6 +3856,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Phasing"
                               ariaLabel="Curve Phasing"
                               value={fxPhaseSpreadDeg}
@@ -3221,6 +3877,7 @@ export function SceneAndFxManager({
                             {(fxWaveform === "pulse" ||
                               fxWaveform === "square") && (
                               <NumericSlider
+                                layout="stacked"
                                 label="Duty"
                                 ariaLabel="Curve Duty Pct"
                                 value={Math.round(fxDuty * 100)}
@@ -3279,31 +3936,6 @@ export function SceneAndFxManager({
                                   <option value="blocks(2)">Blocks (2)</option>
                                 </select>
                               </label>
-                            </div>
-
-                            <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-steel/40">
-                              <span className="text-fog">Beams</span>
-                              <select
-                                aria-label="Inspector Target Group"
-                                value={fxTargetGroup}
-                                onChange={(e) => {
-                                  const tg = e.target.value;
-                                  setFxTargetGroup(tg);
-                                  void syncSelectedSceneBlock({
-                                    targetGroup: tg,
-                                  });
-                                }}
-                                className="flex-1 min-w-0 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
-                              >
-                                {targetOptions.map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label}
-                                  </option>
-                                ))}
-                              </select>
-                              <span className="text-fog shrink-0">
-                                {compiledCells.length} Beam(s)
-                              </span>
                             </div>
                           </div>
                         )}
@@ -3420,6 +4052,7 @@ export function SceneAndFxManager({
                                   </div>
 
                                   <NumericSlider
+                                    layout="stacked"
                                     label="Stop Level"
                                     ariaLabel="Value Stop Level"
                                     value={Math.round(stops[safeIdx] * 100)}
@@ -3492,6 +4125,7 @@ export function SceneAndFxManager({
                             </div>
 
                             <NumericSlider
+                              layout="stacked"
                               label="Rotation"
                               ariaLabel="Mapping Rotation"
                               value={fxDirectionDeg}
@@ -3510,6 +4144,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Width"
                               ariaLabel="Color Width"
                               value={fxColorWidth}
@@ -3525,12 +4160,13 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Scale"
                               ariaLabel="Pattern Scale Slider"
                               value={patternScaleValue}
                               defaultValue={1}
                               min={0.25}
-                              max={4}
+                              max={10}
                               step={0.05}
                               unit="×"
                               precision={2}
@@ -3544,6 +4180,7 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Gradient"
                               ariaLabel="Gradient"
                               value={Math.round(fxGradient * 100)}
@@ -3561,16 +4198,49 @@ export function SceneAndFxManager({
                             />
 
                             <NumericSlider
+                              layout="stacked"
                               label="Rate"
                               ariaLabel="FX Rate Cycles"
                               value={fxRateCycles}
                               defaultValue={1}
-                              min={0.25}
+                              min={0}
                               max={8}
                               step={0.25}
                               unit="×"
                               precision={2}
+                              headerExtra={
+                                <button
+                                  type="button"
+                                  data-testid="spatial-static-toggle"
+                                  aria-pressed={fxRateCycles === 0}
+                                  onClick={() => {
+                                    const nextRate =
+                                      fxRateCycles === 0
+                                        ? Math.max(0.25, lastNonZeroRateRef.current || 1)
+                                        : 0;
+                                    if (fxRateCycles > 0) {
+                                      lastNonZeroRateRef.current = fxRateCycles;
+                                    }
+                                    setFxTimingMode("cycles");
+                                    setFxRateCycles(nextRate);
+                                    void syncSelectedSceneBlock({
+                                      timingMode: "cycles",
+                                      rateCycles: nextRate,
+                                    });
+                                  }}
+                                  className={`px-1.5 py-0.5 rounded border text-[9px] font-mono shrink-0 ${
+                                    fxRateCycles === 0
+                                      ? "bg-amber/20 border-amber text-amber"
+                                      : "bg-ink border-steel text-fog hover:text-frost"
+                                  }`}
+                                >
+                                  Static
+                                </button>
+                              }
                               onChange={(rc) => {
+                                if (rc > 0) {
+                                  lastNonZeroRateRef.current = rc;
+                                }
                                 setFxTimingMode("cycles");
                                 setFxRateCycles(rc);
                                 void syncSelectedSceneBlock({
@@ -3580,29 +4250,418 @@ export function SceneAndFxManager({
                               }}
                             />
 
+                            <NumericSlider
+                              layout="stacked"
+                              label="Phase Offset"
+                              ariaLabel="Spatial Phase Offset"
+                              value={Math.round(fxPhaseOffset * 100)}
+                              defaultValue={0}
+                              min={0}
+                              max={100}
+                              step={1}
+                              unit="%"
+                              precision={0}
+                              onChange={(pct) => {
+                                const po = pct / 100;
+                                setFxPhaseOffset(po);
+                                void syncSelectedSceneBlock({
+                                  phaseOffset: po,
+                                });
+                              }}
+                            />
+
                             <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-steel/40">
-                              <span className="text-fog">Beams</span>
-                              <select
-                                aria-label="Inspector Target Group"
-                                value={fxTargetGroup}
-                                onChange={(e) => {
-                                  const tg = e.target.value;
-                                  setFxTargetGroup(tg);
+                              <button
+                                type="button"
+                                data-testid="inspector-gizmo-fit-btn"
+                                onClick={() => {
+                                  if (!selectedScenePrimaryBlock) return;
+                                  const st = useTaktStore.getState();
+                                  const b = computeTargetGizmoBounds({
+                                    compiledCells: st.compiledCells,
+                                    patch: st.showState.patch,
+                                    groups: st.showState.groups,
+                                    targetGroup:
+                                      selectedScene?.target_group ??
+                                      selectedScenePrimaryBlock.target_group ??
+                                      fxTargetGroup,
+                                    fallbackFixtureIds: st.selectedFixtureIds,
+                                  });
+                                  setFxCenterX(b.centerX);
+                                  setFxCenterY(b.centerY);
+                                  setFxSpatialFreq(b.spatialFreq);
                                   void syncSelectedSceneBlock({
-                                    targetGroup: tg,
+                                    centerX: b.centerX,
+                                    centerY: b.centerY,
+                                    boxHalfX: b.boxHalfX,
+                                    boxHalfY: b.boxHalfY,
+                                    spatialFreq: b.spatialFreq,
                                   });
                                 }}
+                                title="Resize and center the 2D shader gizmo around the targeted fixtures"
+                                className="flex-1 py-1 rounded border border-cobalt bg-cobalt/15 hover:bg-cobalt/30 text-frost font-semibold"
+                              >
+                                Fit Gizmo to Targets
+                              </button>
+                              <button
+                                type="button"
+                                aria-pressed={gizmoAutoFit}
+                                onClick={() => setGizmoAutoFit(!gizmoAutoFit)}
+                                title="Automatically refit the 2D gizmo whenever targeted fixtures move"
+                                className={`px-2 py-1 rounded border ${
+                                  gizmoAutoFit
+                                    ? "border-plum bg-plum/25 text-frost font-semibold"
+                                    : "border-steel bg-ink text-fog hover:text-mist"
+                                }`}
+                              >
+                                Auto
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {activeSubmenu === "scene_sequence" && (
+                          <div
+                            data-testid="scene-sequence-editor"
+                            className="bg-pitch border border-steel rounded p-2 flex flex-col gap-2 font-mono text-[10px]"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <label className="flex items-center gap-1.5 flex-1 min-w-0">
+                                <span className="text-fog shrink-0">Mode</span>
+                                <select
+                                  aria-label="Sequence Playback Mode"
+                                  data-testid="seq-playback-mode-select"
+                                  value={fxSeqPlaybackMode}
+                                  onChange={(e) => {
+                                    const mode = e.target
+                                      .value as SequencePlaybackMode;
+                                    void commitSequenceSteps(fxSeqSteps, mode);
+                                  }}
+                                  className="flex-1 min-w-0 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
+                                >
+                                  <option value="loop">Loop</option>
+                                  <option value="one_shot">One-Shot</option>
+                                  <option value="bounce">Bounce</option>
+                                </select>
+                              </label>
+                              <span
+                                data-testid="seq-total-duration"
+                                className="text-fog shrink-0"
+                              >
+                                {computeSceneSequenceDurationSec(
+                                  fxSeqSteps,
+                                  liveBpm || showState.bpm || 120,
+                                ).toFixed(2)}
+                                s
+                              </span>
+                            </div>
+
+                            {seqDropNotice && (
+                              <div
+                                data-testid="seq-drop-notice"
+                                className="px-2 py-1 rounded bg-signal/15 border border-signal/60 text-signal text-[10px]"
+                              >
+                                {seqDropNotice}
+                              </div>
+                            )}
+
+                            {/* Drag-and-Drop Dropzone */}
+                            <div
+                              data-scene-sequence-dropzone="true"
+                              data-target-block-id={
+                                selectedScenePrimaryBlock?.id ?? ""
+                              }
+                              data-testid="scene-sequence-dropzone"
+                              onDragOver={(e) => {
+                                e.preventDefault();
+                              }}
+                              onDrop={(e) => {
+                                e.preventDefault();
+                                const sid =
+                                  e.dataTransfer.getData("text/takt-scene") ||
+                                  e.dataTransfer.getData("text/plain");
+                                if (sid) {
+                                  void addSceneStepToSequence(
+                                    sid,
+                                    selectedScenePrimaryBlock?.id,
+                                  );
+                                }
+                              }}
+                              className={`rounded border border-dashed px-2 py-2 text-center transition-colors ${
+                                draggingSceneId
+                                  ? "border-ember bg-ember/15 text-frost"
+                                  : "border-steel/80 bg-ink/60 text-fog"
+                              }`}
+                            >
+                              {draggingSceneId
+                                ? "Drop scene here to append step"
+                                : "Drag scenes from the Scene List here"}
+                            </div>
+
+                            {/* Quick Add Scene Dropdown */}
+                            <div className="flex items-center gap-1">
+                              <select
+                                aria-label="Add Scene to Sequence"
+                                data-testid="seq-add-scene-select"
+                                value={seqAddSceneId}
+                                onChange={(e) =>
+                                  setSeqAddSceneId(e.target.value)
+                                }
                                 className="flex-1 min-w-0 bg-ink border border-steel rounded px-1.5 py-0.5 text-xs text-frost"
                               >
-                                {targetOptions.map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label}
-                                  </option>
-                                ))}
+                                <option value="">Select scene to add…</option>
+                                {showState.scenes
+                                  .filter(
+                                    (s) =>
+                                      !s.timeline_ref &&
+                                      s.id !== selectedScene?.id,
+                                  )
+                                  .map((s) => (
+                                    <option key={s.id} value={s.id}>
+                                      {s.name}
+                                    </option>
+                                  ))}
                               </select>
-                              <span className="text-fog shrink-0">
-                                {compiledCells.length} Beam(s)
-                              </span>
+                              <button
+                                type="button"
+                                data-testid="seq-add-scene-btn"
+                                disabled={!seqAddSceneId}
+                                onClick={() => {
+                                  if (!seqAddSceneId) return;
+                                  void addSceneStepToSequence(
+                                    seqAddSceneId,
+                                    selectedScenePrimaryBlock?.id,
+                                  );
+                                }}
+                                className="px-2 py-0.5 rounded bg-ink border border-steel hover:border-ember text-frost disabled:opacity-40"
+                              >
+                                + Add
+                              </button>
+                            </div>
+
+                            {/* Ordered Step List */}
+                            <div className="flex flex-col gap-1">
+                              {fxSeqSteps.length === 0 ? (
+                                <div className="text-fog text-center py-2">
+                                  No steps yet. Drag a scene above or use + Add.
+                                </div>
+                              ) : (
+                                fxSeqSteps.map((step, stepIdx) => {
+                                  const refScene = showState.scenes.find(
+                                    (s) => s.id === step.scene_id,
+                                  );
+                                  const swatchColors = refScene
+                                    ? getScenePaletteColors(refScene)
+                                    : null;
+                                  const swatchHex = swatchColors
+                                    ? swatchColors[0]
+                                    : "#FF5500";
+                                  return (
+                                    <div
+                                      key={`${step.scene_id}-${stepIdx}`}
+                                      data-testid={`seq-step-row-${stepIdx}`}
+                                      data-scene-sequence-dropzone="true"
+                                      data-target-block-id={
+                                        selectedScenePrimaryBlock?.id ?? ""
+                                      }
+                                      data-insert-index={stepIdx}
+                                      className="bg-ink border border-steel/80 rounded px-1.5 py-1 flex flex-col gap-1"
+                                    >
+                                      <div className="flex items-center justify-between gap-1">
+                                        <div className="flex items-center gap-1.5 min-w-0">
+                                          <span className="text-fog shrink-0">
+                                            #{stepIdx + 1}
+                                          </span>
+                                          <span
+                                            className="w-2.5 h-2.5 rounded-sm shrink-0 border border-frost/30"
+                                            style={{ backgroundColor: swatchHex }}
+                                          />
+                                          <span className="text-frost truncate font-semibold">
+                                            {refScene?.name ?? step.scene_id}
+                                          </span>
+                                        </div>
+                                        <div className="flex items-center gap-0.5 shrink-0">
+                                          <button
+                                            type="button"
+                                            aria-label={`Move step ${stepIdx + 1} up`}
+                                            data-testid={`seq-step-up-${stepIdx}`}
+                                            disabled={stepIdx === 0}
+                                            onClick={() => {
+                                              if (stepIdx === 0) return;
+                                              const next = [...fxSeqSteps];
+                                              const [item] = next.splice(
+                                                stepIdx,
+                                                1,
+                                              );
+                                              next.splice(stepIdx - 1, 0, item);
+                                              void commitSequenceSteps(next);
+                                            }}
+                                            className="p-0.5 rounded text-fog hover:text-frost disabled:opacity-30"
+                                          >
+                                            <ArrowUp className="w-3 h-3" />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            aria-label={`Move step ${stepIdx + 1} down`}
+                                            data-testid={`seq-step-down-${stepIdx}`}
+                                            disabled={
+                                              stepIdx === fxSeqSteps.length - 1
+                                            }
+                                            onClick={() => {
+                                              if (
+                                                stepIdx ===
+                                                fxSeqSteps.length - 1
+                                              )
+                                                return;
+                                              const next = [...fxSeqSteps];
+                                              const [item] = next.splice(
+                                                stepIdx,
+                                                1,
+                                              );
+                                              next.splice(stepIdx + 1, 0, item);
+                                              void commitSequenceSteps(next);
+                                            }}
+                                            className="p-0.5 rounded text-fog hover:text-frost disabled:opacity-30"
+                                          >
+                                            <ArrowDown className="w-3 h-3" />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            aria-label={`Remove step ${stepIdx + 1}`}
+                                            data-testid={`seq-step-remove-${stepIdx}`}
+                                            onClick={() => {
+                                              const next = fxSeqSteps.filter(
+                                                (_, i) => i !== stepIdx,
+                                              );
+                                              void commitSequenceSteps(next);
+                                            }}
+                                            className="p-0.5 rounded text-signal/80 hover:text-signal"
+                                          >
+                                            <Trash2 className="w-3 h-3" />
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      <div className="flex items-center gap-1.5">
+                                        <label className="flex items-center gap-1">
+                                          <span className="text-fog">Dur</span>
+                                          <input
+                                            type="number"
+                                            min={
+                                              step.duration_unit === "beats"
+                                                ? 1
+                                                : 0.05
+                                            }
+                                            step={
+                                              step.duration_unit === "beats"
+                                                ? 1
+                                                : 0.25
+                                            }
+                                            aria-label={`Step ${stepIdx + 1} duration`}
+                                            data-testid={`seq-step-duration-${stepIdx}`}
+                                            value={
+                                              step.duration_unit === "beats"
+                                                ? Math.max(
+                                                    1,
+                                                    Math.round(
+                                                      step.duration_value,
+                                                    ),
+                                                  )
+                                                : step.duration_value
+                                            }
+                                            onChange={(e) => {
+                                              const parsed = Number(
+                                                e.target.value,
+                                              );
+                                              const v =
+                                                step.duration_unit === "beats"
+                                                  ? Math.max(
+                                                      1,
+                                                      Math.round(parsed || 1),
+                                                    )
+                                                  : Math.max(
+                                                      0.05,
+                                                      parsed || 0.05,
+                                                    );
+                                              const next = fxSeqSteps.map(
+                                                (st, i) =>
+                                                  i === stepIdx
+                                                    ? {
+                                                        ...st,
+                                                        duration_value: v,
+                                                      }
+                                                    : st,
+                                              );
+                                              void commitSequenceSteps(next);
+                                            }}
+                                            className="w-12 bg-pitch border border-steel rounded px-1 py-0.5 text-[10px] text-frost"
+                                          />
+                                        </label>
+                                        <button
+                                          type="button"
+                                          data-testid={`seq-step-unit-${stepIdx}`}
+                                          onClick={() => {
+                                            const nextUnit: DurationUnit =
+                                              step.duration_unit === "beats"
+                                                ? "seconds"
+                                                : "beats";
+                                            const next = fxSeqSteps.map(
+                                              (st, i) =>
+                                                i === stepIdx
+                                                  ? {
+                                                      ...st,
+                                                      duration_unit: nextUnit,
+                                                      duration_value:
+                                                        nextUnit === "beats"
+                                                          ? Math.max(
+                                                              1,
+                                                              Math.round(
+                                                                st.duration_value,
+                                                              ),
+                                                            )
+                                                          : st.duration_value,
+                                                    }
+                                                  : st,
+                                            );
+                                            void commitSequenceSteps(next);
+                                          }}
+                                          className="px-1.5 py-0.5 rounded bg-pitch border border-steel hover:border-ember text-[9px] text-mist"
+                                        >
+                                          {step.duration_unit === "beats"
+                                            ? "beats"
+                                            : "sec"}
+                                        </button>
+                                        <label className="flex items-center gap-1 ml-auto">
+                                          <span className="text-fog">Fade</span>
+                                          <input
+                                            type="number"
+                                            min={0}
+                                            step={0.1}
+                                            aria-label={`Step ${stepIdx + 1} crossfade seconds`}
+                                            data-testid={`seq-step-fade-${stepIdx}`}
+                                            value={step.fade_sec}
+                                            onChange={(e) => {
+                                              const v = Math.max(
+                                                0,
+                                                Number(e.target.value) || 0,
+                                              );
+                                              const next = fxSeqSteps.map(
+                                                (st, i) =>
+                                                  i === stepIdx
+                                                    ? { ...st, fade_sec: v }
+                                                    : st,
+                                              );
+                                              void commitSequenceSteps(next);
+                                            }}
+                                            className="w-11 bg-pitch border border-steel rounded px-1 py-0.5 text-[10px] text-frost"
+                                          />
+                                          <span className="text-fog">s</span>
+                                        </label>
+                                      </div>
+                                    </div>
+                                  );
+                                })
+                              )}
                             </div>
                           </div>
                         )}
@@ -3689,12 +4748,14 @@ export function SceneAndFxManager({
                             .showState.scenes.find(
                               (s) => s.id === selectedScene.id,
                             ) ?? selectedScene;
-                        const nextVal = Math.max(
-                          0.1,
-                          val ?? latestScene.duration_value ?? 4,
-                        );
                         const nextUnit: DurationUnit =
                           unit ?? latestScene.duration_unit ?? "beats";
+                        const rawNextVal =
+                          val ?? latestScene.duration_value ?? 4;
+                        const nextVal =
+                          nextUnit === "beats"
+                            ? Math.max(1, Math.round(rawNextVal))
+                            : Math.max(0.1, rawNextVal);
                         void upsertScene({
                           ...latestScene,
                           duration_value: nextVal,
@@ -3755,9 +4816,13 @@ export function SceneAndFxManager({
                               aria-label="Scene Duration Value"
                               data-testid="scene-duration-input"
                               type="number"
-                              min={0.1}
+                              min={curDurUnit === "beats" ? 1 : 0.1}
                               step={curDurUnit === "beats" ? 1 : 0.1}
-                              value={curDurVal}
+                              value={
+                                curDurUnit === "beats"
+                                  ? Math.max(1, Math.round(curDurVal))
+                                  : curDurVal
+                              }
                               onChange={(e) => {
                                 const parsed = Number(e.target.value);
                                 if (!Number.isNaN(parsed) && parsed > 0) {
@@ -4076,6 +5141,7 @@ export function SceneAndFxManager({
               )}
             </div>
           </section>
+          </>
         )}
       </div>
 
@@ -4118,6 +5184,63 @@ export function SceneAndFxManager({
           >
             Rename Bank
           </button>
+          <div className="px-3 py-1.5 border-t border-steel/50 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] text-fog">Bank Color</span>
+              {bankColors[bankContextMenu.bank] && (
+                <button
+                  type="button"
+                  data-testid={`bank-color-reset-${bankContextMenu.bank}`}
+                  onClick={() => {
+                    setBankColor(bankContextMenu.bank, null);
+                  }}
+                  className="text-[10px] text-fog hover:text-frost underline"
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {BANK_COLOR_PRESETS.map((hex) => {
+                const isSelected =
+                  bankColors[bankContextMenu.bank]?.toLowerCase() ===
+                  hex.toLowerCase();
+                return (
+                  <button
+                    key={hex}
+                    type="button"
+                    data-testid={`bank-color-swatch-${bankContextMenu.bank}-${hex}`}
+                    onClick={() => {
+                      setBankColor(bankContextMenu.bank, hex);
+                      setBankContextMenu(null);
+                    }}
+                    title={`Set bank color ${hex}`}
+                    style={{ backgroundColor: hex }}
+                    className={`w-4 h-4 rounded-sm border transition-transform hover:scale-110 ${
+                      isSelected
+                        ? "border-frost ring-1 ring-frost"
+                        : "border-pitch"
+                    }`}
+                  />
+                );
+              })}
+              <label
+                title="Custom Bank Color"
+                className="w-4 h-4 rounded-sm border border-steel bg-ink flex items-center justify-center cursor-pointer overflow-hidden hover:border-frost"
+              >
+                <input
+                  type="color"
+                  aria-label={`Custom color for ${bankContextMenu.bank}`}
+                  data-testid={`bank-color-picker-${bankContextMenu.bank}`}
+                  value={bankColors[bankContextMenu.bank] ?? "#FBBF24"}
+                  onChange={(e) => {
+                    setBankColor(bankContextMenu.bank, e.target.value);
+                  }}
+                  className="w-6 h-6 cursor-pointer border-0 bg-transparent p-0"
+                />
+              </label>
+            </div>
+          </div>
           <button
             type="button"
             data-testid={`delete-bank-${bankContextMenu.bank}`}

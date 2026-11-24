@@ -20,10 +20,7 @@ import {
   type SmartControlLayer,
 } from "../lib/mixerLogic";
 import type { OrderRuleStr } from "../lib/patchLogic";
-import {
-  type GroupMixerStripState,
-  useTaktStore,
-} from "../store/useTaktStore";
+import { useTaktStore } from "../store/useTaktStore";
 import { ColorPaletteBuilderModal } from "./ColorPaletteBuilderModal";
 import { NumericSlider } from "./NumericSlider";
 
@@ -110,19 +107,16 @@ export function PalettesAndControls({
   hideUndoRedo = false,
   hideGroups = false,
   daslightDock = false,
-  forceLiveMixer = false,
 }: {
   hideUndoRedo?: boolean;
   hideGroups?: boolean;
   daslightDock?: boolean;
-  forceLiveMixer?: boolean;
 }) {
   const showState = useTaktStore((s) => s.showState);
   const liveLayers = useTaktStore((s) => s.liveLayers);
   const compiledCells = useTaktStore((s) => s.compiledCells);
   const cellPreviewRgbd = useTaktStore((s) => s.cellPreviewRgbd);
   const fixtureDetailsCache = useTaktStore((s) => s.fixtureDetailsCache);
-  const groupMixerStrips = useTaktStore((s) => s.groupMixerStrips);
   const activeGroupFilterId = useTaktStore((s) => s.activeGroupFilterId);
   const selectedSceneId = useTaktStore((s) => s.selectedSceneId);
   const canUndo = useTaktStore((s) => s.canUndo);
@@ -134,7 +128,6 @@ export function PalettesAndControls({
   const deleteDimmerPalette = useTaktStore((s) => s.deleteDimmerPalette);
   const upsertGroup = useTaktStore((s) => s.upsertGroup);
   const setLiveLayers = useTaktStore((s) => s.setLiveLayers);
-  const updateGroupMixerStrip = useTaktStore((s) => s.updateGroupMixerStrip);
   const undoShow = useTaktStore((s) => s.undoShow);
   const redoShow = useTaktStore((s) => s.redoShow);
 
@@ -164,7 +157,7 @@ export function PalettesAndControls({
     const counts: Record<string, number> = {};
     for (const blk of showState.fx_library) {
       for (const el of blk.elements) {
-        if (el.palette_ref) {
+        if (el.kind !== "scene_sequence" && el.palette_ref) {
           counts[el.palette_ref] = (counts[el.palette_ref] ?? 0) + 1;
         }
       }
@@ -1079,258 +1072,8 @@ export function PalettesAndControls({
         </div>
       </div>
 
-      {/* BODY: Either MIXER Vertical Console OR EDIT Trait Dock */}
-      {forceLiveMixer ? (
-        <section
-          data-testid="live-mixer-console"
-          className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden p-2 flex items-stretch gap-2 bg-pitch"
-        >
-          {[
-            { id: "all", name: "All Fixtures" },
-            ...showState.groups.map((g) => ({ id: g.id, name: g.name })),
-          ].map((grp) => {
-            const strip: GroupMixerStripState = groupMixerStrips[grp.id] ?? {
-              dimmer: 1.0,
-              hueShiftDeg: 0,
-              saturation: 1.0,
-              strobeEnabled: false,
-              strobeHz: 8,
-              mode: "normal",
-              flashActive: false,
-              exclusiveFlashActive: false,
-            };
-            return (
-              <div
-                key={grp.id}
-                data-testid={`group-mixer-strip-${grp.id}`}
-                className="w-36 shrink-0 bg-slate-dark border border-steel rounded p-2 flex flex-col justify-between gap-1.5 font-mono text-[10px]"
-              >
-                <div className="flex items-center justify-between gap-1 border-b border-steel/60 pb-1">
-                  <span className="font-sans text-[11px] font-semibold text-frost truncate">
-                    {grp.name}
-                  </span>
-                  <span className="text-ember">
-                    {Math.round(strip.dimmer * 100)}%
-                  </span>
-                </div>
-
-                {/* Vertical Master Dimmer Fader */}
-                <div className="flex-1 min-h-0 flex items-center justify-center gap-2 py-1">
-                  <NumericSlider
-                    orientation="vertical"
-                    ariaLabel={`Mixer Dimmer ${grp.name}`}
-                    value={strip.dimmer}
-                    defaultValue={1.0}
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    displayMultiplier={100}
-                    unit="%"
-                    precision={0}
-                    onChange={(val) =>
-                      updateGroupMixerStrip(grp.id, { dimmer: val })
-                    }
-                    className="h-full"
-                    inputClassName="w-10 text-[9px]"
-                  />
-
-                  <div className="flex flex-col gap-1.5 flex-1 min-w-0">
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-[9px] text-fog">
-                        Hue {strip.hueShiftDeg}°
-                      </span>
-                      <NumericSlider
-                        ariaLabel={`Mixer Hue ${grp.name}`}
-                        value={strip.hueShiftDeg}
-                        defaultValue={0}
-                        min={0}
-                        max={360}
-                        step={1}
-                        unit="°"
-                        precision={0}
-                        onChange={(val) =>
-                          updateGroupMixerStrip(grp.id, { hueShiftDeg: val })
-                        }
-                        sliderClassName="accent-cobalt"
-                        inputClassName="w-11 text-[9px]"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-[9px] text-fog">
-                        Sat {Math.round(strip.saturation * 100)}%
-                      </span>
-                      <NumericSlider
-                        ariaLabel={`Mixer Saturation ${grp.name}`}
-                        value={strip.saturation}
-                        defaultValue={1.0}
-                        min={0}
-                        max={1}
-                        step={0.01}
-                        displayMultiplier={100}
-                        unit="%"
-                        precision={0}
-                        onChange={(val) =>
-                          updateGroupMixerStrip(grp.id, { saturation: val })
-                        }
-                        sliderClassName="accent-plum"
-                        inputClassName="w-11 text-[9px]"
-                      />
-                    </label>
-                    <div className="flex items-center gap-1">
-                      <button
-                        type="button"
-                        data-testid={`mixer-strobe-toggle-${grp.id}`}
-                        aria-pressed={strip.strobeEnabled}
-                        onClick={() =>
-                          updateGroupMixerStrip(grp.id, {
-                            strobeEnabled: !strip.strobeEnabled,
-                          })
-                        }
-                        className={`px-1 py-0.5 rounded border text-[9px] ${
-                          strip.strobeEnabled
-                            ? "bg-signal text-frost border-signal"
-                            : "bg-pitch text-fog border-steel"
-                        }`}
-                      >
-                        ⚡
-                      </button>
-                      <NumericSlider
-                        ariaLabel={`Mixer Strobe Hz ${grp.name}`}
-                        value={strip.strobeHz}
-                        defaultValue={8}
-                        min={1}
-                        max={20}
-                        step={0.5}
-                        unit="Hz"
-                        precision={1}
-                        onChange={(val) =>
-                          updateGroupMixerStrip(grp.id, { strobeHz: val })
-                        }
-                        sliderClassName="accent-signal"
-                        inputClassName="w-10 text-[9px]"
-                        className="flex-1 min-w-0"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                {/* Bottom Console Buttons */}
-                <div className="grid grid-cols-3 gap-1">
-                  <button
-                    type="button"
-                    data-testid={`mixer-full-${grp.id}`}
-                    aria-pressed={strip.mode === "full"}
-                    onClick={() =>
-                      updateGroupMixerStrip(grp.id, {
-                        mode: strip.mode === "full" ? "normal" : "full",
-                      })
-                    }
-                    className={`py-0.5 rounded border text-[9px] ${
-                      strip.mode === "full"
-                        ? "bg-ember text-frost border-ember font-semibold"
-                        : "bg-pitch text-mist border-steel"
-                    }`}
-                  >
-                    Full
-                  </button>
-                  <button
-                    type="button"
-                    data-testid={`mixer-excl-full-${grp.id}`}
-                    aria-pressed={strip.mode === "exclusive_full"}
-                    onClick={() =>
-                      updateGroupMixerStrip(grp.id, {
-                        mode:
-                          strip.mode === "exclusive_full"
-                            ? "normal"
-                            : "exclusive_full",
-                      })
-                    }
-                    className={`py-0.5 rounded border text-[9px] ${
-                      strip.mode === "exclusive_full"
-                        ? "bg-cobalt text-frost border-cobalt font-semibold"
-                        : "bg-pitch text-mist border-steel"
-                    }`}
-                  >
-                    Excl
-                  </button>
-                  <button
-                    type="button"
-                    data-testid={`mixer-blackout-${grp.id}`}
-                    aria-pressed={strip.mode === "blackout"}
-                    onClick={() =>
-                      updateGroupMixerStrip(grp.id, {
-                        mode:
-                          strip.mode === "blackout" ? "normal" : "blackout",
-                      })
-                    }
-                    className={`py-0.5 rounded border text-[9px] ${
-                      strip.mode === "blackout"
-                        ? "bg-signal text-frost border-signal font-semibold"
-                        : "bg-pitch text-mist border-steel"
-                    }`}
-                  >
-                    BO
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-2 gap-1">
-                  <button
-                    type="button"
-                    data-testid={`mixer-flash-${grp.id}`}
-                    onPointerDown={() =>
-                      updateGroupMixerStrip(grp.id, { flashActive: true })
-                    }
-                    onPointerUp={() =>
-                      updateGroupMixerStrip(grp.id, { flashActive: false })
-                    }
-                    onPointerLeave={() => {
-                      if (strip.flashActive) {
-                        updateGroupMixerStrip(grp.id, { flashActive: false });
-                      }
-                    }}
-                    className={`py-1 rounded border text-[9px] font-semibold ${
-                      strip.flashActive
-                        ? "bg-amber-400 text-void border-amber-300"
-                        : "bg-amber-500/20 text-amber-300 border-amber-500/60"
-                    }`}
-                  >
-                    ⚡ Flash
-                  </button>
-                  <button
-                    type="button"
-                    data-testid={`mixer-excl-flash-${grp.id}`}
-                    onPointerDown={() =>
-                      updateGroupMixerStrip(grp.id, {
-                        exclusiveFlashActive: true,
-                      })
-                    }
-                    onPointerUp={() =>
-                      updateGroupMixerStrip(grp.id, {
-                        exclusiveFlashActive: false,
-                      })
-                    }
-                    onPointerLeave={() => {
-                      if (strip.exclusiveFlashActive) {
-                        updateGroupMixerStrip(grp.id, {
-                          exclusiveFlashActive: false,
-                        });
-                      }
-                    }}
-                    className={`py-1 rounded border text-[9px] font-semibold ${
-                      strip.exclusiveFlashActive
-                        ? "bg-amber-400 text-void border-amber-300"
-                        : "bg-plum/20 text-mist border-plum/60"
-                    }`}
-                  >
-                    ⚡ Excl
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </section>
-      ) : (
-        <div className="flex-1 min-h-0 flex items-stretch overflow-hidden">
+      {/* BODY: EDIT Trait Dock */}
+      <div className="flex-1 min-h-0 flex items-stretch overflow-hidden">
           {/* Left Vertical Trait Category Rail (Moving Lights omitted) */}
           <nav
             aria-label="Trait Categories"
@@ -2180,7 +1923,6 @@ export function PalettesAndControls({
             )}
           </div>
         </div>
-      )}
 
       {/* Hidden Accessibility Bridge for Palette Usage Count & Slice 4/5 Compatibility */}
       <div className="sr-only" data-testid="scene-live-cell-preview">

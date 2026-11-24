@@ -5,6 +5,7 @@ import { BottomNavBar } from "./components/BottomNavBar";
 import { DmxMonitor } from "./components/DmxMonitor";
 import { FixtureBuilder } from "./components/FixtureBuilder";
 import { JitterHistogram } from "./components/JitterHistogram";
+import { MissingAudioModal } from "./components/MissingAudioModal";
 import { PatchView } from "./components/PatchView";
 import { StudioWorkspace } from "./components/StudioWorkspace";
 import { TopStatusBar } from "./components/TopStatusBar";
@@ -14,10 +15,10 @@ export function App() {
   const activeTab = useTaktStore((s) => s.activeTab);
   const histogramOpen = useTaktStore((s) => s.histogramOpen);
   const initEngineConnection = useTaktStore((s) => s.initEngineConnection);
-  const isDirty = useTaktStore((s) => s.isDirty);
   const closePromptOpen = useTaktStore((s) => s.closePromptOpen);
-  const setClosePromptOpen = useTaktStore((s) => s.setClosePromptOpen);
-  const saveProjectToFile = useTaktStore((s) => s.saveProjectToFile);
+  const pendingUnsavedAction = useTaktStore((s) => s.pendingUnsavedAction);
+  const cancelUnsavedAction = useTaktStore((s) => s.cancelUnsavedAction);
+  const confirmUnsavedAction = useTaktStore((s) => s.confirmUnsavedAction);
 
   useEffect(() => {
     const disconnect = initEngineConnection();
@@ -36,6 +37,35 @@ export function App() {
   }, [initEngineConnection]);
 
   useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === "TEXTAREA" || target.isContentEditable) {
+          return;
+        }
+        if (tag === "INPUT") {
+          const inputType = ((target as HTMLInputElement).type || "text").toLowerCase();
+          if (
+            inputType === "text" ||
+            inputType === "number" ||
+            inputType === "search" ||
+            inputType === "url" ||
+            inputType === "email" ||
+            inputType === "password" ||
+            inputType === "tel"
+          ) {
+            return;
+          }
+        }
+      }
+      e.preventDefault();
+    };
+    window.addEventListener("contextmenu", onContextMenu);
+    return () => window.removeEventListener("contextmenu", onContextMenu);
+  }, []);
+
+  useEffect(() => {
     if (!isTauriEnvironment()) return;
     let unlisten: (() => void) | null = null;
     let cancelled = false;
@@ -45,7 +75,9 @@ export function App() {
         const fn = await win.onCloseRequested((event) => {
           if (useTaktStore.getState().isDirty) {
             event.preventDefault();
-            useTaktStore.getState().setClosePromptOpen(true);
+            void useTaktStore
+              .getState()
+              .requestProjectAction({ type: "close_window" });
           }
         });
         if (cancelled) {
@@ -74,15 +106,21 @@ export function App() {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, []);
 
-  const forceCloseWindow = async () => {
-    if (isTauriEnvironment()) {
-      try {
-        await getCurrentWindow().destroy();
-      } catch {
-        // Ignore in tests
-      }
-    }
-  };
+  const unsavedActionType = pendingUnsavedAction?.type ?? "close_window";
+  const unsavedPromptBody =
+    unsavedActionType === "new_project"
+      ? "You have unsaved changes in your current project. Do you want to save before creating a new project?"
+      : unsavedActionType === "open_project" || unsavedActionType === "open_recent"
+        ? "You have unsaved changes in your current project. Do you want to save before opening another project?"
+        : unsavedActionType === "close_project"
+          ? "You have unsaved changes in your current project. Do you want to save before closing this project?"
+          : "You have unsaved changes in your current project. Do you want to save before closing?";
+  const unsavedSaveLabel =
+    unsavedActionType === "new_project"
+      ? "Save & New"
+      : unsavedActionType === "open_project" || unsavedActionType === "open_recent"
+        ? "Save & Open"
+        : "Save & Close";
 
   const isStudio =
     activeTab === "studio" ||
@@ -118,6 +156,7 @@ export function App() {
         {activeTab === "fixtures" && <FixtureBuilder />}
       </main>
       <BottomNavBar />
+      <MissingAudioModal />
 
       {closePromptOpen && (
         <div
@@ -131,13 +170,12 @@ export function App() {
               Unsaved Show Changes
             </h2>
             <p className="text-xs text-mist leading-relaxed">
-              You have unsaved changes in your current project
-              {isDirty ? "" : ""}. Do you want to save before closing?
+              {unsavedPromptBody}
             </p>
             <div className="flex items-center justify-end gap-2 pt-1">
               <button
                 type="button"
-                onClick={() => setClosePromptOpen(false)}
+                onClick={() => cancelUnsavedAction()}
                 className="px-3 py-1.5 rounded border border-steel bg-ink text-xs font-mono text-mist hover:border-fog"
               >
                 Cancel
@@ -145,8 +183,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => {
-                  setClosePromptOpen(false);
-                  void forceCloseWindow();
+                  void confirmUnsavedAction(false);
                 }}
                 className="px-3 py-1.5 rounded border border-signal/70 bg-signal/20 text-xs font-mono text-frost hover:bg-signal/35"
               >
@@ -155,17 +192,11 @@ export function App() {
               <button
                 type="button"
                 onClick={() => {
-                  void (async () => {
-                    const saved = await saveProjectToFile();
-                    if (saved) {
-                      setClosePromptOpen(false);
-                      await forceCloseWindow();
-                    }
-                  })();
+                  void confirmUnsavedAction(true);
                 }}
                 className="px-3 py-1.5 rounded bg-ember hover:bg-burnt text-xs font-mono font-semibold text-frost"
               >
-                Save &amp; Close
+                {unsavedSaveLabel}
               </button>
             </div>
           </div>

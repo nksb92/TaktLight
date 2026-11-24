@@ -13,6 +13,7 @@ import {
   secToGridBeats,
 } from "../lib/timelineLogic";
 import { useTaktStore } from "../store/useTaktStore";
+import { HelpTooltip } from "./HelpTooltip";
 
 export function TimelineRightInspector({
   timelineId,
@@ -35,6 +36,12 @@ export function TimelineRightInspector({
   const setTimelineProjectTransients = useTaktStore(
     (s) => s.setTimelineProjectTransients,
   );
+  const timelineShowBeats = useTaktStore((s) => s.timelineShowBeats);
+  const setTimelineShowBeats = useTaktStore((s) => s.setTimelineShowBeats);
+  const timelineShowKicks = useTaktStore((s) => s.timelineShowKicks);
+  const setTimelineShowKicks = useTaktStore((s) => s.setTimelineShowKicks);
+  const timelineShowSnares = useTaktStore((s) => s.timelineShowSnares);
+  const setTimelineShowSnares = useTaktStore((s) => s.setTimelineShowSnares);
   const latencyOffsetMs = useTaktStore((s) => s.latencyOffsetMs);
   const setLatencyOffsetMs = useTaktStore((s) => s.setLatencyOffsetMs);
   const timelinePlayheadSec = useTaktStore((s) => s.timelinePlayheadSec);
@@ -50,30 +57,18 @@ export function TimelineRightInspector({
   );
 
   const resolvedClip = useMemo(() => {
-    if (!currentTimeline) return null;
-    if (selectedTimelineClip) {
-      const trk = currentTimeline.tracks.find(
-        (t) => t.id === selectedTimelineClip.trackId,
-      );
-      const clip = trk?.clips[selectedTimelineClip.clipIndex];
-      if (trk && clip) {
-        return {
-          trackId: trk.id,
-          clipIndex: selectedTimelineClip.clipIndex,
-          track: trk,
-          clip,
-        };
-      }
-    }
-    for (const trk of currentTimeline.tracks) {
-      if (trk.clips.length > 0) {
-        return {
-          trackId: trk.id,
-          clipIndex: 0,
-          track: trk,
-          clip: trk.clips[0],
-        };
-      }
+    if (!currentTimeline || !selectedTimelineClip) return null;
+    const trk = currentTimeline.tracks.find(
+      (t) => t.id === selectedTimelineClip.trackId,
+    );
+    const clip = trk?.clips[selectedTimelineClip.clipIndex];
+    if (trk && clip) {
+      return {
+        trackId: trk.id,
+        clipIndex: selectedTimelineClip.clipIndex,
+        track: trk,
+        clip,
+      };
     }
     return null;
   }, [currentTimeline, selectedTimelineClip]);
@@ -385,18 +380,24 @@ export function TimelineRightInspector({
                   <input
                     aria-label="Selected Clip Duration Sec"
                     type="number"
-                    min={timelineTimeUnit === "beats" ? 0.25 : 0.1}
+                    min={timelineTimeUnit === "beats" ? 1 : 0.1}
                     step={timelineTimeUnit === "beats" ? 1 : 0.05}
                     value={
                       timelineTimeUnit === "beats"
-                        ? secToDurBeats(resolvedClip.clip.duration_sec)
+                        ? Math.max(
+                            1,
+                            Math.round(
+                              secToDurBeats(resolvedClip.clip.duration_sec),
+                            ),
+                          )
                         : resolvedClip.clip.duration_sec
                     }
                     onChange={(e) => {
-                      const raw = Math.max(
-                        timelineTimeUnit === "beats" ? 0.25 : 0.1,
-                        Number(e.target.value) || 0.1,
-                      );
+                      const parsed = Number(e.target.value);
+                      const raw =
+                        timelineTimeUnit === "beats"
+                          ? Math.max(1, Math.round(parsed || 1))
+                          : Math.max(0.1, parsed || 0.1);
                       const nextSec =
                         timelineTimeUnit === "beats" ? durBeatsToSec(raw) : raw;
                       updateSelectedClip((c) => ({
@@ -674,11 +675,11 @@ export function TimelineRightInspector({
             <span>Align Grid to Playhead</span>
           </button>
 
-          <label
-            className="flex flex-col gap-1"
-            title="Audio beat/transient detection sensitivity (0.0 = loudest hits only, 1.0 = detects softer hits)"
-          >
-            <span className="text-fog">Transient Sensitivity (0–1)</span>
+          <label className="flex flex-col gap-1">
+            <span className="text-fog flex items-center gap-1">
+              <span>Transient Sensitivity (0–1)</span>
+              <HelpTooltip text="Audio beat/transient detection threshold (0.0 = loudest peaks only, 1.0 = detects softer hits). Re-run Analyze Audio to apply." />
+            </span>
             <input
               aria-label="Transient Sensitivity"
               type="number"
@@ -693,11 +694,11 @@ export function TimelineRightInspector({
             />
           </label>
 
-          <label
-            className="flex flex-col gap-1"
-            title="Compensates for audio output vs DMX latency in milliseconds (-500 to +500 ms)"
-          >
-            <span className="text-fog">Audio Latency Offset (ms)</span>
+          <label className="flex flex-col gap-1">
+            <span className="text-fog flex items-center gap-1">
+              <span>Audio Latency Offset (ms)</span>
+              <HelpTooltip text="Compensates for audio output vs DMX network latency (-500 to +500 ms)." />
+            </span>
             <input
               aria-label="Latency Offset Ms"
               type="number"
@@ -711,6 +712,36 @@ export function TimelineRightInspector({
               className="bg-ink border border-steel rounded px-2 py-1 text-xs text-frost"
             />
           </label>
+
+          <div className="grid grid-cols-3 gap-1">
+            <label className="flex items-center gap-1 px-1.5 py-1 rounded bg-pitch border border-steel text-mist cursor-pointer">
+              <input
+                type="checkbox"
+                checked={timelineShowBeats}
+                onChange={(e) => setTimelineShowBeats(e.target.checked)}
+                className="accent-frost"
+              />
+              <span>Beats</span>
+            </label>
+            <label className="flex items-center gap-1 px-1.5 py-1 rounded bg-pitch border border-steel text-amber-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={timelineShowKicks}
+                onChange={(e) => setTimelineShowKicks(e.target.checked)}
+                className="accent-amber-400"
+              />
+              <span>Kicks</span>
+            </label>
+            <label className="flex items-center gap-1 px-1.5 py-1 rounded bg-pitch border border-steel text-cyan-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={timelineShowSnares}
+                onChange={(e) => setTimelineShowSnares(e.target.checked)}
+                className="accent-cyan-400"
+              />
+              <span>Snares</span>
+            </label>
+          </div>
 
           <label
             className="flex items-center gap-2 px-2 py-1 rounded bg-pitch border border-steel text-mist cursor-pointer"
@@ -728,7 +759,7 @@ export function TimelineRightInspector({
 
           <label
             className="flex items-center gap-2 px-2 py-1 rounded bg-pitch border border-steel text-mist cursor-pointer"
-            title="Project detected music kick and snare transient markers vertically across all lighting tracks (also enables transient snapping)"
+            title="Project enabled Kick and Snare transient markers vertically across all lighting tracks"
           >
             <input
               type="checkbox"

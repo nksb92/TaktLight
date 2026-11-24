@@ -13,12 +13,14 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { OrderRuleStr } from "../lib/patchLogic";
-import { useTaktStore } from "../store/useTaktStore";
+import { DEFAULT_STUDIO_LAYOUT, useTaktStore } from "../store/useTaktStore";
 import { FixtureGrid2D } from "./FixtureGrid2D";
+import { HelpTooltip } from "./HelpTooltip";
 import { PalettesAndControls } from "./PalettesAndControls";
 import { SceneAndFxManager } from "./SceneAndFxManager";
+import { SplitHandle } from "./SplitHandle";
 import { TimelineEditor } from "./TimelineEditor";
 
 function slugGroupId(name: string, existingIds: string[]): string {
@@ -38,7 +40,6 @@ export function StudioWorkspace() {
   const showState = useTaktStore((s) => s.showState);
   const canUndo = useTaktStore((s) => s.canUndo);
   const canRedo = useTaktStore((s) => s.canRedo);
-  const studioSubMode = useTaktStore((s) => s.studioSubMode);
   const mappingOverlayMode = useTaktStore((s) => s.mappingOverlayMode);
   const selectedMappingTarget = useTaktStore((s) => s.selectedMappingTarget);
   const keyBindings = useTaktStore((s) => s.keyBindings);
@@ -67,10 +68,17 @@ export function StudioWorkspace() {
   const releaseAllScenes = useTaktStore((s) => s.releaseAllScenes);
   const setLiveBpm = useTaktStore((s) => s.setLiveBpm);
   const tapTempo = useTaktStore((s) => s.tapTempo);
+  const studioLayout = useTaktStore((s) => s.studioLayout);
+  const setStudioLayout = useTaktStore((s) => s.setStudioLayout);
 
-  const [showInspector, setShowInspector] = useState(true);
-  const [showBottomDock, setShowBottomDock] = useState(true);
-  const [timelineExpanded, setTimelineExpanded] = useState(false);
+  const showInspector = studioLayout.showInspector;
+  const showBottomDock = studioLayout.showBottomDock;
+  const timelineExpanded = studioLayout.timelineExpanded;
+
+  const workspaceContainerRef = useRef<HTMLDivElement | null>(null);
+  const bottomSplitRef = useRef<HTMLDivElement | null>(null);
+  const expandedUpperRef = useRef<HTMLDivElement | null>(null);
+
   const [groupName, setGroupName] = useState("Stage Front");
   const [groupOrder, setGroupOrder] = useState<OrderRuleStr>("center_out");
   const [groupTargets, setGroupTargets] = useState(
@@ -171,11 +179,13 @@ export function StudioWorkspace() {
     showState.scenes[0] ??
     null;
   const isTimelineScene = Boolean(activeScene?.timeline_ref);
-  const isTimelineFullWidth =
-    studioSubMode !== "live_busking" && isTimelineScene && timelineExpanded;
+  const isTimelineFullWidth = isTimelineScene && timelineExpanded;
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col gap-1.5">
+    <div
+      ref={workspaceContainerRef}
+      className="flex-1 min-h-0 flex flex-col gap-1.5"
+    >
       {/* Slim Daslight Control Header Strip */}
       <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 bg-slate-dark border border-steel rounded px-2.5 py-1">
         <div className="flex flex-wrap items-center gap-2">
@@ -308,34 +318,40 @@ export function StudioWorkspace() {
 
           {/* Daslight Pane Visibility Toggles */}
           <div className="flex items-center gap-0.5 pl-1.5 border-l border-steel/60">
-            <button
-              type="button"
-              data-testid="toggle-bottom-dock-btn"
-              aria-pressed={showBottomDock}
-              onClick={() => setShowBottomDock((v) => !v)}
-              title="Toggle 2D Grid & Trait Dock"
-              className={`p-1 rounded border transition-colors ${
-                showBottomDock
-                  ? "bg-ink border-ember text-frost"
-                  : "bg-pitch border-steel text-fog hover:text-mist"
-              }`}
-            >
-              <PanelBottom className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              data-testid="toggle-right-inspector-btn"
-              aria-pressed={showInspector}
-              onClick={() => setShowInspector((v) => !v)}
-              title="Toggle Scene FX Inspector"
-              className={`p-1 rounded border transition-colors ${
-                showInspector
-                  ? "bg-ink border-ember text-frost"
-                  : "bg-pitch border-steel text-fog hover:text-mist"
-              }`}
-            >
-              <PanelRight className="w-3.5 h-3.5" />
-            </button>
+            <HelpTooltip text="Toggle Bottom Dock (2D Grid & Controls / Timeline)">
+              <button
+                type="button"
+                data-testid="toggle-bottom-dock-btn"
+                aria-pressed={showBottomDock}
+                onClick={() =>
+                  setStudioLayout({ showBottomDock: !showBottomDock })
+                }
+                className={`p-1 rounded border transition-colors ${
+                  showBottomDock
+                    ? "bg-ink border-ember text-frost"
+                    : "bg-pitch border-steel text-fog hover:text-mist"
+                }`}
+              >
+                <PanelBottom className="w-3.5 h-3.5" />
+              </button>
+            </HelpTooltip>
+            <HelpTooltip text="Toggle Right Scene FX Inspector">
+              <button
+                type="button"
+                data-testid="toggle-right-inspector-btn"
+                aria-pressed={showInspector}
+                onClick={() =>
+                  setStudioLayout({ showInspector: !showInspector })
+                }
+                className={`p-1 rounded border transition-colors ${
+                  showInspector
+                    ? "bg-ink border-ember text-frost"
+                    : "bg-pitch border-steel text-fog hover:text-mist"
+                }`}
+              >
+                <PanelRight className="w-3.5 h-3.5" />
+              </button>
+            </HelpTooltip>
           </div>
         </div>
       </div>
@@ -374,8 +390,14 @@ export function StudioWorkspace() {
 
       {/* Upper Daslight Split: When Timeline is expanded full-width, show Scene Library + 2D Grid side-by-side; otherwise Banks & Scenes + FX Inspector */}
       {isTimelineFullWidth ? (
-        <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-1.5">
-          <div className="lg:col-span-6 min-h-0 flex flex-col">
+        <div
+          ref={expandedUpperRef}
+          className="flex-1 min-h-0 flex flex-col lg:flex-row gap-1.5 lg:gap-0"
+        >
+          <div
+            style={{ width: `${studioLayout.expandedUpperSplitPct}%` }}
+            className="min-h-0 min-w-0 flex flex-col max-lg:!w-full"
+          >
             <SceneAndFxManager
               hideUndoRedo
               daslightUpper
@@ -383,7 +405,27 @@ export function StudioWorkspace() {
               liveBuskingMode={false}
             />
           </div>
-          <div className="lg:col-span-6 min-h-0">
+          <SplitHandle
+            orientation="vertical"
+            testId="split-expanded-upper"
+            ariaLabel="Resize Scene Library and 2D Grid"
+            className="hidden lg:flex"
+            onDragDelta={(deltaPx) => {
+              const totalW = expandedUpperRef.current?.clientWidth || 1200;
+              const deltaPct = (deltaPx / Math.max(300, totalW)) * 100;
+              setStudioLayout({
+                expandedUpperSplitPct:
+                  useTaktStore.getState().studioLayout.expandedUpperSplitPct +
+                  deltaPct,
+              });
+            }}
+            onDoubleClick={() =>
+              setStudioLayout({
+                expandedUpperSplitPct: DEFAULT_STUDIO_LAYOUT.expandedUpperSplitPct,
+              })
+            }
+          />
+          <div className="flex-1 min-h-0 min-w-0">
             <FixtureGrid2D hideUndoRedo compact />
           </div>
         </div>
@@ -393,9 +435,30 @@ export function StudioWorkspace() {
             hideUndoRedo
             daslightUpper
             showInspector={showInspector}
-            liveBuskingMode={studioSubMode === "live_busking"}
+            liveBuskingMode={false}
           />
         </div>
+      )}
+
+      {showBottomDock && (
+        <SplitHandle
+          orientation="horizontal"
+          testId="split-studio-vertical"
+          ariaLabel="Resize upper and bottom workspace height"
+          onDragDelta={(deltaPx) => {
+            const totalH = workspaceContainerRef.current?.clientHeight || 720;
+            const deltaPct = (deltaPx / Math.max(300, totalH)) * 100;
+            setStudioLayout({
+              bottomDockPct:
+                useTaktStore.getState().studioLayout.bottomDockPct - deltaPct,
+            });
+          }}
+          onDoubleClick={() =>
+            setStudioLayout({
+              bottomDockPct: DEFAULT_STUDIO_LAYOUT.bottomDockPct,
+            })
+          }
+        />
       )}
 
       {/* Middle Horizontal GROUPS + Bottom Dock Tab Bar */}
@@ -505,67 +568,82 @@ export function StudioWorkspace() {
           </details>
         </div>
 
-        {/* Daslight Bottom-Right Dock Tab Switcher: EDIT: <Scene> | MIXER */}
+        {/* Active Scene Edit Indicator */}
         <div className="flex items-center gap-0.5 bg-pitch border border-steel rounded p-0.5 font-mono text-[11px]">
           <button
             type="button"
             data-testid="submode-builder"
-            aria-pressed={studioSubMode === "builder"}
+            aria-pressed={true}
             onClick={() => setStudioSubMode("builder")}
-            className={`px-2.5 py-0.5 rounded transition-colors ${
-              studioSubMode === "builder"
-                ? "bg-slate text-frost font-semibold border border-steel"
-                : "text-fog hover:text-mist"
-            }`}
+            className="px-2.5 py-0.5 rounded bg-slate text-frost font-semibold border border-steel transition-colors"
           >
             EDIT: {activeScene ? activeScene.name : "Scene"}
-          </button>
-          <button
-            type="button"
-            data-testid="submode-live_busking"
-            aria-pressed={studioSubMode === "live_busking"}
-            onClick={() => setStudioSubMode("live_busking")}
-            className={`px-2.5 py-0.5 rounded transition-colors ${
-              studioSubMode === "live_busking"
-                ? "bg-pine text-frost font-semibold"
-                : "text-fog hover:text-mist"
-            }`}
-          >
-            MIXER
           </button>
         </div>
       </section>
 
-      {/* Bottom Split Dock: Full-width Expanded Timeline OR Left = 2D Grid, Right = Timeline / EDIT / MIXER */}
+      {/* Bottom Split Dock: Full-width Expanded Timeline OR Left = 2D Grid, Right = Timeline / EDIT */}
       {showBottomDock &&
         (isTimelineFullWidth ? (
           <div
             data-testid="daslight-timeline-dock"
-            className="h-[48%] min-h-[270px] shrink-0 min-h-0 overflow-y-auto"
+            style={{
+              height: `${Math.min(72, Math.max(32, studioLayout.bottomDockPct + 5))}%`,
+            }}
+            className="min-h-[240px] shrink-0 overflow-y-auto"
           >
             <TimelineEditor
               hideUndoRedo
               timelineId={activeScene?.timeline_ref ?? undefined}
               expanded={timelineExpanded}
-              onToggleExpand={() => setTimelineExpanded((v) => !v)}
+              onToggleExpand={() =>
+                setStudioLayout({ timelineExpanded: !timelineExpanded })
+              }
             />
           </div>
         ) : (
           <div
+            ref={bottomSplitRef}
             data-testid="daslight-bottom-dock"
-            className="h-[43%] min-h-[250px] shrink-0 grid grid-cols-1 lg:grid-cols-12 gap-1.5 min-h-0"
+            style={{ height: `${studioLayout.bottomDockPct}%` }}
+            className="min-h-[220px] shrink-0 flex flex-col lg:flex-row gap-1.5 lg:gap-0 min-h-0"
           >
-            <div className="lg:col-span-6 h-full min-h-0">
+            <div
+              style={{ width: `${studioLayout.bottomSplitPct}%` }}
+              className="h-full min-h-0 min-w-0 max-lg:!w-full"
+            >
               <FixtureGrid2D hideUndoRedo compact />
             </div>
-            <div className="lg:col-span-6 h-full min-h-0 overflow-y-auto">
-              {studioSubMode !== "live_busking" && isTimelineScene ? (
+            <SplitHandle
+              orientation="vertical"
+              testId="split-bottom-dock-horizontal"
+              ariaLabel="Resize 2D Grid and Controls or Timeline"
+              className="hidden lg:flex"
+              onDragDelta={(deltaPx) => {
+                const totalW = bottomSplitRef.current?.clientWidth || 1200;
+                const deltaPct = (deltaPx / Math.max(300, totalW)) * 100;
+                setStudioLayout({
+                  bottomSplitPct:
+                    useTaktStore.getState().studioLayout.bottomSplitPct +
+                    deltaPct,
+                });
+              }}
+              onDoubleClick={() =>
+                setStudioLayout({
+                  bottomSplitPct: DEFAULT_STUDIO_LAYOUT.bottomSplitPct,
+                })
+              }
+            />
+            <div className="flex-1 h-full min-h-0 min-w-0 overflow-y-auto">
+              {isTimelineScene ? (
                 <div data-testid="daslight-timeline-dock" className="h-full min-h-0">
                   <TimelineEditor
                     hideUndoRedo
                     timelineId={activeScene?.timeline_ref ?? undefined}
                     expanded={timelineExpanded}
-                    onToggleExpand={() => setTimelineExpanded((v) => !v)}
+                    onToggleExpand={() =>
+                      setStudioLayout({ timelineExpanded: !timelineExpanded })
+                    }
                   />
                 </div>
               ) : (
@@ -573,7 +651,6 @@ export function StudioWorkspace() {
                   hideUndoRedo
                   hideGroups
                   daslightDock
-                  forceLiveMixer={studioSubMode === "live_busking"}
                 />
               )}
             </div>

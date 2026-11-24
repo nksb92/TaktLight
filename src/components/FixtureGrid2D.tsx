@@ -11,13 +11,13 @@ import {
 } from "lucide-react";
 import { type PointerEvent, type WheelEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  computeTargetGizmoBounds,
   DEFAULT_COLOR_PALETTES,
   evaluateSpatialShader2DPhase,
   getPaletteColors,
   linearRgbToSrgbHex,
-  patternScaleToSpatialFreq,
+  resolveGizmoHalfExtents,
   sampleOklabStopsLinear,
-  spatialFreqToPatternScale,
 } from "../lib/mixerLogic";
 import {
   computeOrderU,
@@ -27,12 +27,46 @@ import {
 } from "../lib/patchLogic";
 import { registerCanvasGeometry } from "../lib/testBridge";
 import { type CellSelectionPattern, useTaktStore } from "../store/useTaktStore";
+import { HelpTooltip } from "./HelpTooltip";
 import { NumericSlider } from "./NumericSlider";
 
 const CANVAS_WIDTH = 840;
 const CANVAS_HEIGHT = 480;
 const VIEW_FIT = 0.84;
 const ROTATION_HANDLE_NORM_RADIUS = 0.115;
+
+const GRID_SNAP_PRESETS: Array<{ value: number; label: string }> = [
+  { value: 0.01, label: "1% (Fine)" },
+  { value: 0.025, label: "2.5%" },
+  { value: 0.05, label: "5%" },
+  { value: 0.1, label: "10%" },
+  { value: 0.2, label: "20% (Coarse)" },
+];
+
+/**
+ * Compute the rendered bitmap rectangle inside an `object-contain` canvas so
+ * pointer coordinates and geometry exports match the visible pixels.
+ */
+function getCanvasContentRect(canvas: HTMLCanvasElement): {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+} {
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+  }
+  const scale = Math.min(rect.width / CANVAS_WIDTH, rect.height / CANVAS_HEIGHT);
+  const width = CANVAS_WIDTH * scale;
+  const height = CANVAS_HEIGHT * scale;
+  return {
+    left: rect.left + (rect.width - width) * 0.5,
+    top: rect.top + (rect.height - height) * 0.5,
+    width,
+    height,
+  };
+}
 
 const PATTERN_FILTERS: Array<{
   pattern: CellSelectionPattern;
@@ -85,6 +119,13 @@ export function FixtureGrid2D({
   const applyCellSelectionPattern = useTaktStore(
     (s) => s.applyCellSelectionPattern,
   );
+  const setSelectedCellIndices = useTaktStore(
+    (s) => s.setSelectedCellIndices,
+  );
+  const toggleCellSelection = useTaktStore((s) => s.toggleCellSelection);
+  const clearSelections = useTaktStore((s) => s.clearSelections);
+  const gizmoAutoFit = useTaktStore((s) => s.gizmoAutoFit);
+  const setGizmoAutoFit = useTaktStore((s) => s.setGizmoAutoFit);
   const setCanvasOrderRule = useTaktStore((s) => s.setCanvasOrderRule);
   const undoShow = useTaktStore((s) => s.undoShow);
   const redoShow = useTaktStore((s) => s.redoShow);
@@ -93,6 +134,10 @@ export function FixtureGrid2D({
   const [zoom, setZoom] = useState<number>(1.0);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [snapToGrid, setSnapToGrid] = useState<boolean>(true);
+  const [snapStep, setSnapStep] = useState<number>(0.05);
+  const [selectionMode, setSelectionMode] = useState<"fixtures" | "cells">(
+    "fixtures",
+  );
   const [shaderGizmoActive, setShaderGizmoActive] = useState<boolean>(false);
   const [quickGroupName, setQuickGroupName] = useState<string>("Stage Group");
   const [dragRenderTick, setDragRenderTick] = useState<number>(0);
@@ -110,11 +155,15 @@ export function FixtureGrid2D({
     centerY: number;
     directionDeg: number;
     spatialFreq: number;
+    boxHalfX: number;
+    boxHalfY: number;
   }>({
     centerX: 0.5,
     centerY: 0.5,
     directionDeg: 45,
     spatialFreq: 1.0,
+    boxHalfX: 0.2,
+    boxHalfY: 0.2,
   });
 
   const [dragState, setDragState] = useState<
@@ -130,25 +179,32 @@ export function FixtureGrid2D({
         startPan: { x: number; y: number };
       }
     | { mode: "marquee"; startPos: { x: number; y: number } }
-    | { mode: "shader_center" | "shader_angle" | "shader_scale" }
+    | {
+        mode:
+          | "shader_center"
+          | "shader_angle"
+          | "shader_scale"
+          | "shader_scale_x"
+          | "shader_scale_y";
+      }
     | null
   >(null);
 
   const activeShaderBlock = useMemo(() => {
     const hasShader = (b: { elements: { kind: string }[] } | undefined | null) =>
       Boolean(b && b.elements.some((el) => el.kind === "spatial_shader_2d"));
-    if (activeShaderGizmoBlockId) {
-      const found = showState.fx_library.find(
-        (b) => b.id === activeShaderGizmoBlockId,
-      );
-      if (hasShader(found)) return found!;
-    }
     if (selectedSceneId) {
       const selScene = showState.scenes.find((s) => s.id === selectedSceneId);
       for (const refId of selScene?.block_refs ?? []) {
         const blk = showState.fx_library.find((b) => b.id === refId);
         if (hasShader(blk)) return blk!;
       }
+    }
+    if (activeShaderGizmoBlockId) {
+      const found = showState.fx_library.find(
+        (b) => b.id === activeShaderGizmoBlockId,
+      );
+      if (hasShader(found)) return found!;
     }
     for (const inst of activeScenes) {
       const actScene = showState.scenes.find((s) => s.id === inst.scene_id);
@@ -176,11 +232,18 @@ export function FixtureGrid2D({
       (el) => el.kind === "spatial_shader_2d",
     );
     if (shaderEl && shaderEl.kind === "spatial_shader_2d") {
+      const [boxHalfX, boxHalfY] = resolveGizmoHalfExtents(
+        shaderEl.spatial_freq,
+        shaderEl.box_half_x,
+        shaderEl.box_half_y,
+      );
       setGizmoState({
         centerX: shaderEl.center_x,
         centerY: shaderEl.center_y,
         directionDeg: shaderEl.direction_deg,
         spatialFreq: shaderEl.spatial_freq,
+        boxHalfX,
+        boxHalfY,
       });
       if (activeShaderBlock && lastAutoGizmoBlockIdRef.current !== activeShaderBlock.id) {
         lastAutoGizmoBlockIdRef.current = activeShaderBlock.id;
@@ -243,10 +306,13 @@ export function FixtureGrid2D({
     }
   }, [fixtureDetailsCache, hasCustomTargetRef, selectedFixture]);
 
-  const toScreenPx = (nx: number, ny: number, w: number, h: number) => ({
-    sx: ((nx - 0.5 - pan.x) * zoom * VIEW_FIT + 0.5) * w,
-    sy: ((ny - 0.5 - pan.y) * zoom * VIEW_FIT + 0.5) * h,
-  });
+  const toScreenPx = (nx: number, ny: number, w: number, h: number) => {
+    const unit = Math.min(w, h) * zoom * VIEW_FIT;
+    return {
+      sx: (nx - 0.5 - pan.x) * unit + w * 0.5,
+      sy: (ny - 0.5 - pan.y) * unit + h * 0.5,
+    };
+  };
 
   const activeGroupCellKeys = useMemo(() => {
     const keys = new Set<string>();
@@ -356,18 +422,34 @@ export function FixtureGrid2D({
     ctx.fillStyle = "#0A0F18";
     ctx.fillRect(0, 0, w, h);
 
-    // Extended 0.1-step grid including negative & >1 space
+    // Background grid scaled to snapStep (auto-coarsened if lines would be < 6px apart)
+    const unitPx = Math.min(w, h) * zoom * VIEW_FIT;
+    let gridStep = snapStep;
+    while (gridStep * unitPx < 6) {
+      gridStep *= 2;
+    }
+    const minNx = (0 - w * 0.5) / unitPx + 0.5 + pan.x;
+    const maxNx = (w - w * 0.5) / unitPx + 0.5 + pan.x;
+    const minNy = (0 - h * 0.5) / unitPx + 0.5 + pan.y;
+    const maxNy = (h - h * 0.5) / unitPx + 0.5 + pan.y;
+    const startIx = Math.floor(minNx / gridStep);
+    const endIx = Math.ceil(maxNx / gridStep);
+    const startIy = Math.floor(minNy / gridStep);
+    const endIy = Math.ceil(maxNy / gridStep);
+
     ctx.strokeStyle = "#162030";
     ctx.lineWidth = 1;
-    for (let i = -20; i <= 30; i++) {
-      const pX = toScreenPx(i / 10, 0, w, h).sx;
-      const pY = toScreenPx(0, i / 10, w, h).sy;
+    for (let i = startIx; i <= endIx; i++) {
+      const pX = toScreenPx(i * gridStep, 0, w, h).sx;
       if (pX >= 0 && pX <= w) {
         ctx.beginPath();
         ctx.moveTo(pX, 0);
         ctx.lineTo(pX, h);
         ctx.stroke();
       }
+    }
+    for (let i = startIy; i <= endIy; i++) {
+      const pY = toScreenPx(0, i * gridStep, w, h).sy;
       if (pY >= 0 && pY <= h) {
         ctx.beginPath();
         ctx.moveTo(0, pY);
@@ -409,11 +491,10 @@ export function FixtureGrid2D({
         (el) => el.kind === "spatial_shader_2d",
       );
       if (shaderEl && shaderEl.kind === "spatial_shader_2d") {
-        const patternScale = spatialFreqToPatternScale(gizmoState.spatialFreq);
-        const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
-        const minNx = gizmoState.centerX - boxHalfNorm;
-        const minNy = gizmoState.centerY - boxHalfNorm;
-        const boxSpan = boxHalfNorm * 2;
+        const minNx = gizmoState.centerX - gizmoState.boxHalfX;
+        const minNy = gizmoState.centerY - gizmoState.boxHalfY;
+        const boxSpanX = gizmoState.boxHalfX * 2;
+        const boxSpanY = gizmoState.boxHalfY * 2;
         const gridRes = 18;
         const activePal = showState.color_palettes.find(
           (p) => p.id === shaderEl.palette_ref,
@@ -427,20 +508,31 @@ export function FixtureGrid2D({
         const isColor = shaderEl.trait === "color";
         const nowSec = performance.now() / 1000;
         const bpm = showState.bpm || 120;
-        const rateBeats = shaderEl.rate_beats ?? 4;
-        const basePhaseCycles =
-          shaderEl.speed_hz && shaderEl.speed_hz > 0
-            ? nowSec * shaderEl.speed_hz
-            : ((nowSec * bpm) / 60) / Math.max(0.1, rateBeats);
+        const phaseOffset = shaderEl.phase_offset ?? 0;
+        let basePhaseCycles: number;
+        if (shaderEl.speed_hz && shaderEl.speed_hz > 0) {
+          basePhaseCycles = nowSec * shaderEl.speed_hz + phaseOffset;
+        } else if (shaderEl.rate_beats && shaderEl.rate_beats > 0) {
+          basePhaseCycles =
+            ((nowSec * bpm) / 60) / Math.max(0.1, shaderEl.rate_beats) +
+            phaseOffset;
+        } else if (shaderEl.rate_cycles === 0) {
+          basePhaseCycles = phaseOffset;
+        } else {
+          const durBeats = Math.max(0.05, activeShaderBlock.duration_beats || 4);
+          basePhaseCycles =
+            (((nowSec * bpm) / 60) / durBeats) * (shaderEl.rate_cycles ?? 1) +
+            phaseOffset;
+        }
 
         ctx.save();
         ctx.globalAlpha = 0.34;
         for (let gy = 0; gy < gridRes; gy++) {
           for (let gx = 0; gx < gridRes; gx++) {
-            const nx0 = minNx + (gx / gridRes) * boxSpan;
-            const ny0 = minNy + (gy / gridRes) * boxSpan;
-            const nx1 = minNx + ((gx + 1) / gridRes) * boxSpan;
-            const ny1 = minNy + ((gy + 1) / gridRes) * boxSpan;
+            const nx0 = minNx + (gx / gridRes) * boxSpanX;
+            const ny0 = minNy + (gy / gridRes) * boxSpanY;
+            const nx1 = minNx + ((gx + 1) / gridRes) * boxSpanX;
+            const ny1 = minNy + ((gy + 1) / gridRes) * boxSpanY;
             const sampleNx = (nx0 + nx1) * 0.5;
             const sampleNy = (ny0 + ny1) * 0.5;
             const s = evaluateSpatialShader2DPhase({
@@ -626,10 +718,9 @@ export function FixtureGrid2D({
 
       if (isPrimary) {
         const rad = (effPos.rotation * Math.PI) / 180;
-        const hx =
-          fxX + Math.cos(rad) * (ROTATION_HANDLE_NORM_RADIUS * zoom * VIEW_FIT * w);
-        const hy =
-          fxY + Math.sin(rad) * (ROTATION_HANDLE_NORM_RADIUS * zoom * VIEW_FIT * h);
+        const unit = Math.min(w, h) * zoom * VIEW_FIT;
+        const hx = fxX + Math.cos(rad) * (ROTATION_HANDLE_NORM_RADIUS * unit);
+        const hy = fxY + Math.sin(rad) * (ROTATION_HANDLE_NORM_RADIUS * unit);
         ctx.strokeStyle = "#FF5500";
         ctx.lineWidth = 1.5;
         ctx.beginPath();
@@ -667,17 +758,15 @@ export function FixtureGrid2D({
 
     // Interactive 2D Shader Gizmo
     if (shaderGizmoActive) {
-      const patternScale = spatialFreqToPatternScale(gizmoState.spatialFreq);
-      const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
       const tl = toScreenPx(
-        gizmoState.centerX - boxHalfNorm,
-        gizmoState.centerY - boxHalfNorm,
+        gizmoState.centerX - gizmoState.boxHalfX,
+        gizmoState.centerY - gizmoState.boxHalfY,
         w,
         h,
       );
       const br = toScreenPx(
-        gizmoState.centerX + boxHalfNorm,
-        gizmoState.centerY + boxHalfNorm,
+        gizmoState.centerX + gizmoState.boxHalfX,
+        gizmoState.centerY + gizmoState.boxHalfY,
         w,
         h,
       );
@@ -690,6 +779,8 @@ export function FixtureGrid2D({
       ctx.setLineDash([]);
       ctx.fillStyle = "#EC4899";
       ctx.fillRect(br.sx - 5, br.sy - 5, 10, 10);
+      ctx.fillRect(br.sx - 4, cPx.sy - 4, 8, 8);
+      ctx.fillRect(cPx.sx - 4, br.sy - 4, 8, 8);
 
       ctx.strokeStyle = "#38BDF8";
       ctx.lineWidth = 2;
@@ -730,6 +821,7 @@ export function FixtureGrid2D({
     showState.bpm,
     showState.color_palettes,
     showState.patch,
+    snapStep,
     zoom,
     pan,
     dragRenderTick,
@@ -740,21 +832,16 @@ export function FixtureGrid2D({
     registerCanvasGeometry(() => {
       const canvas = canvasRef.current;
       if (!canvas) return null;
-      const rect = canvas.getBoundingClientRect();
+      const rect = getCanvasContentRect(canvas);
       if (rect.width <= 0 || rect.height <= 0) return null;
 
+      const unit = Math.min(rect.width, rect.height) * zoom * VIEW_FIT;
       const toClient = (nx: number, ny: number) => ({
         x: Number(
-          (
-            rect.left +
-            ((nx - 0.5 - pan.x) * zoom * VIEW_FIT + 0.5) * rect.width
-          ).toFixed(1),
+          (rect.left + rect.width * 0.5 + (nx - 0.5 - pan.x) * unit).toFixed(1),
         ),
         y: Number(
-          (
-            rect.top +
-            ((ny - 0.5 - pan.y) * zoom * VIEW_FIT + 0.5) * rect.height
-          ).toFixed(1),
+          (rect.top + rect.height * 0.5 + (ny - 0.5 - pan.y) * unit).toFixed(1),
         ),
       });
 
@@ -782,17 +869,16 @@ export function FixtureGrid2D({
 
       let shaderGizmo = null;
       if (shaderGizmoActive) {
-        const patternScale = spatialFreqToPatternScale(gizmoState.spatialFreq);
-        const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
         const center = toClient(gizmoState.centerX, gizmoState.centerY);
         const scaleHandle = toClient(
-          gizmoState.centerX + boxHalfNorm,
-          gizmoState.centerY + boxHalfNorm,
+          gizmoState.centerX + gizmoState.boxHalfX,
+          gizmoState.centerY + gizmoState.boxHalfY,
         );
         const angRad = (gizmoState.directionDeg * Math.PI) / 180;
+        const unitCanvas = Math.min(CANVAS_WIDTH, CANVAS_HEIGHT) * zoom * VIEW_FIT;
         const angleHandle = toClient(
-          gizmoState.centerX + (Math.cos(angRad) * 42) / (CANVAS_WIDTH * zoom),
-          gizmoState.centerY + (Math.sin(angRad) * 42) / (CANVAS_HEIGHT * zoom),
+          gizmoState.centerX + (Math.cos(angRad) * 42) / unitCanvas,
+          gizmoState.centerY + (Math.sin(angRad) * 42) / unitCanvas,
         );
         shaderGizmo = {
           active: true,
@@ -829,12 +915,11 @@ export function FixtureGrid2D({
   const toNormalizedCanvasPos = (
     e: PointerEvent<HTMLCanvasElement>,
   ): { x: number; y: number } => {
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect = getCanvasContentRect(e.currentTarget);
     if (rect.width <= 0 || rect.height <= 0) return { x: 0.5, y: 0.5 };
-    const viewX = (e.clientX - rect.left) / rect.width;
-    const viewY = (e.clientY - rect.top) / rect.height;
-    const nx = (viewX - 0.5) / (zoom * VIEW_FIT) + 0.5 + pan.x;
-    const ny = (viewY - 0.5) / (zoom * VIEW_FIT) + 0.5 + pan.y;
+    const unit = Math.min(rect.width, rect.height) * zoom * VIEW_FIT;
+    const nx = (e.clientX - (rect.left + rect.width * 0.5)) / unit + 0.5 + pan.x;
+    const ny = (e.clientY - (rect.top + rect.height * 0.5)) / unit + 0.5 + pan.y;
     return { x: Number(nx.toFixed(3)), y: Number(ny.toFixed(3)) };
   };
 
@@ -849,11 +934,85 @@ export function FixtureGrid2D({
             center_y: next.centerY,
             direction_deg: next.directionDeg,
             spatial_freq: next.spatialFreq,
+            box_half_x: next.boxHalfX,
+            box_half_y: next.boxHalfY,
           }
         : el,
     );
     void upsertFxBlock({ ...activeShaderBlock, elements: updatedElements });
   };
+
+  const fitActiveGizmoToTargets = () => {
+    if (!activeShaderBlock) return;
+    const bounds = computeTargetGizmoBounds({
+      compiledCells,
+      patch: showState.patch,
+      groups: showState.groups,
+      targetGroup: selectedScene?.target_group ?? activeShaderBlock.target_group,
+      fallbackFixtureIds: selectedFixtureIds,
+    });
+    commitShaderGizmoUpdate({
+      ...gizmoState,
+      centerX: bounds.centerX,
+      centerY: bounds.centerY,
+      boxHalfX: bounds.boxHalfX,
+      boxHalfY: bounds.boxHalfY,
+      spatialFreq: bounds.spatialFreq,
+    });
+  };
+
+  const lastPatchPosSigRef = useRef<string>("");
+  useEffect(() => {
+    const posSig = showState.patch
+      .map(
+        (f) =>
+          `${f.id}:${f.grid_pos.x.toFixed(3)},${f.grid_pos.y.toFixed(3)},${f.grid_pos.rotation.toFixed(1)},${f.grid_pos.scale_x.toFixed(3)},${f.grid_pos.scale_y.toFixed(3)}`,
+      )
+      .join("|");
+    if (!lastPatchPosSigRef.current) {
+      lastPatchPosSigRef.current = posSig;
+      return;
+    }
+    if (posSig === lastPatchPosSigRef.current) return;
+    lastPatchPosSigRef.current = posSig;
+
+    if (!gizmoAutoFit || !activeShaderBlock || dragState) return;
+    const bounds = computeTargetGizmoBounds({
+      compiledCells,
+      patch: showState.patch,
+      groups: showState.groups,
+      targetGroup: selectedScene?.target_group ?? activeShaderBlock.target_group,
+      fallbackFixtureIds: selectedFixtureIds,
+    });
+    const shaderEl = activeShaderBlock.elements.find(
+      (el) => el.kind === "spatial_shader_2d",
+    );
+    if (!shaderEl || shaderEl.kind !== "spatial_shader_2d") return;
+    const diff =
+      Math.abs(shaderEl.center_x - bounds.centerX) +
+      Math.abs(shaderEl.center_y - bounds.centerY) +
+      Math.abs((shaderEl.box_half_x ?? bounds.boxHalfX) - bounds.boxHalfX) +
+      Math.abs((shaderEl.box_half_y ?? bounds.boxHalfY) - bounds.boxHalfY);
+    if (diff > 0.004) {
+      commitShaderGizmoUpdate({
+        centerX: bounds.centerX,
+        centerY: bounds.centerY,
+        directionDeg: shaderEl.direction_deg,
+        spatialFreq: bounds.spatialFreq,
+        boxHalfX: bounds.boxHalfX,
+        boxHalfY: bounds.boxHalfY,
+      });
+    }
+  }, [
+    activeShaderBlock,
+    compiledCells,
+    dragState,
+    gizmoAutoFit,
+    selectedFixtureIds,
+    selectedScene?.target_group,
+    showState.groups,
+    showState.patch,
+  ]);
 
   const handlePointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
@@ -870,18 +1029,30 @@ export function FixtureGrid2D({
     const pos = toNormalizedCanvasPos(e);
 
     if (shaderGizmoActive) {
-      const patternScale = spatialFreqToPatternScale(gizmoState.spatialFreq);
-      const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
-      const scaleHandleX = gizmoState.centerX + boxHalfNorm;
-      const scaleHandleY = gizmoState.centerY + boxHalfNorm;
+      const scaleHandleX = gizmoState.centerX + gizmoState.boxHalfX;
+      const scaleHandleY = gizmoState.centerY + gizmoState.boxHalfY;
       const angRad = (gizmoState.directionDeg * Math.PI) / 180;
+      const unitCanvas = Math.min(CANVAS_WIDTH, CANVAS_HEIGHT) * zoom * VIEW_FIT;
       const angHandleX =
-        gizmoState.centerX + (Math.cos(angRad) * 42) / (CANVAS_WIDTH * zoom);
+        gizmoState.centerX + (Math.cos(angRad) * 42) / unitCanvas;
       const angHandleY =
-        gizmoState.centerY + (Math.sin(angRad) * 42) / (CANVAS_HEIGHT * zoom);
+        gizmoState.centerY + (Math.sin(angRad) * 42) / unitCanvas;
 
       if (Math.hypot(scaleHandleX - pos.x, scaleHandleY - pos.y) < 0.05) {
+        setGizmoAutoFit(false);
         setDragState({ mode: "shader_scale" });
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        return;
+      }
+      if (Math.hypot(scaleHandleX - pos.x, gizmoState.centerY - pos.y) < 0.05) {
+        setGizmoAutoFit(false);
+        setDragState({ mode: "shader_scale_x" });
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        return;
+      }
+      if (Math.hypot(gizmoState.centerX - pos.x, scaleHandleY - pos.y) < 0.05) {
+        setGizmoAutoFit(false);
+        setDragState({ mode: "shader_scale_y" });
         e.currentTarget.setPointerCapture?.(e.pointerId);
         return;
       }
@@ -894,10 +1065,35 @@ export function FixtureGrid2D({
         Math.hypot(gizmoState.centerX - pos.x, gizmoState.centerY - pos.y) <
         0.06
       ) {
+        setGizmoAutoFit(false);
         setDragState({ mode: "shader_center" });
         e.currentTarget.setPointerCapture?.(e.pointerId);
         return;
       }
+    }
+
+    if (selectionMode === "cells") {
+      let closestCellIdx: number | null = null;
+      let bestCellDist = 0.045;
+      compiledCells.forEach((cell, idx) => {
+        const dist = Math.hypot(
+          cell.canvas_xy[0] - pos.x,
+          cell.canvas_xy[1] - pos.y,
+        );
+        if (dist < bestCellDist) {
+          bestCellDist = dist;
+          closestCellIdx = idx;
+        }
+      });
+      if (closestCellIdx !== null) {
+        const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+        toggleCellSelection(closestCellIdx, additive);
+      } else {
+        setDragState({ mode: "marquee", startPos: pos });
+        setMarqueeRect({ x0: pos.x, y0: pos.y, x1: pos.x, y1: pos.y });
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      }
+      return;
     }
 
     if (selectedFixture) {
@@ -980,10 +1176,11 @@ export function FixtureGrid2D({
     if (!dragState) return;
 
     if (dragState.mode === "pan") {
-      const rect = e.currentTarget.getBoundingClientRect();
+      const rect = getCanvasContentRect(e.currentTarget);
       if (rect.width > 0 && rect.height > 0) {
-        const dxNorm = (e.clientX - dragState.startClient.x) / (rect.width * zoom * VIEW_FIT);
-        const dyNorm = (e.clientY - dragState.startClient.y) / (rect.height * zoom * VIEW_FIT);
+        const unit = Math.min(rect.width, rect.height) * zoom * VIEW_FIT;
+        const dxNorm = (e.clientX - dragState.startClient.x) / unit;
+        const dyNorm = (e.clientY - dragState.startClient.y) / unit;
         setPan({
           x: Number((dragState.startPan.x - dxNorm).toFixed(3)),
           y: Number((dragState.startPan.y - dyNorm).toFixed(3)),
@@ -1006,6 +1203,21 @@ export function FixtureGrid2D({
       const maxX = Math.max(rect.x0, rect.x1);
       const minY = Math.min(rect.y0, rect.y1);
       const maxY = Math.max(rect.y0, rect.y1);
+      if (selectionMode === "cells") {
+        const hitCells: number[] = [];
+        compiledCells.forEach((cell, idx) => {
+          if (
+            cell.canvas_xy[0] >= minX &&
+            cell.canvas_xy[0] <= maxX &&
+            cell.canvas_xy[1] >= minY &&
+            cell.canvas_xy[1] <= maxY
+          ) {
+            hitCells.push(idx);
+          }
+        });
+        setSelectedCellIndices(hitCells);
+        return;
+      }
       const hitSet = new Set<string>();
       for (const fx of showState.patch) {
         if (
@@ -1055,18 +1267,31 @@ export function FixtureGrid2D({
       return;
     }
     if (dragState.mode === "shader_scale") {
-      const boxHalf = Math.max(
-        0.05,
-        Math.max(
-          Math.abs(pos.x - gizmoState.centerX),
-          Math.abs(pos.y - gizmoState.centerY),
-        ),
+      const nextX = Number(
+        Math.min(2.0, Math.max(0.05, Math.abs(pos.x - gizmoState.centerX))).toFixed(3),
       );
-      const scale = Math.max(0.25, Math.min(4.0, boxHalf / 0.2));
+      const nextY = Number(
+        Math.min(2.0, Math.max(0.05, Math.abs(pos.y - gizmoState.centerY))).toFixed(3),
+      );
       commitShaderGizmoUpdate({
         ...gizmoState,
-        spatialFreq: patternScaleToSpatialFreq(scale),
+        boxHalfX: nextX,
+        boxHalfY: nextY,
       });
+      return;
+    }
+    if (dragState.mode === "shader_scale_x") {
+      const nextX = Number(
+        Math.min(2.0, Math.max(0.05, Math.abs(pos.x - gizmoState.centerX))).toFixed(3),
+      );
+      commitShaderGizmoUpdate({ ...gizmoState, boxHalfX: nextX });
+      return;
+    }
+    if (dragState.mode === "shader_scale_y") {
+      const nextY = Number(
+        Math.min(2.0, Math.max(0.05, Math.abs(pos.y - gizmoState.centerY))).toFixed(3),
+      );
+      commitShaderGizmoUpdate({ ...gizmoState, boxHalfY: nextY });
       return;
     }
 
@@ -1101,7 +1326,7 @@ export function FixtureGrid2D({
     const dx = pos.x - dragState.startPos.x;
     const dy = pos.y - dragState.startPos.y;
     const snapVal = (v: number) =>
-      snapToGrid ? Number((Math.round(v / 0.05) * 0.05).toFixed(3)) : Number(v.toFixed(3));
+      snapToGrid ? Number((Math.round(v / snapStep) * snapStep).toFixed(3)) : Number(v.toFixed(3));
 
     for (const [id, basePos] of Object.entries(dragState.initialGridPositions)) {
       dragOverridesRef.current[id] = {
@@ -1261,37 +1486,120 @@ export function FixtureGrid2D({
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              data-testid="toggle-2d-snap-grid"
-              aria-pressed={snapToGrid}
-              onClick={() => setSnapToGrid((v) => !v)}
-              className={`flex items-center gap-1 px-1.5 py-0.5 rounded border font-mono text-[10px] transition-colors ${
-                snapToGrid
-                  ? "bg-cobalt/30 border-cobalt text-frost font-semibold"
-                  : "bg-ink border-steel text-fog hover:text-mist"
-              }`}
-              title="Snap fixtures to 0.05 grid when dragging"
-            >
-              <Magnet className="w-3 h-3" />
-              <span>Snap</span>
-            </button>
-            <button
-              type="button"
-              data-testid="toggle-2d-shader-gizmo"
-              aria-pressed={shaderGizmoActive}
-              onClick={() => setShaderGizmoActive((v) => !v)}
-              className={`flex items-center gap-1 px-1.5 py-0.5 rounded border font-mono text-[10px] transition-colors ${
-                shaderGizmoActive
-                  ? "bg-plum/30 border-plum text-frost font-semibold"
-                  : "bg-ink border-steel text-fog hover:text-mist"
-              }`}
-              title="Toggle 2D Shader FX Gizmo"
-            >
-              <Crosshair className="w-3 h-3" />
-              <span>FX</span>
-            </button>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {/* Selection Mode: Whole Fixtures vs Individual Cells */}
+            <HelpTooltip text="Fixtures mode selects & moves whole fixtures; Cells mode clicks or marquees individual segments for partial-fixture groups.">
+              <div className="flex items-center gap-0.5 bg-ink border border-steel rounded p-0.5 font-mono text-[10px]">
+                <button
+                  type="button"
+                  data-testid="grid-select-mode-fixtures"
+                  aria-pressed={selectionMode === "fixtures"}
+                  onClick={() => setSelectionMode("fixtures")}
+                  className={`px-1.5 py-0.2 rounded transition-colors ${
+                    selectionMode === "fixtures"
+                      ? "bg-ember text-frost font-semibold"
+                      : "text-fog hover:text-mist"
+                  }`}
+                >
+                  Fixtures
+                </button>
+                <button
+                  type="button"
+                  data-testid="grid-select-mode-cells"
+                  aria-pressed={selectionMode === "cells"}
+                  onClick={() => setSelectionMode("cells")}
+                  className={`px-1.5 py-0.2 rounded transition-colors ${
+                    selectionMode === "cells"
+                      ? "bg-plum text-frost font-semibold"
+                      : "text-fog hover:text-mist"
+                  }`}
+                >
+                  Cells
+                </button>
+              </div>
+            </HelpTooltip>
+
+            <div className="flex items-center gap-0.5">
+              <HelpTooltip
+                text={`Snap fixtures to ${Math.round(snapStep * 1000) / 10}% grid when dragging`}
+              >
+                <button
+                  type="button"
+                  data-testid="toggle-2d-snap-grid"
+                  aria-pressed={snapToGrid}
+                  onClick={() => setSnapToGrid((v) => !v)}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded border font-mono text-[10px] transition-colors ${
+                    snapToGrid
+                      ? "bg-cobalt/30 border-cobalt text-frost font-semibold"
+                      : "bg-ink border-steel text-fog hover:text-mist"
+                  }`}
+                >
+                  <Magnet className="w-3 h-3" />
+                  <span>Snap</span>
+                </button>
+              </HelpTooltip>
+              <select
+                aria-label="Grid Snap Size"
+                data-testid="grid-snap-step-select"
+                value={snapStep}
+                onChange={(e) => setSnapStep(Number(e.target.value))}
+                disabled={!snapToGrid}
+                title="Grid snap & visual grid spacing (% of stage)"
+                className="bg-ink border border-steel rounded px-1 py-0.5 font-mono text-[10px] text-frost disabled:opacity-40"
+              >
+                {GRID_SNAP_PRESETS.map((p) => (
+                  <option key={p.value} value={p.value}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <HelpTooltip text="Toggle 2D Shader FX Gizmo overlay for spatial mappings.">
+              <button
+                type="button"
+                data-testid="toggle-2d-shader-gizmo"
+                aria-pressed={shaderGizmoActive}
+                onClick={() => setShaderGizmoActive((v) => !v)}
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded border font-mono text-[10px] transition-colors ${
+                  shaderGizmoActive
+                    ? "bg-plum/30 border-plum text-frost font-semibold"
+                    : "bg-ink border-steel text-fog hover:text-mist"
+                }`}
+              >
+                <Crosshair className="w-3 h-3" />
+                <span>FX</span>
+              </button>
+            </HelpTooltip>
+
+            {activeShaderBlock && (
+              <div className="flex items-center gap-0.5">
+                <HelpTooltip text="Fit 2D shader gizmo center and size to the scene's targeted fixtures or cells.">
+                  <button
+                    type="button"
+                    data-testid="gizmo-fit-btn"
+                    onClick={fitActiveGizmoToTargets}
+                    className="px-1.5 py-0.5 rounded border border-cobalt bg-cobalt/20 hover:bg-cobalt/35 font-mono text-[10px] text-frost font-semibold transition-colors"
+                  >
+                    Fit
+                  </button>
+                </HelpTooltip>
+                <HelpTooltip text="Auto-Fit: refit the 2D shader gizmo whenever targeted fixtures move or rotate. Pauses automatically if you drag gizmo handles manually.">
+                  <button
+                    type="button"
+                    data-testid="gizmo-autofit-toggle"
+                    aria-pressed={gizmoAutoFit}
+                    onClick={() => setGizmoAutoFit(!gizmoAutoFit)}
+                    className={`px-1.5 py-0.5 rounded border font-mono text-[10px] transition-colors ${
+                      gizmoAutoFit
+                        ? "bg-plum/25 border-plum text-frost font-semibold"
+                        : "bg-ink border-steel text-fog hover:text-mist"
+                    }`}
+                  >
+                    Auto
+                  </button>
+                </HelpTooltip>
+              </div>
+            )}
 
             {/* Always-Visible Position & Rotation Controls */}
             {selectedFixture && (
@@ -1438,6 +1746,17 @@ export function FixtureGrid2D({
                       : f.label}
               </button>
             ))}
+            <button
+              type="button"
+              data-testid="pattern-filter-none"
+              onClick={() =>
+                applyCellSelectionPattern("none", activeGroupFilterId)
+              }
+              title="Clear pixel pattern selection"
+              className="w-full py-1 rounded bg-ink border border-steel/70 text-fog hover:border-signal hover:text-frost text-center leading-none mt-auto"
+            >
+              None
+            </button>
           </div>
 
           {/* Center 2D Grid Canvas */}
@@ -1479,7 +1798,8 @@ export function FixtureGrid2D({
                   <button
                     type="button"
                     data-testid="clear-fixture-selection-btn"
-                    onClick={() => setSelectedFixtureIds([])}
+                    onClick={() => clearSelections()}
+                    title="Clear all selected fixtures and pixel/pattern selections"
                     className="px-1 py-0.2 rounded bg-ink border border-steel text-fog hover:text-mist"
                   >
                     Clr
@@ -1557,10 +1877,19 @@ export function FixtureGrid2D({
                 onClick={() =>
                   void createGroupFromSelectedFixtures(quickGroupName)
                 }
-                title={`Save Selection (${selectionCountForGroup}) as Group`}
-                className="p-1 rounded bg-plum hover:bg-plum/90 text-frost disabled:opacity-40 shrink-0"
+                title={
+                  selectedCellIndices.length > 0
+                    ? `Save ${selectedCellIndices.length} selected cell(s) as Group`
+                    : `Save Selection (${selectionCountForGroup}) as Group`
+                }
+                className="px-1.5 py-1 rounded bg-plum hover:bg-plum/90 text-frost disabled:opacity-40 shrink-0 flex items-center gap-0.5 font-mono text-[10px]"
               >
                 <Plus className="w-3.5 h-3.5" />
+                {selectedCellIndices.length > 0 && (
+                  <span data-testid="selected-cells-group-badge">
+                    {selectedCellIndices.length}c
+                  </span>
+                )}
               </button>
             </div>
           </div>
