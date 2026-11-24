@@ -337,18 +337,18 @@ async function readFileAsArrayBuffer(file: File): Promise<ArrayBuffer> {
   return new Response(file).arrayBuffer();
 }
 
-/**
- * Decodes an OS-dropped or file-picked audio File (MP3, WAV, OGG, FLAC, M4A)
- * using Web Audio API `AudioContext.decodeAudioData` (with WAV fallback for tests),
- * registers the asset in memory, and returns both asset metadata and initial analysis.
- */
-export async function decodeAudioFile(
-  file: File,
+export function extractAudioFileName(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || filePath;
+}
+
+export async function decodeAudioArrayBuffer(
+  arrayBuffer: ArrayBuffer,
+  key: string,
+  fileName: string,
   transientSensitivity = 0.65,
 ): Promise<{ asset: DecodedAudioAsset; analysis: AudioAnalysisResult }> {
-  const key = file.name;
-  const arrayBuffer = await readFileAsArrayBuffer(file);
-
   const ctx = getAudioContext();
   if (ctx && typeof ctx.decodeAudioData === "function") {
     try {
@@ -365,7 +365,7 @@ export async function decodeAudioFile(
       }
       const asset: DecodedAudioAsset = {
         key,
-        fileName: file.name,
+        fileName,
         durationSec: Number(Math.max(0.1, audioBuffer.duration).toFixed(3)),
         sampleRate: audioBuffer.sampleRate,
         monoPcm,
@@ -388,7 +388,7 @@ export async function decodeAudioFile(
   if (wavDecoded && wavDecoded.monoPcm.length > 0) {
     const asset: DecodedAudioAsset = {
       key,
-      fileName: file.name,
+      fileName,
       durationSec: Number(Math.max(0.1, wavDecoded.durationSec).toFixed(3)),
       sampleRate: wavDecoded.sampleRate,
       monoPcm: wavDecoded.monoPcm,
@@ -416,7 +416,7 @@ export async function decodeAudioFile(
   }
   const asset: DecodedAudioAsset = {
     key,
-    fileName: file.name,
+    fileName,
     durationSec: fallbackDur,
     sampleRate: sr,
     monoPcm,
@@ -425,6 +425,33 @@ export async function decodeAudioFile(
   registerDecodedAudioAsset(asset);
   const analysis = analyzePcmBuffer(monoPcm, sr, key, transientSensitivity);
   return { asset, analysis };
+}
+
+export async function decodeAudioBytes(
+  bytes: Uint8Array | number[],
+  key: string,
+  fileName: string,
+  transientSensitivity = 0.65,
+): Promise<{ asset: DecodedAudioAsset; analysis: AudioAnalysisResult }> {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const copy = new Uint8Array(u8.byteLength);
+  copy.set(u8);
+  return decodeAudioArrayBuffer(copy.buffer, key, fileName, transientSensitivity);
+}
+
+/**
+ * Decodes an OS-dropped or file-picked audio File (MP3, WAV, OGG, FLAC, M4A)
+ * using Web Audio API `AudioContext.decodeAudioData` (with WAV fallback for tests),
+ * registers the asset in memory, and returns both asset metadata and initial analysis.
+ */
+export async function decodeAudioFile(
+  file: File,
+  transientSensitivity = 0.65,
+  overrideKey?: string,
+): Promise<{ asset: DecodedAudioAsset; analysis: AudioAnalysisResult }> {
+  const key = overrideKey ?? file.name;
+  const arrayBuffer = await readFileAsArrayBuffer(file);
+  return decodeAudioArrayBuffer(arrayBuffer, key, file.name, transientSensitivity);
 }
 
 export function reanalyzeAudioClip(

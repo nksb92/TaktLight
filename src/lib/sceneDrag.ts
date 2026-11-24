@@ -65,6 +65,25 @@ function onUp(e: MouseEvent | PointerEvent) {
 
   const els = document.elementsFromPoint(e.clientX, e.clientY);
   for (const el of els) {
+    if (el.hasAttribute("data-scene-sequence-dropzone")) {
+      const targetBlockId = el.getAttribute("data-target-block-id") ?? "";
+      const rawIdx = el.getAttribute("data-insert-index");
+      const insertIndex =
+        rawIdx !== null && rawIdx !== "" && Number.isFinite(Number(rawIdx))
+          ? Number(rawIdx)
+          : undefined;
+      el.dispatchEvent(
+        new CustomEvent("takt:scene-sequence-drop", {
+          bubbles: true,
+          detail: {
+            sceneId,
+            targetBlockId,
+            insertIndex,
+          },
+        }),
+      );
+      break;
+    }
     const laneId = el.getAttribute("data-track-lane-id");
     const testId = el.getAttribute("data-testid");
     if (laneId || testId === "timeline-new-track-dropzone") {
@@ -75,6 +94,19 @@ function onUp(e: MouseEvent | PointerEvent) {
             sceneId,
             trackId: laneId ?? "__new__",
             clientX: e.clientX,
+          },
+        }),
+      );
+      break;
+    }
+    const bankTarget = el.getAttribute("data-bank-drop-target");
+    if (bankTarget) {
+      el.dispatchEvent(
+        new CustomEvent("takt:scene-bank-drop", {
+          bubbles: true,
+          detail: {
+            sceneId,
+            targetBank: bankTarget,
           },
         }),
       );

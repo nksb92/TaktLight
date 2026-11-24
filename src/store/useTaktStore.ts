@@ -1,6 +1,12 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import {
+  decodeAudioBytes,
+  decodeAudioFile,
+  extractAudioFileName,
+  getDecodedAudioAsset,
+} from "../lib/audioEngine";
+import {
   decodeBinaryFrame,
   DMX_UNIVERSE_CHANNELS,
   encodeBinaryFrame,
@@ -45,8 +51,10 @@ import {
 } from "../lib/mixerLogic";
 import { computeTimelineContentDurationSec } from "../lib/timelineLogic";
 import {
+  compactCellTargets,
   CompiledCell,
   defaultCalibration,
+  expandTargetRange,
   FixtureCalibration,
   FixtureGroupDef,
   FixtureInstance,
@@ -54,6 +62,7 @@ import {
   GridPos,
   OrderRuleStr,
   previewPlacement,
+  resolveUniverseDisplayConfig,
   ShowStateDto,
   transformCellUv,
 } from "../lib/patchLogic";
@@ -81,12 +90,140 @@ export interface GroupMixerStripState {
 
 export type CellSelectionPattern =
   | "all"
+  | "none"
   | "1/2"
   | "1/3"
   | "1/4"
   | "invert"
   | "shift_left"
   | "shift_right";
+
+export interface RecentProjectEntry {
+  path: string;
+  name: string;
+  openedAt: number;
+}
+
+export type PendingUnsavedAction =
+  | { type: "close_window" }
+  | { type: "new_project" }
+  | { type: "close_project" }
+  | { type: "open_project" }
+  | { type: "open_recent"; path: string };
+
+export interface StudioLayoutState {
+  bottomDockPct: number;
+  inspectorWidthPx: number;
+  bottomSplitPct: number;
+  expandedUpperSplitPct: number;
+  showInspector: boolean;
+  showBottomDock: boolean;
+  timelineExpanded: boolean;
+}
+
+export const DEFAULT_STUDIO_LAYOUT: StudioLayoutState = {
+  bottomDockPct: 43,
+  inspectorWidthPx: 290,
+  bottomSplitPct: 50,
+  expandedUpperSplitPct: 50,
+  showInspector: true,
+  showBottomDock: true,
+  timelineExpanded: false,
+};
+
+const STUDIO_LAYOUT_STORAGE_KEY = "taktlight.studioLayout";
+const RECENT_PROJECTS_STORAGE_KEY = "taktlight.recentProjects";
+
+function clampStudioLayout(raw: Partial<StudioLayoutState>): StudioLayoutState {
+  return {
+    bottomDockPct: Math.max(
+      22,
+      Math.min(72, Number(raw.bottomDockPct ?? DEFAULT_STUDIO_LAYOUT.bottomDockPct) || 43),
+    ),
+    inspectorWidthPx: Math.max(
+      240,
+      Math.min(560, Number(raw.inspectorWidthPx ?? DEFAULT_STUDIO_LAYOUT.inspectorWidthPx) || 290),
+    ),
+    bottomSplitPct: Math.max(
+      25,
+      Math.min(75, Number(raw.bottomSplitPct ?? DEFAULT_STUDIO_LAYOUT.bottomSplitPct) || 50),
+    ),
+    expandedUpperSplitPct: Math.max(
+      25,
+      Math.min(
+        75,
+        Number(raw.expandedUpperSplitPct ?? DEFAULT_STUDIO_LAYOUT.expandedUpperSplitPct) || 50,
+      ),
+    ),
+    showInspector: raw.showInspector ?? DEFAULT_STUDIO_LAYOUT.showInspector,
+    showBottomDock: raw.showBottomDock ?? DEFAULT_STUDIO_LAYOUT.showBottomDock,
+    timelineExpanded: raw.timelineExpanded ?? DEFAULT_STUDIO_LAYOUT.timelineExpanded,
+  };
+}
+
+function loadStudioLayoutFromStorage(): StudioLayoutState {
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return { ...DEFAULT_STUDIO_LAYOUT };
+    }
+    const raw = window.localStorage.getItem(STUDIO_LAYOUT_STORAGE_KEY);
+    if (!raw) return { ...DEFAULT_STUDIO_LAYOUT };
+    const parsed = JSON.parse(raw) as Partial<StudioLayoutState>;
+    return clampStudioLayout(parsed);
+  } catch {
+    return { ...DEFAULT_STUDIO_LAYOUT };
+  }
+}
+
+function saveStudioLayoutToStorage(layout: StudioLayoutState): void {
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(STUDIO_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+  } catch {
+    // Ignore storage quota / disabled storage errors
+  }
+}
+
+export function pathDisplayName(pathOrName: string): string {
+  const parts = pathOrName.split(/[/\\]/);
+  return parts[parts.length - 1] || pathOrName;
+}
+
+function loadRecentProjectsFromStorage(): RecentProjectEntry[] {
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return [];
+    }
+    const raw = window.localStorage.getItem(RECENT_PROJECTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (e): e is RecentProjectEntry =>
+          Boolean(e && typeof e.path === "string" && typeof e.name === "string"),
+      )
+      .slice(0, 10);
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentProjectsToStorage(entries: RecentProjectEntry[]): void {
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(
+      RECENT_PROJECTS_STORAGE_KEY,
+      JSON.stringify(entries.slice(0, 10)),
+    );
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 export type WorkspaceTab =
   | "monitor"
@@ -244,10 +381,11 @@ const DEFAULT_UNIVERSES: UniverseConfig[] = [
     id: 2,
     review_output: false,
     protocol: {
-      protocol: "sacn",
-      mode: { mode: "multicast" },
-      sacn_universe: 2,
-      priority: 100,
+      protocol: "art_net",
+      mode: { mode: "broadcast" },
+      net: 0,
+      subnet: 0,
+      uni: 1,
     },
   },
 ];
@@ -457,6 +595,9 @@ function createInitialState() {
     timelineSensitivity: 0.65,
     timelineShowTransients: true,
     timelineProjectTransients: false,
+    timelineShowBeats: true,
+    timelineShowKicks: true,
+    timelineShowSnares: true,
     compiledCells: [] as CompiledCell[],
     cellPreviewRgbd: new Uint8Array(0),
     canUndo: false,
@@ -468,12 +609,20 @@ function createInitialState() {
     selectedFixtureIds: [] as string[],
     sceneBanks: ["Bank 1"],
     stackableBanks: {} as Record<string, boolean>,
+    bankColors: {} as Record<string, string>,
     focusedPatchUniverse: 1,
     outputEnabled: false,
     showRevision: 0,
     savedRevision: 0,
     isDirty: false,
     closePromptOpen: false,
+    pendingUnsavedAction: null as PendingUnsavedAction | null,
+    currentProjectPath: null as string | null,
+    recentProjects: loadRecentProjectsFromStorage(),
+    studioLayout: loadStudioLayoutFromStorage(),
+    gizmoAutoFit: true,
+    missingAudioFiles: [] as MissingAudioFileEntry[],
+    missingAudioModalOpen: false,
 
     studioOutputMode: "live" as StudioOutputMode,
     studioSubMode: "builder" as StudioSubMode,
@@ -915,8 +1064,8 @@ function synthesizeSimulationBuffer(state: {
 }
 
 function serializeShowXmlLocally(show: ShowStateDto): string {
-  const esc = (s: string) =>
-    s
+  const esc = (s: string | null | undefined) =>
+    String(s ?? "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
@@ -1015,9 +1164,23 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
           const ord = el.order ? ` order="${escFn(el.order)}"` : "";
           return `${indent}<StepChase trait="${escFn(el.trait)}" op="${escFn(el.op)}"${sb}${sh}${rc}${ow}${px}${ar} fade="${el.fade}" amplitude="${el.amplitude}"${pr}${ord} />`;
         }
+        if (el.kind === "scene_sequence") {
+          const pm = el.playback_mode ? ` playback_mode="${escFn(el.playback_mode)}"` : "";
+          if (el.steps.length === 0) {
+            return `${indent}<SceneSequence${pm} />`;
+          }
+          const stepLines = el.steps
+            .map(
+              (st) =>
+                `${indent}  <Step scene_id="${escFn(st.scene_id)}" duration_value="${st.duration_value}" duration_unit="${escFn(st.duration_unit)}" fade_sec="${st.fade_sec}" />`,
+            )
+            .join("\n");
+          return `${indent}<SceneSequence${pm}>\n${stepLines}\n${indent}</SceneSequence>`;
+        }
         const rb = el.rate_beats !== null ? ` rate_beats="${el.rate_beats}"` : "";
         const sh = el.speed_hz !== null ? ` speed_hz="${el.speed_hz}"` : "";
         const rc = el.rate_cycles != null ? ` rate_cycles="${el.rate_cycles}"` : "";
+        const po = el.phase_offset ? ` phase_offset="${el.phase_offset}"` : "";
         const cw = el.color_width !== undefined && el.color_width !== 1 ? ` color_width="${el.color_width}"` : "";
         const gr = el.gradient !== undefined && el.gradient !== 1 ? ` gradient="${el.gradient}"` : "";
         const gs = el.grayscale ? ` grayscale="true"` : "";
@@ -1025,7 +1188,7 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
         const ic = el.inline_colors && el.inline_colors.length > 0 ? ` inline_colors="${escFn(el.inline_colors.join(","))}"` : "";
         const vs = el.value_stops && el.value_stops.length > 0 ? ` value_stops="${el.value_stops.join(",")}"` : "";
         const pr = el.palette_ref ? ` palette_ref="${escFn(el.palette_ref)}"` : "";
-        return `${indent}<SpatialShader2D trait="${escFn(el.trait)}" op="${escFn(el.op)}" shader="${escFn(el.shader)}"${pr}${rb}${sh}${rc} spatial_freq="${el.spatial_freq}"${cw}${gr}${gs}${tr}${ic}${vs} direction_deg="${el.direction_deg}" center_x="${el.center_x}" center_y="${el.center_y}" />`;
+        return `${indent}<SpatialShader2D trait="${escFn(el.trait)}" op="${escFn(el.op)}" shader="${escFn(el.shader)}"${pr}${rb}${sh}${rc}${po} spatial_freq="${el.spatial_freq}"${cw}${gr}${gs}${tr}${ic}${vs} direction_deg="${el.direction_deg}" center_x="${el.center_x}" center_y="${el.center_y}" />`;
       })
       .join("\n");
 
@@ -1068,11 +1231,16 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
             .map((clip) => {
               const rb = clip.ref_block ? ` ref_block="${esc(clip.ref_block)}"` : "";
               const af = clip.audio_file ? ` audio_file="${esc(clip.audio_file)}"` : "";
+              const ts = clip.time_stretch ? ` time_stretch="true"` : "";
+              const sd =
+                clip.source_duration_sec != null
+                  ? ` source_duration_sec="${clip.source_duration_sec}"`
+                  : "";
               if (clip.inline_fx.length === 0) {
-                return `        <Clip${rb}${af} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}" />`;
+                return `        <Clip${rb}${af} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}"${ts}${sd} />`;
               }
               const inlineXml = serializeFxElementsXml(clip.inline_fx, "          ", esc);
-              return `        <Clip${rb}${af} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}">\n${inlineXml}\n        </Clip>`;
+              return `        <Clip${rb}${af} start_sec="${clip.start_sec}" duration_sec="${clip.duration_sec}" fade_in_sec="${clip.fade_in_sec}" fade_out_sec="${clip.fade_out_sec}"${ts}${sd}>\n${inlineXml}\n        </Clip>`;
             })
             .join("\n");
           return `      <Track id="${esc(trk.id)}" name="${esc(trk.name)}"${tt}${tg}>\n${clipLines}\n      </Track>`;
@@ -1082,6 +1250,19 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
       return `    <Timeline id="${esc(tl.id)}" name="${esc(tl.name)}" duration_sec="${tl.duration_sec}" grid_offset_sec="${tl.grid_offset_sec}"${lp}>\n      <TempoMap>\n${tempoLines}\n      </TempoMap>\n${audioLine}${trackLines}\n    </Timeline>`;
     })
     .join("\n");
+
+  const bankColorEntries = Object.entries(show.bank_colors ?? {})
+    .filter(([bank, color]) => bank.trim().length > 0 && color.trim().length > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+  const bankColorsBlock =
+    bankColorEntries.length > 0
+      ? `\n  <BankColors>\n${bankColorEntries
+          .map(
+            ([bank, color]) =>
+              `    <BankColor bank="${esc(bank)}" color="${esc(color)}" />`,
+          )
+          .join("\n")}\n  </BankColors>`
+      : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <TaktLightShow version="1.0" name="${esc(show.name)}" bpm="${show.bpm}">
@@ -1105,7 +1286,7 @@ ${sceneLines}
   </Scenes>
   <Timelines>
 ${timelineLines}
-  </Timelines>
+  </Timelines>${bankColorsBlock}
 </TaktLightShow>
 `;
 }
@@ -1116,6 +1297,9 @@ function parseShowXmlLocally(
 ): ShowStateDto {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlStr, "application/xml");
+  if (doc.querySelector("parsererror")) {
+    throw new Error("Invalid XML syntax in .takt.xml file");
+  }
   const root = doc.querySelector("TaktLightShow");
   if (!root) {
     throw new Error("Missing <TaktLightShow> root element");
@@ -1347,9 +1531,14 @@ function parseShowXmlLocally(
           speed_hz: child.getAttribute("speed_hz")
             ? Number(child.getAttribute("speed_hz"))
             : null,
-          rate_cycles: child.getAttribute("rate_cycles")
-            ? Number(child.getAttribute("rate_cycles"))
-            : null,
+          rate_cycles:
+            child.getAttribute("rate_cycles") !== null
+              ? Number(child.getAttribute("rate_cycles"))
+              : null,
+          phase_offset:
+            child.getAttribute("phase_offset") !== null
+              ? Number(child.getAttribute("phase_offset"))
+              : null,
           spatial_freq: Number(child.getAttribute("spatial_freq") ?? 1),
           color_width: child.getAttribute("color_width")
             ? Number(child.getAttribute("color_width"))
@@ -1368,6 +1557,48 @@ function parseShowXmlLocally(
           direction_deg: Number(child.getAttribute("direction_deg") ?? 0),
           center_x: Number(child.getAttribute("center_x") ?? 0.5),
           center_y: Number(child.getAttribute("center_y") ?? 0.5),
+        });
+      } else if (tag === "SceneSequence") {
+        const pmRaw = (child.getAttribute("playback_mode") ?? "loop")
+          .trim()
+          .toLowerCase();
+        const playback_mode =
+          pmRaw === "one_shot" || pmRaw === "oneshot"
+            ? "one_shot"
+            : pmRaw === "bounce"
+              ? "bounce"
+              : "loop";
+        const steps: Array<{
+          scene_id: string;
+          duration_value: number;
+          duration_unit: "beats" | "seconds";
+          fade_sec: number;
+        }> = [];
+        Array.from(child.children).forEach((stepEl) => {
+          if (stepEl.tagName !== "Step") return;
+          const scene_id = stepEl.getAttribute("scene_id") ?? "";
+          if (!scene_id) return;
+          const unitRaw = (stepEl.getAttribute("duration_unit") ?? "beats")
+            .trim()
+            .toLowerCase();
+          const duration_unit =
+            unitRaw === "seconds" || unitRaw === "sec" || unitRaw === "s"
+              ? "seconds"
+              : "beats";
+          steps.push({
+            scene_id,
+            duration_value: Math.max(
+              0.05,
+              Number(stepEl.getAttribute("duration_value") ?? 4),
+            ),
+            duration_unit,
+            fade_sec: Math.max(0, Number(stepEl.getAttribute("fade_sec") ?? 0)),
+          });
+        });
+        elements.push({
+          kind: "scene_sequence",
+          playback_mode,
+          steps,
         });
       }
     });
@@ -1442,6 +1673,8 @@ function parseShowXmlLocally(
     el.querySelectorAll(":scope > Track").forEach((trkEl) => {
       const clips: ClipDef[] = [];
       trkEl.querySelectorAll(":scope > Clip").forEach((cEl) => {
+        const srcDurAttr = cEl.getAttribute("source_duration_sec");
+        const srcDurNum = srcDurAttr !== null ? Number(srcDurAttr) : NaN;
         clips.push({
           ref_block: cEl.getAttribute("ref_block"),
           start_sec: Number(cEl.getAttribute("start_sec") ?? 0),
@@ -1450,6 +1683,8 @@ function parseShowXmlLocally(
           fade_out_sec: Number(cEl.getAttribute("fade_out_sec") ?? 0),
           inline_fx: parseFxElementsXml(cEl),
           audio_file: cEl.getAttribute("audio_file") || null,
+          time_stretch: cEl.getAttribute("time_stretch") === "true" ? true : undefined,
+          source_duration_sec: Number.isFinite(srcDurNum) ? srcDurNum : undefined,
         });
       });
       tracks.push({
@@ -1473,6 +1708,15 @@ function parseShowXmlLocally(
     });
   });
 
+  const bank_colors: Record<string, string> = {};
+  root.querySelectorAll("BankColors > BankColor").forEach((el) => {
+    const bank = el.getAttribute("bank")?.trim();
+    const color = el.getAttribute("color")?.trim();
+    if (bank && color) {
+      bank_colors[bank] = color;
+    }
+  });
+
   return {
     version,
     name,
@@ -1493,7 +1737,61 @@ function parseShowXmlLocally(
     fx_library,
     scenes,
     timelines,
+    bank_colors,
   };
+}
+
+export interface MissingAudioFileEntry {
+  originalKey: string;
+  baseName: string;
+  timelineIds: string[];
+  resolved: boolean;
+  resolvedPath?: string;
+}
+
+interface AudioFileBytesDto {
+  resolved_path: string;
+  file_name: string;
+  bytes: number[];
+}
+
+interface ResolvedAudioMatchDto {
+  requested: string;
+  resolved_path: string;
+  file_name: string;
+}
+
+function collectShowAudioRefs(
+  timelines: ReadonlyArray<TimelineDef>,
+): Array<{ key: string; baseName: string; timelineIds: string[] }> {
+  const byKey = new Map<string, { key: string; baseName: string; timelineIds: Set<string> }>();
+  const addRef = (raw: string | null | undefined, timelineId: string) => {
+    const trimmed = raw?.trim();
+    if (!trimmed) return;
+    const existing = byKey.get(trimmed);
+    if (existing) {
+      existing.timelineIds.add(timelineId);
+    } else {
+      byKey.set(trimmed, {
+        key: trimmed,
+        baseName: extractAudioFileName(trimmed),
+        timelineIds: new Set([timelineId]),
+      });
+    }
+  };
+  for (const tl of timelines) {
+    addRef(tl.audio_track?.file, tl.id);
+    for (const tr of tl.tracks) {
+      for (const clip of tr.clips) {
+        addRef(clip.audio_file, tl.id);
+      }
+    }
+  }
+  return Array.from(byKey.values()).map((entry) => ({
+    key: entry.key,
+    baseName: entry.baseName,
+    timelineIds: Array.from(entry.timelineIds),
+  }));
 }
 
 export interface TaktStoreState {
@@ -1537,6 +1835,9 @@ export interface TaktStoreState {
   timelineSensitivity: number;
   timelineShowTransients: boolean;
   timelineProjectTransients: boolean;
+  timelineShowBeats: boolean;
+  timelineShowKicks: boolean;
+  timelineShowSnares: boolean;
   compiledCells: CompiledCell[];
   cellPreviewRgbd: Uint8Array;
   canUndo: boolean;
@@ -1548,12 +1849,18 @@ export interface TaktStoreState {
   selectedFixtureIds: string[];
   sceneBanks: string[];
   stackableBanks: Record<string, boolean>;
+  bankColors: Record<string, string>;
   focusedPatchUniverse: number;
   outputEnabled: boolean;
   showRevision: number;
   savedRevision: number;
   isDirty: boolean;
   closePromptOpen: boolean;
+  pendingUnsavedAction: PendingUnsavedAction | null;
+  currentProjectPath: string | null;
+  recentProjects: RecentProjectEntry[];
+  studioLayout: StudioLayoutState;
+  gizmoAutoFit: boolean;
   studioOutputMode: StudioOutputMode;
   studioSubMode: StudioSubMode;
   selectedSceneId: string | null;
@@ -1582,12 +1889,24 @@ export interface TaktStoreState {
   applyEngineSnapshot: (snapshot: EngineSnapshotDto) => void;
   applyShowSnapshot: (
     snapshot: ShowSnapshotDto,
-    options?: { markClean?: boolean },
+    options?: { markClean?: boolean; replaceBanks?: boolean },
   ) => void;
   ensureFixtureDetailsLoaded: (profiles: string[]) => Promise<void>;
   setClosePromptOpen: (open: boolean) => void;
   markShowSaved: () => void;
+  requestProjectAction: (action: PendingUnsavedAction) => Promise<void>;
+  confirmUnsavedAction: (saveFirst: boolean) => Promise<boolean>;
+  cancelUnsavedAction: () => void;
+  newProject: () => Promise<void>;
+  closeProject: () => Promise<void>;
+  openProjectFromFile: () => Promise<"opened" | "cancelled" | "unsupported">;
+  openRecentProject: (path: string) => Promise<boolean>;
+  loadRecentProjects: () => Promise<void>;
   saveProjectToFile: () => Promise<boolean>;
+  saveProjectAsFile: () => Promise<boolean>;
+  setStudioLayout: (patch: Partial<StudioLayoutState>) => void;
+  resetStudioLayout: () => void;
+  setGizmoAutoFit: (enabled: boolean) => void;
   setSelectedUniverse: (universeId: number) => void;
   setDisplayFormat: (format: DisplayFormat) => void;
   selectChannel: (channel: number | null) => void;
@@ -1646,7 +1965,26 @@ export interface TaktStoreState {
   undoShow: () => Promise<void>;
   redoShow: () => Promise<void>;
   exportShowXml: () => Promise<string>;
-  importShowXml: (xmlStr: string) => Promise<void>;
+  importShowXml: (
+    xmlStr: string,
+    fileHandle?: ProjectFileHandle | null,
+  ) => Promise<void>;
+  missingAudioFiles: MissingAudioFileEntry[];
+  missingAudioModalOpen: boolean;
+  checkShowAudioFiles: () => Promise<MissingAudioFileEntry[]>;
+  relinkMissingAudioWithFile: (
+    originalKey: string,
+    file: File,
+  ) => Promise<void>;
+  relinkMissingAudioWithPath: (
+    originalKey: string,
+    filePath: string,
+  ) => Promise<{ ok: boolean; message: string }>;
+  relinkMissingAudioFromFolderFiles: (files: File[]) => Promise<number>;
+  relinkMissingAudioFromFolderPath: (
+    folderPath: string,
+  ) => Promise<{ matched: number; message: string }>;
+  dismissMissingAudioModal: () => void;
   upsertColorPalette: (palette: ColorPaletteDef) => Promise<void>;
   deleteColorPalette: (id: string) => Promise<void>;
   upsertDimmerPalette: (palette: DimmerPaletteDef) => Promise<void>;
@@ -1696,6 +2034,9 @@ export interface TaktStoreState {
   setTimelineSensitivity: (sens: number) => void;
   setTimelineShowTransients: (enabled: boolean) => void;
   setTimelineProjectTransients: (enabled: boolean) => void;
+  setTimelineShowBeats: (enabled: boolean) => void;
+  setTimelineShowKicks: (enabled: boolean) => void;
+  setTimelineShowSnares: (enabled: boolean) => void;
   resolveSplitFixtures: () => Promise<void>;
   selectFixtureInstance: (id: string | null) => void;
   setFocusedPatchUniverse: (universeId: number) => void;
@@ -1712,9 +2053,11 @@ export interface TaktStoreState {
     presetMode?: "color" | "color_anim" | "effect",
   ) => Promise<SceneDef>;
   createSceneBank: (bankName: string) => void;
+  reorderSceneBanks: (fromBank: string, toBank: string) => void;
   renameSceneBank: (oldName: string, newName: string) => Promise<void>;
   deleteSceneBank: (bankName: string) => Promise<void>;
   toggleBankStackable: (bankName: string) => void;
+  setBankColor: (bankName: string, color: string | null) => void;
   releaseBankScenes: (bankName: string, tSec?: number) => Promise<void>;
   toggleSelectFixtureInstance: (id: string, additive?: boolean) => void;
   setSelectedFixtureIds: (ids: string[]) => void;
@@ -1748,6 +2091,8 @@ export interface TaktStoreState {
     groupFilterId?: string,
   ) => void;
   setSelectedCellIndices: (indices: number[]) => void;
+  toggleCellSelection: (cellIndex: number, additive?: boolean) => void;
+  clearSelections: () => void;
   setActiveGroupFilterId: (groupId: string) => void;
   setCanvasOrderRule: (rule: OrderRuleStr) => void;
   setActiveShaderGizmoBlockId: (blockId: string | null) => void;
@@ -1755,6 +2100,23 @@ export interface TaktStoreState {
   dismissToast: () => void;
   resetForTest: () => void;
 }
+
+export type ProjectFileHandle = {
+  getFile?: () => Promise<{ text: () => Promise<string> }>;
+  queryPermission?: (descriptor?: {
+    mode?: "read" | "readwrite";
+  }) => Promise<string>;
+  requestPermission?: (descriptor?: {
+    mode?: "read" | "readwrite";
+  }) => Promise<string>;
+  createWritable: () => Promise<{
+    write: (data: string) => Promise<void>;
+    close: () => Promise<void>;
+    abort?: () => Promise<void>;
+  }>;
+};
+
+let savedProjectFileHandle: ProjectFileHandle | null = null;
 
 export const useTaktStore = create<TaktStoreState>((set, get) => ({
   ...createInitialState(),
@@ -1916,13 +2278,18 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       const nextSelectedSceneId = hasSelected
         ? state.selectedSceneId
         : (snapshot.show.scenes[0]?.id ?? null);
-      const nextBanks = [...state.sceneBanks];
+      const nextBanks = options?.replaceBanks ? [] : [...state.sceneBanks];
       for (const sc of snapshot.show.scenes) {
         const b = sc.bank?.trim();
         if (b && !nextBanks.includes(b)) {
           nextBanks.push(b);
         }
       }
+      const nextBankColors = options?.replaceBanks
+        ? { ...(snapshot.show.bank_colors ?? {}) }
+        : snapshot.show.bank_colors !== undefined
+          ? { ...snapshot.show.bank_colors }
+          : state.bankColors;
       const nextRev = snapshot.revision;
       const markClean = Boolean(options?.markClean);
       const nextSavedRev = markClean ? nextRev : state.savedRevision;
@@ -1938,6 +2305,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         crossProtocolWarning: snapshot.cross_protocol_warning,
         selectedSceneId: nextSelectedSceneId,
         sceneBanks: nextBanks.length > 0 ? nextBanks : ["Bank 1"],
+        bankColors: nextBankColors,
         showRevision: nextRev,
         savedRevision: nextSavedRev,
         isDirty: nextRev !== nextSavedRev,
@@ -1949,7 +2317,11 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     }
   },
 
-  setClosePromptOpen: (open) => set({ closePromptOpen: open }),
+  setClosePromptOpen: (open) =>
+    set({
+      closePromptOpen: open,
+      pendingUnsavedAction: open ? { type: "close_window" } : null,
+    }),
 
   markShowSaved: () =>
     set((state) => ({
@@ -1957,8 +2329,223 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       isDirty: false,
     })),
 
+  loadRecentProjects: async () => {
+    if (isTauriEnvironment()) {
+      try {
+        const paths = await invoke<string[]>("get_recent_projects_command");
+        const entries: RecentProjectEntry[] = paths.map((p, idx) => ({
+          path: p,
+          name: pathDisplayName(p),
+          openedAt: Date.now() - idx,
+        }));
+        set({ recentProjects: entries });
+        saveRecentProjectsToStorage(entries);
+      } catch {
+        // Ignore if command unavailable in older mocks
+      }
+      return;
+    }
+    set({ recentProjects: loadRecentProjectsFromStorage() });
+  },
+
+  requestProjectAction: async (action) => {
+    if (get().isDirty) {
+      set({
+        pendingUnsavedAction: action,
+        closePromptOpen: true,
+      });
+      return;
+    }
+    set({ pendingUnsavedAction: action });
+    await get().confirmUnsavedAction(false);
+  },
+
+  cancelUnsavedAction: () =>
+    set({
+      pendingUnsavedAction: null,
+      closePromptOpen: false,
+    }),
+
+  confirmUnsavedAction: async (saveFirst) => {
+    const action = get().pendingUnsavedAction;
+    if (saveFirst) {
+      const saved = await get().saveProjectToFile();
+      if (!saved) {
+        return false;
+      }
+    }
+    set({
+      pendingUnsavedAction: null,
+      closePromptOpen: false,
+    });
+    if (!action) return true;
+
+    switch (action.type) {
+      case "new_project":
+        await get().newProject();
+        return true;
+      case "close_project":
+        await get().closeProject();
+        return true;
+      case "open_project": {
+        const res = await get().openProjectFromFile();
+        if (res === "unsupported" && typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("takt:open-file-fallback"));
+        }
+        return res === "opened";
+      }
+      case "open_recent":
+        if (action.path) {
+          return await get().openRecentProject(action.path);
+        }
+        return false;
+      case "close_window":
+        if (isTauriEnvironment()) {
+          try {
+            const { getCurrentWindow } = await import("@tauri-apps/api/window");
+            await getCurrentWindow().destroy();
+          } catch {
+            // Ignore outside full Tauri webview
+          }
+        }
+        return true;
+    }
+  },
+
+  newProject: async () => {
+    savedProjectFileHandle = null;
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto>("new_project_command");
+      get().applyShowSnapshot(snapshot, { markClean: true, replaceBanks: true });
+      set({
+        currentProjectPath: null,
+        selectedFixtureInstanceId: null,
+        selectedFixtureIds: [],
+        selectedCellIndices: [],
+        selectedTimelineClip: null,
+        activeGroupFilterId: "all",
+        parkedChannels: {},
+        activeScenes: [],
+        activeTimelineId: null,
+        timelinePlaying: false,
+        timelinePlayheadSec: 0,
+      });
+      return;
+    }
+
+    const preservedLayout = get().studioLayout;
+    const preservedRecent = get().recentProjects;
+    const fresh = createInitialState();
+    set({
+      ...fresh,
+      studioLayout: preservedLayout,
+      recentProjects: preservedRecent,
+      currentProjectPath: null,
+      patchToast: "Started new project",
+    });
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  closeProject: async () => {
+    await get().newProject();
+  },
+
+  openRecentProject: async (path) => {
+    if (isTauriEnvironment()) {
+      try {
+        const snapshot = await invoke<ShowSnapshotDto>(
+          "open_project_path_command",
+          { path },
+        );
+        savedProjectFileHandle = null;
+        get().applyShowSnapshot(snapshot, { markClean: true, replaceBanks: true });
+        set({ currentProjectPath: path });
+        await get().loadRecentProjects();
+        await get().checkShowAudioFiles();
+        return true;
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : `Failed to open "${path}"`;
+        set({ patchToast: msg });
+        return false;
+      }
+    }
+    set({
+      patchToast: `Cannot directly reopen "${pathDisplayName(path)}" in browser preview; use Open Project instead.`,
+    });
+    return false;
+  },
+
+  setStudioLayout: (patch) =>
+    set((state) => {
+      const next = clampStudioLayout({ ...state.studioLayout, ...patch });
+      saveStudioLayoutToStorage(next);
+      return { studioLayout: next };
+    }),
+
+  resetStudioLayout: () => {
+    const next = { ...DEFAULT_STUDIO_LAYOUT };
+    saveStudioLayoutToStorage(next);
+    set({ studioLayout: next });
+  },
+
+  setGizmoAutoFit: (enabled) => set({ gizmoAutoFit: enabled }),
+
+  openProjectFromFile: async () => {
+    if (isTauriEnvironment()) {
+      const snapshot = await invoke<ShowSnapshotDto | null>(
+        "open_project_file_command",
+      );
+      if (!snapshot) {
+        return "cancelled";
+      }
+      savedProjectFileHandle = null;
+      get().applyShowSnapshot(snapshot, { markClean: true, replaceBanks: true });
+      await get().loadRecentProjects();
+      const latest = get().recentProjects[0];
+      if (latest) {
+        set({ currentProjectPath: latest.path });
+      }
+      await get().checkShowAudioFiles();
+      return "opened";
+    }
+    if (typeof window === "undefined") {
+      return "unsupported";
+    }
+    const pickerWin = window as unknown as {
+      showOpenFilePicker?: (opts: unknown) => Promise<ProjectFileHandle[]>;
+    };
+    if (typeof pickerWin.showOpenFilePicker !== "function") {
+      return "unsupported";
+    }
+    let handle: ProjectFileHandle | undefined;
+    try {
+      const handles = await pickerWin.showOpenFilePicker({
+        multiple: false,
+        types: [
+          {
+            description: "TaktLight Show XML",
+            accept: { "application/xml": [".xml"] },
+          },
+        ],
+      });
+      handle = handles?.[0];
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return "cancelled";
+      }
+      return "unsupported";
+    }
+    if (!handle || typeof handle.getFile !== "function") {
+      return "cancelled";
+    }
+    const file = await handle.getFile();
+    const content = await file.text();
+    await get().importShowXml(content, handle);
+    return "opened";
+  },
+
   saveProjectToFile: async () => {
-    const xml = await get().exportShowXml();
     const cleanName =
       get()
         .showState.name.trim()
@@ -1967,26 +2554,74 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       ? cleanName
       : `${cleanName}.takt.xml`;
 
+    if (isTauriEnvironment()) {
+      const saved = await invoke<boolean>("save_project_file_command", {
+        suggestedName: fileName,
+      });
+      if (saved) {
+        get().markShowSaved();
+        await get().loadRecentProjects();
+        const latest = get().recentProjects[0];
+        if (latest) set({ currentProjectPath: latest.path });
+      }
+      return saved;
+    }
+
     if (typeof window !== "undefined") {
+      if (savedProjectFileHandle) {
+        try {
+          if (typeof savedProjectFileHandle.queryPermission === "function") {
+            const perm = await savedProjectFileHandle.queryPermission({
+              mode: "readwrite",
+            });
+            if (
+              perm !== "granted" &&
+              typeof savedProjectFileHandle.requestPermission === "function"
+            ) {
+              const req = await savedProjectFileHandle.requestPermission({
+                mode: "readwrite",
+              });
+              if (req !== "granted") {
+                return false;
+              }
+            }
+          }
+          const writable = await savedProjectFileHandle.createWritable();
+          try {
+            const xml = await get().exportShowXml();
+            await writable.write(xml);
+            await writable.close();
+          } catch (writeErr) {
+            await writable.abort?.().catch(() => undefined);
+            throw writeErr;
+          }
+          get().markShowSaved();
+          return true;
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            return false;
+          }
+          savedProjectFileHandle = null;
+        }
+      }
+
       const pickerWin = window as unknown as {
-        showSaveFilePicker?: (opts: unknown) => Promise<{
-          createWritable: () => Promise<{
-            write: (data: string) => Promise<void>;
-            close: () => Promise<void>;
-          }>;
-        }>;
+        showSaveFilePicker?: (opts: unknown) => Promise<ProjectFileHandle>;
       };
       if (typeof pickerWin.showSaveFilePicker === "function") {
         try {
+          // Call showSaveFilePicker synchronously in the user gesture before awaiting IPC
           const handle = await pickerWin.showSaveFilePicker({
             suggestedName: fileName,
             types: [
               {
                 description: "TaktLight Show XML",
-                accept: { "application/xml": [".takt.xml", ".xml"] },
+                accept: { "application/xml": [".xml"] },
               },
             ],
           });
+          savedProjectFileHandle = handle;
+          const xml = await get().exportShowXml();
           const writable = await handle.createWritable();
           await writable.write(xml);
           await writable.close();
@@ -1998,6 +2633,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
           }
         }
       }
+      const xml = await get().exportShowXml();
       if (typeof document !== "undefined" && typeof URL.createObjectURL === "function") {
         const blob = new Blob([xml], { type: "application/xml" });
         const url = URL.createObjectURL(blob);
@@ -2012,6 +2648,32 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     return true;
   },
 
+  saveProjectAsFile: async () => {
+    const cleanName =
+      get()
+        .showState.name.trim()
+        .replace(/[^a-zA-Z0-9._-]+/g, "_") || "taktlight_show";
+    const fileName = cleanName.endsWith(".takt.xml")
+      ? cleanName
+      : `${cleanName}.takt.xml`;
+
+    if (isTauriEnvironment()) {
+      const saved = await invoke<boolean>("save_project_as_command", {
+        suggestedName: fileName,
+      });
+      if (saved) {
+        get().markShowSaved();
+        await get().loadRecentProjects();
+        const latest = get().recentProjects[0];
+        if (latest) set({ currentProjectPath: latest.path });
+      }
+      return saved;
+    }
+
+    savedProjectFileHandle = null;
+    return await get().saveProjectToFile();
+  },
+
   setSelectedUniverse: (universeId) => set({ selectedUniverseId: universeId }),
 
   setDisplayFormat: (format) => set({ displayFormat: format }),
@@ -2022,6 +2684,22 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     if (channel < 1 || channel > 512) return;
     const clamped =
       value === null ? null : Math.max(0, Math.min(255, Math.round(value)));
+
+    if (clamped !== null) {
+      const existingUnis = get().universes;
+      if (!existingUnis.some((u) => u.id === universe)) {
+        const sorted = [...existingUnis].sort((a, b) => a.id - b.id);
+        let curId = sorted[sorted.length - 1]?.id ?? 0;
+        while (curId < universe) {
+          const nextId = curId + 1;
+          if (!get().universes.some((u) => u.id === nextId)) {
+            const { config } = resolveUniverseDisplayConfig(get().universes, nextId);
+            await get().configureUniverse({ ...config, id: nextId, review_output: false });
+          }
+          curId = nextId;
+        }
+      }
+    }
 
     set((state) => {
       const nextParked = { ...state.parkedChannels };
@@ -2198,6 +2876,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       void get().refreshSnapshot();
       void get().loadFixtures();
       void get().loadShowSnapshot();
+      void get().loadRecentProjects();
       void invoke("subscribe_frames", { channel });
 
       const pollTimer = setInterval(() => {
@@ -2465,7 +3144,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   loadShowSnapshot: async () => {
     if (isTauriEnvironment()) {
       const snapshot = await invoke<ShowSnapshotDto>("get_show_snapshot");
-      get().applyShowSnapshot(snapshot, { markClean: true });
+      get().applyShowSnapshot(snapshot, { markClean: true, replaceBanks: true });
     }
   },
 
@@ -2858,19 +3537,29 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     return serializeShowXmlLocally(get().showState);
   },
 
-  importShowXml: async (xmlStr) => {
+  importShowXml: async (xmlStr, fileHandle = null) => {
     if (isTauriEnvironment()) {
       const snapshot = await invoke<ShowSnapshotDto>("import_show_xml_command", {
         xmlStr,
       });
-      get().applyShowSnapshot(snapshot, { markClean: true });
+      savedProjectFileHandle = fileHandle;
+      get().applyShowSnapshot(snapshot, { markClean: true, replaceBanks: true });
+      await get().checkShowAudioFiles();
       return;
     }
 
     const state = get();
     const prevShow = structuredClone(state.showState);
     const imported = parseShowXmlLocally(xmlStr, state.fixtureDetailsCache);
+    savedProjectFileHandle = fileHandle;
     const nextRev = state.showRevision + 1;
+    const nextBanks: string[] = [];
+    for (const sc of imported.scenes) {
+      const b = sc.bank?.trim();
+      if (b && !nextBanks.includes(b)) {
+        nextBanks.push(b);
+      }
+    }
     set({
       showState: imported,
       universes: imported.network_outputs.universes,
@@ -2878,6 +3567,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         imported.patch,
         state.fixtureDetailsCache,
       ),
+      sceneBanks: nextBanks.length > 0 ? nextBanks : ["Bank 1"],
+      bankColors: { ...(imported.bank_colors ?? {}) },
       patchToast: "Imported .takt.xml show",
       showRevision: nextRev,
       savedRevision: nextRev,
@@ -2888,6 +3579,241 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       canRedo: false,
     });
     get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+    await get().checkShowAudioFiles();
+  },
+
+  checkShowAudioFiles: async () => {
+    const timelines = get().showState.timelines;
+    const refs = collectShowAudioRefs(timelines);
+    if (refs.length === 0) {
+      set({ missingAudioFiles: [], missingAudioModalOpen: false });
+      return [];
+    }
+
+    const missing: MissingAudioFileEntry[] = [];
+    for (const ref of refs) {
+      if (getDecodedAudioAsset(ref.key)) {
+        continue;
+      }
+
+      if (isTauriEnvironment()) {
+        try {
+          const dto = await invoke<AudioFileBytesDto>(
+            "read_audio_file_bytes_command",
+            { path: ref.key },
+          );
+          const { analysis } = await decodeAudioBytes(
+            dto.bytes,
+            ref.key,
+            dto.file_name,
+          );
+          get().setClipAudioAnalysis(ref.key, analysis, ref.timelineIds[0]);
+          continue;
+        } catch {
+          // File not found or unreadable on disk -> prompt user to relink
+        }
+      }
+
+      missing.push({
+        originalKey: ref.key,
+        baseName: ref.baseName,
+        timelineIds: ref.timelineIds,
+        resolved: false,
+      });
+    }
+
+    set({
+      missingAudioFiles: missing,
+      missingAudioModalOpen: missing.length > 0,
+    });
+    return missing;
+  },
+
+  relinkMissingAudioWithFile: async (originalKey, file) => {
+    const entry = get().missingAudioFiles.find(
+      (f) => f.originalKey === originalKey,
+    );
+    const newKey =
+      file.name.toLowerCase() ===
+      extractAudioFileName(originalKey).toLowerCase()
+        ? originalKey
+        : file.name;
+    const { analysis } = await decodeAudioFile(file, 0.65, newKey);
+    get().setClipAudioAnalysis(newKey, analysis, entry?.timelineIds[0]);
+
+    if (newKey !== originalKey) {
+      const affected = get().showState.timelines.filter(
+        (tl) =>
+          tl.audio_track?.file === originalKey ||
+          tl.tracks.some((tr) =>
+            tr.clips.some((c) => c.audio_file === originalKey),
+          ),
+      );
+      for (const tl of affected) {
+        const updated: TimelineDef = {
+          ...tl,
+          audio_track:
+            tl.audio_track?.file === originalKey
+              ? { ...tl.audio_track, file: newKey }
+              : tl.audio_track,
+          tracks: tl.tracks.map((tr) => ({
+            ...tr,
+            clips: tr.clips.map((c) =>
+              c.audio_file === originalKey ? { ...c, audio_file: newKey } : c,
+            ),
+          })),
+        };
+        await get().upsertTimeline(updated);
+      }
+    }
+
+    set((state) => ({
+      missingAudioFiles: state.missingAudioFiles.map((f) =>
+        f.originalKey === originalKey
+          ? { ...f, resolved: true, resolvedPath: file.name }
+          : f,
+      ),
+    }));
+  },
+
+  relinkMissingAudioWithPath: async (originalKey, filePath) => {
+    if (!isTauriEnvironment()) {
+      return {
+        ok: false,
+        message: "Direct path loading requires the desktop app; use Browse File.",
+      };
+    }
+    try {
+      const dto = await invoke<AudioFileBytesDto>(
+        "read_audio_file_bytes_command",
+        { path: filePath },
+      );
+      const entry = get().missingAudioFiles.find(
+        (f) => f.originalKey === originalKey,
+      );
+      const newKey = dto.resolved_path;
+      const { analysis } = await decodeAudioBytes(
+        dto.bytes,
+        newKey,
+        dto.file_name,
+      );
+      get().setClipAudioAnalysis(newKey, analysis, entry?.timelineIds[0]);
+
+      if (newKey !== originalKey) {
+        const affected = get().showState.timelines.filter(
+          (tl) =>
+            tl.audio_track?.file === originalKey ||
+            tl.tracks.some((tr) =>
+              tr.clips.some((c) => c.audio_file === originalKey),
+            ),
+        );
+        for (const tl of affected) {
+          const updated: TimelineDef = {
+            ...tl,
+            audio_track:
+              tl.audio_track?.file === originalKey
+                ? {
+                    ...tl.audio_track,
+                    file: newKey,
+                    abs_fallback: newKey,
+                  }
+                : tl.audio_track,
+            tracks: tl.tracks.map((tr) => ({
+              ...tr,
+              clips: tr.clips.map((c) =>
+                c.audio_file === originalKey ? { ...c, audio_file: newKey } : c,
+              ),
+            })),
+          };
+          await get().upsertTimeline(updated);
+        }
+      }
+
+      set((state) => ({
+        missingAudioFiles: state.missingAudioFiles.map((f) =>
+          f.originalKey === originalKey
+            ? { ...f, resolved: true, resolvedPath: dto.resolved_path }
+            : f,
+        ),
+      }));
+      return { ok: true, message: `Relinked ${dto.file_name}.` };
+    } catch (err) {
+      return {
+        ok: false,
+        message:
+          err instanceof Error ? err.message : String(err || "File not found"),
+      };
+    }
+  },
+
+  relinkMissingAudioFromFolderFiles: async (files) => {
+    const byLowerName = new Map<string, File>();
+    for (const f of files) {
+      const lower = f.name.toLowerCase();
+      if (!byLowerName.has(lower)) {
+        byLowerName.set(lower, f);
+      }
+    }
+
+    const unresolved = get().missingAudioFiles.filter((f) => !f.resolved);
+    let matched = 0;
+    for (const entry of unresolved) {
+      const hit = byLowerName.get(entry.baseName.toLowerCase());
+      if (hit) {
+        await get().relinkMissingAudioWithFile(entry.originalKey, hit);
+        matched += 1;
+      }
+    }
+    return matched;
+  },
+
+  relinkMissingAudioFromFolderPath: async (folderPath) => {
+    if (!isTauriEnvironment()) {
+      return {
+        matched: 0,
+        message: "Folder path scan requires the desktop app; use Browse Folder.",
+      };
+    }
+    const unresolved = get().missingAudioFiles.filter((f) => !f.resolved);
+    if (unresolved.length === 0) {
+      return { matched: 0, message: "All audio files are already relinked." };
+    }
+    try {
+      const matches = await invoke<ResolvedAudioMatchDto[]>(
+        "resolve_audio_in_folder_command",
+        {
+          folderPath,
+          fileNames: unresolved.map((u) => u.originalKey),
+        },
+      );
+      let matched = 0;
+      for (const m of matches) {
+        const res = await get().relinkMissingAudioWithPath(
+          m.requested,
+          m.resolved_path,
+        );
+        if (res.ok) matched += 1;
+      }
+      return {
+        matched,
+        message:
+          matched > 0
+            ? `Relinked ${matched} audio file${matched === 1 ? "" : "s"} from folder.`
+            : "No matching audio files found in that folder.",
+      };
+    } catch (err) {
+      return {
+        matched: 0,
+        message:
+          err instanceof Error
+            ? err.message
+            : String(err || "Folder scan failed"),
+      };
+    }
+  },
+
+  dismissMissingAudioModal: () => {
+    set({ missingAudioModalOpen: false });
   },
 
   upsertColorPalette: async (palette) => {
@@ -3482,6 +4408,17 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   upsertTimeline: async (timeline, coalesceKey) => {
     if (isTauriEnvironment()) {
+      // Optimistically apply timeline update immediately to eliminate drag/trim/fade drop flicker
+      set((state) => {
+        const exists = state.showState.timelines.some((t) => t.id === timeline.id);
+        const nextTimelines = exists
+          ? state.showState.timelines.map((t) => (t.id === timeline.id ? timeline : t))
+          : [...state.showState.timelines, timeline];
+        return {
+          showState: { ...state.showState, timelines: nextTimelines },
+          isDirty: true,
+        };
+      });
       const snap = await invoke<ShowSnapshotDto>("upsert_timeline_command", {
         timeline,
         coalesceKey: coalesceKey ?? null,
@@ -3713,10 +4650,10 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
     await get().upsertTimeline(newTimeline);
     await get().upsertScene(newScene);
+    await get().setTimelineTransport(timelineId, false, 0);
     set({
       selectedSceneId: sceneId,
       multiSelectedSceneIds: [sceneId],
-      activeTimelineId: timelineId,
       studioSubMode: "builder",
     });
     return newScene;
@@ -3727,7 +4664,8 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     const scene = state.showState.scenes.find((s) => s.id === sceneId);
     if (!scene) return null;
     if (scene.timeline_ref) {
-      set({ activeTimelineId: scene.timeline_ref, studioSubMode: "builder" });
+      await get().setTimelineTransport(scene.timeline_ref, false, 0);
+      set({ studioSubMode: "builder" });
       return scene.timeline_ref;
     }
 
@@ -3761,10 +4699,10 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       block_refs: [],
       timeline_ref: timelineId,
     });
+    await get().setTimelineTransport(timelineId, false, 0);
     set({
       selectedSceneId: scene.id,
       multiSelectedSceneIds: [scene.id],
-      activeTimelineId: timelineId,
       studioSubMode: "builder",
     });
     return timelineId;
@@ -3778,6 +4716,9 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     set({ timelineShowTransients: enabled }),
   setTimelineProjectTransients: (enabled) =>
     set({ timelineProjectTransients: enabled }),
+  setTimelineShowBeats: (enabled) => set({ timelineShowBeats: enabled }),
+  setTimelineShowKicks: (enabled) => set({ timelineShowKicks: enabled }),
+  setTimelineShowSnares: (enabled) => set({ timelineShowSnares: enabled }),
 
   setFocusedPatchUniverse: (universeId) =>
     set({ focusedPatchUniverse: Math.max(1, universeId) }),
@@ -3824,10 +4765,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         activeTimelineId: nextTimelineId,
       };
     });
-    if (clearingPausedTimeline && isTauriEnvironment()) {
-      void get().setTimelineTransport(null, false, 0);
-    }
-    if (!isTauriEnvironment()) {
+    if (isTauriEnvironment()) {
+      if (target?.timeline_ref && prev.activeTimelineId !== target.timeline_ref) {
+        void get().setTimelineTransport(target.timeline_ref, false, 0);
+      } else if (clearingPausedTimeline) {
+        void get().setTimelineTransport(null, false, 0);
+      }
+    } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
   },
@@ -3855,6 +4799,30 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     }));
   },
 
+  reorderSceneBanks: (fromBank, toBank) => {
+    const from = fromBank.trim();
+    const to = toBank.trim();
+    if (!from || !to || from === to) return;
+    set((state) => {
+      const ordered: string[] = [];
+      for (const b of state.sceneBanks) {
+        const clean = b.trim();
+        if (clean && !ordered.includes(clean)) ordered.push(clean);
+      }
+      for (const sc of state.showState.scenes) {
+        const clean = sc.bank?.trim();
+        if (clean && !ordered.includes(clean)) ordered.push(clean);
+      }
+      const fromIdx = ordered.indexOf(from);
+      const toIdx = ordered.indexOf(to);
+      if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return state;
+      const next = [...ordered];
+      const [moved] = next.splice(fromIdx, 1);
+      next.splice(toIdx, 0, moved);
+      return { sceneBanks: next };
+    });
+  },
+
   renameSceneBank: async (oldName, newName) => {
     const from = oldName.trim();
     const to = newName.trim();
@@ -3873,12 +4841,18 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       nextFades[to] = nextFades[from];
       delete nextFades[from];
     }
+    const nextColors = { ...state.bankColors };
+    if (from in nextColors) {
+      nextColors[to] = nextColors[from];
+      delete nextColors[from];
+    }
 
     if (isTauriEnvironment()) {
       set({
         sceneBanks: nextBanks,
         stackableBanks: nextStackable,
         bankDefaultFades: nextFades,
+        bankColors: nextColors,
       });
       const snap = await invoke<ShowSnapshotDto>("rename_scene_bank_command", {
         oldName: from,
@@ -3903,14 +4877,20 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     );
     if (!hasAffected) {
       set({
+        showState: {
+          ...prevShow,
+          bank_colors: nextColors,
+        },
         sceneBanks: nextBanks,
         stackableBanks: nextStackable,
         bankDefaultFades: nextFades,
+        bankColors: nextColors,
       });
       return;
     }
     const nextShow: ShowStateDto = {
       ...prevShow,
+      bank_colors: nextColors,
       scenes: prevShow.scenes.map((sc) =>
         sc.bank?.trim() === from ? { ...sc, bank: to } : sc,
       ),
@@ -3921,6 +4901,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       sceneBanks: nextBanks,
       stackableBanks: nextStackable,
       bankDefaultFades: nextFades,
+      bankColors: nextColors,
       _simUndo: nextUndo,
       _simRedo: [],
       showRevision: state.showRevision + 1,
@@ -3943,9 +4924,24 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     for (const sc of toRemove) {
       await get().deleteScene(sc.id);
     }
-    set({
-      sceneBanks: nextBanks,
+    set((state) => {
+      const nextColors = { ...state.bankColors };
+      delete nextColors[target];
+      return {
+        sceneBanks: nextBanks,
+        bankColors: nextColors,
+        showState: {
+          ...state.showState,
+          bank_colors: nextColors,
+        },
+      };
     });
+    if (isTauriEnvironment()) {
+      void invoke("set_bank_color_command", {
+        bankName: target,
+        color: null,
+      }).catch(() => undefined);
+    }
   },
 
   toggleBankStackable: (bankName) => {
@@ -3957,6 +4953,35 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         [target]: !state.stackableBanks[target],
       },
     }));
+  },
+
+  setBankColor: (bankName, color) => {
+    const target = bankName.trim();
+    if (!target) return;
+    const clean = color?.trim() || null;
+    set((state) => {
+      const nextColors = { ...state.bankColors };
+      if (!clean) {
+        delete nextColors[target];
+      } else {
+        nextColors[target] = clean;
+      }
+      return {
+        bankColors: nextColors,
+        showState: {
+          ...state.showState,
+          bank_colors: nextColors,
+        },
+        showRevision: state.showRevision + 1,
+        isDirty: true,
+      };
+    });
+    if (isTauriEnvironment()) {
+      void invoke("set_bank_color_command", {
+        bankName: target,
+        color: clean,
+      }).catch(() => undefined);
+    }
   },
 
   releaseBankScenes: async (bankName, tSec) => {
@@ -4022,17 +5047,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     }
 
     let targets: string[] = [];
-    if (state.selectedFixtureIds.length > 0) {
+    if (state.selectedCellIndices.length > 0) {
+      const selectedCells = state.selectedCellIndices
+        .map((idx) => state.compiledCells[idx])
+        .filter((c): c is NonNullable<typeof c> => Boolean(c));
+      targets = compactCellTargets(selectedCells);
+    } else if (state.selectedFixtureIds.length > 0) {
       targets = [...state.selectedFixtureIds];
-    } else if (state.selectedCellIndices.length > 0) {
-      targets = Array.from(
-        new Set(
-          state.selectedCellIndices
-            .map((idx) => state.compiledCells[idx])
-            .filter((c): c is NonNullable<typeof c> => Boolean(c))
-            .map((c) => `${c.fixture_id}:${c.cell_index}`),
-        ),
-      );
     } else if (state.selectedFixtureInstanceId) {
       targets = [state.selectedFixtureInstanceId];
     } else {
@@ -4124,10 +5145,61 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     while (state.showState.scenes.some((s) => s.id === `${src.id}_copy_${suffix}`)) {
       suffix += 1;
     }
+
+    // Deep-clone referenced FX blocks so editing the copy never mutates the original scene
+    const usedBlockIds = new Set(state.showState.fx_library.map((b) => b.id));
+    const clonedBlockRefs: string[] = [];
+    for (const blockId of src.block_refs) {
+      const origBlock = state.showState.fx_library.find((b) => b.id === blockId);
+      if (!origBlock) {
+        clonedBlockRefs.push(blockId);
+        continue;
+      }
+      let blkSuffix = 2;
+      let newBlockId = `${origBlock.id}_copy_${blkSuffix}`;
+      while (usedBlockIds.has(newBlockId)) {
+        blkSuffix += 1;
+        newBlockId = `${origBlock.id}_copy_${blkSuffix}`;
+      }
+      usedBlockIds.add(newBlockId);
+      const clonedBlock: FxBlockDef = {
+        ...structuredClone(origBlock),
+        id: newBlockId,
+      };
+      await get().upsertFxBlock(clonedBlock);
+      clonedBlockRefs.push(newBlockId);
+    }
+
+    // Deep-clone referenced Timeline if this is a timeline scene
+    let clonedTimelineRef: string | null | undefined = src.timeline_ref;
+    if (src.timeline_ref) {
+      const origTl = state.showState.timelines.find(
+        (t) => t.id === src.timeline_ref,
+      );
+      if (origTl) {
+        const usedTlIds = new Set(state.showState.timelines.map((t) => t.id));
+        let tlSuffix = 2;
+        let newTlId = `${origTl.id}_copy_${tlSuffix}`;
+        while (usedTlIds.has(newTlId)) {
+          tlSuffix += 1;
+          newTlId = `${origTl.id}_copy_${tlSuffix}`;
+        }
+        const clonedTl: TimelineDef = {
+          ...structuredClone(origTl),
+          id: newTlId,
+          name: `${origTl.name} Copy`,
+        };
+        await get().upsertTimeline(clonedTl);
+        clonedTimelineRef = newTlId;
+      }
+    }
+
     const copy: SceneDef = {
       ...structuredClone(src),
       id: `${src.id}_copy_${suffix}`,
       name: `${src.name} Copy`,
+      block_refs: clonedBlockRefs,
+      timeline_ref: clonedTimelineRef,
     };
     await get().upsertScene(copy);
     set({
@@ -4429,6 +5501,10 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   applyCellSelectionPattern: (pattern, groupFilterId) => {
     const state = get();
+    if (pattern === "none") {
+      set({ selectedCellIndices: [] });
+      return;
+    }
     const total = state.compiledCells.length;
     if (total === 0) {
       set({ selectedCellIndices: [] });
@@ -4440,11 +5516,24 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         ? state.showState.groups.find((g) => g.id === groupFilterId) ?? null
         : null;
     if (targetGrp) {
+      const allowedKeys = new Set<string>();
+      for (const ref of targetGrp.targets) {
+        const trimmed = ref.trim();
+        const colonIdx = trimmed.indexOf(":");
+        const fxId = colonIdx === -1 ? trimmed : trimmed.slice(0, colonIdx).trim();
+        const fx = state.showState.patch.find((f) => f.id === fxId);
+        if (!fx) continue;
+        const detail = state.fixtureDetailsCache[fx.profile];
+        const mode = detail?.expanded_modes.find((m) => m.name === fx.mode);
+        const cellCount = mode?.cells.length ?? 1;
+        for (const cIdx of expandTargetRange(trimmed, cellCount)) {
+          allowedKeys.add(`${fxId}:${cIdx}`);
+        }
+      }
       state.compiledCells.forEach((c, idx) => {
-        const matches = targetGrp.targets.some(
-          (t) => t === c.fixture_id || t.startsWith(`${c.fixture_id}:`),
-        );
-        if (matches) candidateIndices.push(idx);
+        if (allowedKeys.has(`${c.fixture_id}:${c.cell_index}`)) {
+          candidateIndices.push(idx);
+        }
       });
     } else {
       for (let i = 0; i < total; i++) candidateIndices.push(i);
@@ -4489,6 +5578,29 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   setSelectedCellIndices: (indices) => set({ selectedCellIndices: indices }),
 
+  toggleCellSelection: (cellIndex, additive = false) =>
+    set((state) => {
+      const exists = state.selectedCellIndices.includes(cellIndex);
+      if (!additive) {
+        return {
+          selectedCellIndices:
+            exists && state.selectedCellIndices.length === 1 ? [] : [cellIndex],
+        };
+      }
+      return {
+        selectedCellIndices: exists
+          ? state.selectedCellIndices.filter((i) => i !== cellIndex)
+          : [...state.selectedCellIndices, cellIndex],
+      };
+    }),
+
+  clearSelections: () =>
+    set({
+      selectedFixtureIds: [],
+      selectedFixtureInstanceId: null,
+      selectedCellIndices: [],
+    }),
+
   setActiveGroupFilterId: (groupId) => set({ activeGroupFilterId: groupId }),
 
   setCanvasOrderRule: (rule) => set({ canvasOrderRule: rule }),
@@ -4499,5 +5611,16 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   dismissToast: () => set({ patchToast: null }),
 
-  resetForTest: () => set(createInitialState()),
+  resetForTest: () => {
+    savedProjectFileHandle = null;
+    try {
+      if (typeof window !== "undefined" && typeof window.localStorage !== "undefined") {
+        window.localStorage.removeItem(STUDIO_LAYOUT_STORAGE_KEY);
+        window.localStorage.removeItem(RECENT_PROJECTS_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    set(createInitialState());
+  },
 }));

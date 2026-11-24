@@ -1,3 +1,5 @@
+import type { TrackDef } from "./mixerLogic";
+
 export interface TimeInterval {
   start_sec: number;
   duration_sec: number;
@@ -433,4 +435,212 @@ export function clampTrimEndNonOverlapping(
   return Number(
     Math.max(minAllowed, Math.min(ceilEnd, desiredEnd)).toFixed(6),
   );
+}
+
+/**
+ * Ensures there is always at least one empty `untyped` track below the lowest
+ * track that currently contains clips.
+ */
+export function ensureTrailingEmptyTrack(tracks: TrackDef[]): TrackDef[] {
+  if (tracks.length === 0) {
+    return [
+      {
+        id: "trk_1",
+        name: "Track 1",
+        track_type: "untyped",
+        target_group: "all",
+        clips: [],
+      },
+    ];
+  }
+
+  let lastUsedIdx = -1;
+  for (let i = tracks.length - 1; i >= 0; i--) {
+    if (tracks[i].clips.length > 0) {
+      lastUsedIdx = i;
+      break;
+    }
+  }
+  if (lastUsedIdx === -1) {
+    return tracks;
+  }
+
+  const hasFreeBelow = tracks
+    .slice(lastUsedIdx + 1)
+    .some(
+      (t) =>
+        t.clips.length === 0 && (t.track_type ?? "untyped") === "untyped",
+    );
+  if (hasFreeBelow) {
+    return tracks;
+  }
+
+  let maxTrackNum = tracks.length;
+  for (const tr of tracks) {
+    const m = tr.name.match(/^Track\s+(\d+)$/i);
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > maxTrackNum) maxTrackNum = n;
+    }
+  }
+  const nextNum = maxTrackNum + 1;
+  const candidateId = `trk_${nextNum}`;
+  const id = tracks.some((t) => t.id === candidateId)
+    ? `trk_${Date.now()}_${nextNum}`
+    : candidateId;
+
+  return [
+    ...tracks,
+    {
+      id,
+      name: `Track ${nextNum}`,
+      track_type: "untyped",
+      target_group: "all",
+      clips: [],
+    },
+  ];
+}
+
+export type SnapTargetKind = "beat" | "kick" | "snare" | "clip";
+
+export interface SnapTarget {
+  time_sec: number;
+  kind: SnapTargetKind;
+}
+
+const SNAP_KIND_PRIORITY: Record<SnapTargetKind, number> = {
+  snare: 3,
+  kick: 3,
+  beat: 2,
+  clip: 1,
+};
+
+export function computeSnapThresholdSec(
+  pxPerSec: number,
+  maxPx = 10,
+): number {
+  return Math.max(0.04, Math.min(0.22, maxPx / Math.max(1, pxPerSec)));
+}
+
+export function buildTimelineSnapTargets(args: {
+  viewportDurationSec: number;
+  effectiveBpm: number;
+  gridOffsetSec: number;
+  snapGrid: SnapGridSubdivision;
+  showBeats: boolean;
+  showKicks: boolean;
+  showSnares: boolean;
+  transients: ReadonlyArray<{ time_sec: number; band: "kick" | "snare" }>;
+  tracks: ReadonlyArray<TrackDef>;
+  excludeClip?: { trackId: string; clipIndex: number } | null;
+}): SnapTarget[] {
+  const targets: SnapTarget[] = [];
+
+  if (args.showBeats) {
+    const gridTimes = computeSnapGridMarkers(
+      args.viewportDurationSec,
+      args.effectiveBpm,
+      args.gridOffsetSec,
+      args.snapGrid,
+    );
+    for (const time_sec of gridTimes) {
+      targets.push({ time_sec, kind: "beat" });
+    }
+  }
+
+  for (const m of args.transients) {
+    if ((m.band === "kick" && args.showKicks) || (m.band === "snare" && args.showSnares)) {
+      targets.push({ time_sec: m.time_sec, kind: m.band });
+    }
+  }
+
+  for (const trk of args.tracks) {
+    for (let idx = 0; idx < trk.clips.length; idx++) {
+      if (
+        args.excludeClip &&
+        trk.id === args.excludeClip.trackId &&
+        idx === args.excludeClip.clipIndex
+      ) {
+        continue;
+      }
+      const c = trk.clips[idx];
+      targets.push({ time_sec: c.start_sec, kind: "clip" });
+      targets.push({ time_sec: c.start_sec + c.duration_sec, kind: "clip" });
+    }
+  }
+
+  return targets;
+}
+
+export function snapTimeSecToTargets(
+  timeSec: number,
+  targets: ReadonlyArray<SnapTarget>,
+  maxDistanceSec = 0.15,
+): { time_sec: number; snappedTo: SnapTarget | null } {
+  let bestTarget: SnapTarget | null = null;
+  let bestDist = maxDistanceSec;
+
+  for (const target of targets) {
+    const dist = Math.abs(timeSec - target.time_sec);
+    if (dist > bestDist + 1e-4) continue;
+    if (dist <= bestDist - 1e-4) {
+      bestDist = dist;
+      bestTarget = target;
+    } else if (dist <= maxDistanceSec) {
+      const candPriority = SNAP_KIND_PRIORITY[target.kind];
+      const bestPriority = bestTarget ? SNAP_KIND_PRIORITY[bestTarget.kind] : -1;
+      if (!bestTarget || candPriority > bestPriority || (candPriority === bestPriority && dist < bestDist)) {
+        bestDist = dist;
+        bestTarget = target;
+      }
+    }
+  }
+
+  if (!bestTarget) {
+    return {
+      time_sec: Number(timeSec.toFixed(4)),
+      snappedTo: null,
+    };
+  }
+
+  return {
+    time_sec: Number(bestTarget.time_sec.toFixed(4)),
+    snappedTo: bestTarget,
+  };
+}
+
+export type AutoFillCadence = 1 | 2 | 4;
+
+/**
+ * Selects non-overlapping auto-fill timestamps according to cadence (every 1st/2nd/4th hit)
+ * and optional maximum hit count (when limited, counts forward from `startFromSec`).
+ */
+export function selectAutoFillHitTimes(args: {
+  hitTimes: ReadonlyArray<number>;
+  startFromSec: number;
+  cadence: AutoFillCadence;
+  offset?: number;
+  maxCount: number | null;
+  minGapSec: number;
+}): number[] {
+  const safeStart = Math.max(0, args.startFromSec);
+  const safeGap = Math.max(0.01, args.minGapSec);
+  const safeOffset = Math.max(0, Math.min(args.cadence - 1, Math.floor(args.offset ?? 0)));
+  const sorted = [...args.hitTimes].sort((a, b) => a - b);
+
+  const nonOverlapping: number[] = [];
+  let lastEnd = -1;
+  for (const t of sorted) {
+    if (args.maxCount !== null && t < safeStart - 1e-3) continue;
+    if (t >= lastEnd - 1e-3) {
+      nonOverlapping.push(t);
+      lastEnd = t + safeGap;
+    }
+  }
+
+  const cadenced = nonOverlapping.filter((_, idx) => idx % args.cadence === safeOffset);
+  if (args.maxCount !== null) {
+    return cadenced.slice(0, Math.max(1, Math.floor(args.maxCount)));
+  }
+  return cadenced;
 }

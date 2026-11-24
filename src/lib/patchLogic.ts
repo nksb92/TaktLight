@@ -79,6 +79,7 @@ export interface ShowStateDto {
   fx_library: FxBlockDef[];
   scenes: SceneDef[];
   timelines: TimelineDef[];
+  bank_colors?: Record<string, string>;
 }
 
 export interface UniverseSegment {
@@ -474,6 +475,66 @@ export function expandTargetRange(
   return Number.isInteger(single) && single >= 0 && single < cellCount
     ? [single]
     : [];
+}
+
+export function resolveUniverseDisplayConfig(
+  universes: UniverseConfig[],
+  targetId: number,
+): { config: UniverseConfig; isPreview: boolean } {
+  const existing = universes.find((u) => u.id === targetId);
+  if (existing) return { config: existing, isPreview: false };
+
+  const sorted = [...universes].sort((a, b) => a.id - b.id);
+  let base: UniverseConfig =
+    sorted[sorted.length - 1] ?? {
+      id: 1,
+      review_output: false,
+      protocol: {
+        protocol: "art_net",
+        mode: { mode: "broadcast" },
+        net: 0,
+        subnet: 0,
+        uni: 0,
+      },
+    };
+  let curId = base.id;
+  while (curId < targetId) {
+    base = inheritNextUniverse(base, curId + 1);
+    curId += 1;
+  }
+  return { config: { ...base, review_output: false }, isPreview: true };
+}
+
+export function compactCellTargets(
+  cells: Array<{ fixture_id: string; cell_index: number }>,
+): string[] {
+  const byFixture = new Map<string, Set<number>>();
+  const order: string[] = [];
+  for (const c of cells) {
+    let set = byFixture.get(c.fixture_id);
+    if (!set) {
+      set = new Set<number>();
+      byFixture.set(c.fixture_id, set);
+      order.push(c.fixture_id);
+    }
+    set.add(c.cell_index);
+  }
+  const targets: string[] = [];
+  for (const fxId of order) {
+    const sorted = Array.from(byFixture.get(fxId)!).sort((a, b) => a - b);
+    let i = 0;
+    while (i < sorted.length) {
+      const start = sorted[i];
+      let end = start;
+      while (i + 1 < sorted.length && sorted[i + 1] === end + 1) {
+        i += 1;
+        end = sorted[i];
+      }
+      targets.push(start === end ? `${fxId}:${start}` : `${fxId}:${start}..${end}`);
+      i += 1;
+    }
+  }
+  return targets;
 }
 
 export function transformCellUv(

@@ -1,7 +1,10 @@
 import type { ExpandedChannel, FixtureDetail } from "./oflBuilder";
 import {
+  type CompiledCell,
   computeOrderU,
   expandTargetRange,
+  type FixtureGroupDef,
+  type FixtureInstance,
   type OrderRuleStr,
   type ShowStateDto,
   transformCellUv,
@@ -17,6 +20,14 @@ export type Shader2DKind =
   | "plasma";
 export type DurationUnit = "beats" | "seconds";
 export type FxKindTag = "color_fx" | "value_fx" | "curve_fx";
+export type SequencePlaybackMode = "loop" | "one_shot" | "bounce";
+
+export interface SceneSequenceStepDef {
+  scene_id: string;
+  duration_value: number;
+  duration_unit: DurationUnit;
+  fade_sec: number;
+}
 
 export type FxElementDef =
   | {
@@ -77,6 +88,7 @@ export type FxElementDef =
       rate_beats: number | null;
       speed_hz: number | null;
       rate_cycles?: number | null;
+      phase_offset?: number | null;
       spatial_freq: number;
       color_width?: number;
       gradient?: number;
@@ -87,7 +99,145 @@ export type FxElementDef =
       direction_deg: number;
       center_x: number;
       center_y: number;
+      box_half_x?: number | null;
+      box_half_y?: number | null;
+    }
+  | {
+      kind: "scene_sequence";
+      playback_mode: SequencePlaybackMode;
+      steps: SceneSequenceStepDef[];
     };
+
+export function computeSceneSequenceDurationSec(
+  steps: SceneSequenceStepDef[],
+  bpm: number,
+): number {
+  const safeBpm = Math.max(1, Number.isFinite(bpm) ? bpm : 120);
+  const secPerBeat = 60 / safeBpm;
+  let total = 0;
+  for (const st of steps) {
+    const val = Math.max(0.05, Number.isFinite(st.duration_value) ? st.duration_value : 0.05);
+    total += st.duration_unit === "seconds" ? val : val * secPerBeat;
+  }
+  return total;
+}
+
+export interface ActiveSequenceStepInfo {
+  activeIndex: number;
+  prevIndex: number | null;
+  stepLocalSec: number;
+  stepDurationSec: number;
+  fadeAlpha: number;
+}
+
+export function getActiveSequenceStepAt(
+  steps: SceneSequenceStepDef[],
+  playbackMode: SequencePlaybackMode,
+  tSec: number,
+  bpm: number,
+): ActiveSequenceStepInfo | null {
+  const n = steps.length;
+  if (n === 0) return null;
+  const safeBpm = Math.max(1, Number.isFinite(bpm) ? bpm : 120);
+  const secPerBeat = 60 / safeBpm;
+  const stepDurs = steps.map((st) => {
+    const val = Math.max(0.05, Number.isFinite(st.duration_value) ? st.duration_value : 0.05);
+    return st.duration_unit === "seconds" ? val : val * secPerBeat;
+  });
+  const totalLinearDur = stepDurs.reduce((a, b) => a + b, 0);
+  if (totalLinearDur <= 1e-9) return null;
+
+  const tClamped = Math.max(0, Number.isFinite(tSec) ? tSec : 0);
+  let activeIndex = 0;
+  let prevIndex: number | null = null;
+  let stepLocalSec = 0;
+
+  if (playbackMode === "loop") {
+    const tMod = remEuclid(tClamped, totalLinearDur);
+    let acc = 0;
+    activeIndex = n - 1;
+    for (let i = 0; i < n; i++) {
+      if (tMod < acc + stepDurs[i] || i === n - 1) {
+        activeIndex = i;
+        stepLocalSec = Math.max(0, tMod - acc);
+        break;
+      }
+      acc += stepDurs[i];
+    }
+    if (n > 1 && (activeIndex > 0 || tClamped >= stepDurs[0])) {
+      prevIndex = (activeIndex + n - 1) % n;
+    }
+  } else if (playbackMode === "one_shot") {
+    if (tClamped >= totalLinearDur) {
+      activeIndex = n - 1;
+      stepLocalSec = stepDurs[n - 1];
+      prevIndex = null;
+    } else {
+      let acc = 0;
+      activeIndex = n - 1;
+      for (let i = 0; i < n; i++) {
+        if (tClamped < acc + stepDurs[i] || i === n - 1) {
+          activeIndex = i;
+          stepLocalSec = Math.max(0, tClamped - acc);
+          break;
+        }
+        acc += stepDurs[i];
+      }
+      if (activeIndex > 0) {
+        prevIndex = activeIndex - 1;
+      }
+    }
+  } else {
+    // bounce
+    if (n === 1) {
+      activeIndex = 0;
+      stepLocalSec = remEuclid(tClamped, stepDurs[0]);
+      prevIndex = null;
+    } else {
+      const order: number[] = [];
+      for (let i = 0; i < n; i++) order.push(i);
+      for (let i = n - 2; i >= 1; i--) order.push(i);
+      const cycleDur = order.reduce((sum, idx) => sum + stepDurs[idx], 0);
+      const tMod = remEuclid(tClamped, cycleDur);
+      let acc = 0;
+      let foundPos = order.length - 1;
+      for (let pos = 0; pos < order.length; pos++) {
+        const dur = stepDurs[order[pos]];
+        if (tMod < acc + dur || pos === order.length - 1) {
+          foundPos = pos;
+          stepLocalSec = Math.max(0, tMod - acc);
+          break;
+        }
+        acc += dur;
+      }
+      activeIndex = order[foundPos];
+      if (foundPos > 0 || tClamped >= stepDurs[order[0]]) {
+        prevIndex = order[(foundPos + order.length - 1) % order.length];
+      }
+    }
+  }
+
+  const stepDurationSec = stepDurs[activeIndex];
+  const fadeSec = Math.min(
+    stepDurationSec,
+    Math.max(0, steps[activeIndex].fade_sec || 0),
+  );
+  const fadeAlpha =
+    fadeSec > 1e-6 &&
+    stepLocalSec < fadeSec &&
+    prevIndex !== null &&
+    prevIndex !== activeIndex
+      ? clamp01(stepLocalSec / fadeSec)
+      : 1;
+
+  return {
+    activeIndex,
+    prevIndex,
+    stepLocalSec,
+    stepDurationSec,
+    fadeAlpha,
+  };
+}
 
 export interface FxBlockDef {
   id: string;
@@ -379,13 +529,130 @@ export function amplitudeOffsetToRangePct(
 }
 
 export function patternScaleToSpatialFreq(scale: number): number {
-  const clamped = Math.max(0.25, Math.min(4.0, scale || 1));
+  const clamped = Math.max(0.25, Math.min(10.0, scale || 1));
   return Number((1 / clamped).toFixed(3));
 }
 
 export function spatialFreqToPatternScale(freq: number): number {
-  const clampedFreq = Math.max(0.1, freq || 1);
-  return Number(Math.max(0.25, Math.min(4.0, 1 / clampedFreq)).toFixed(2));
+  const clampedFreq = Math.max(0.05, freq || 1);
+  return Number(Math.max(0.25, Math.min(10.0, 1 / clampedFreq)).toFixed(2));
+}
+
+/** Convert pattern scale (0.25..10.0) to normalized gizmo half-extent (0.08..2.0). */
+export function patternScaleToBoxHalfNorm(patternScale: number): number {
+  return Math.min(2.0, Math.max(0.08, 0.2 * patternScale));
+}
+
+/** Resolve independent `[boxHalfX, boxHalfY]` gizmo bounds, falling back to `spatialFreq`. */
+export function resolveGizmoHalfExtents(
+  spatialFreq: number,
+  boxHalfX?: number | null,
+  boxHalfY?: number | null,
+): [number, number] {
+  const fallback = patternScaleToBoxHalfNorm(spatialFreqToPatternScale(spatialFreq));
+  const hx = Math.min(2.0, Math.max(0.05, boxHalfX ?? fallback));
+  const hy = Math.min(2.0, Math.max(0.05, boxHalfY ?? fallback));
+  return [hx, hy];
+}
+
+export interface TargetGizmoBounds {
+  centerX: number;
+  centerY: number;
+  spatialFreq: number;
+  boxHalfX: number;
+  boxHalfY: number;
+}
+
+/**
+ * Compute bounding-box gizmo parameters covering the targeted cells/fixtures
+ * (or fallback fixture IDs / all patched fixtures).
+ */
+export function computeTargetGizmoBounds(params: {
+  compiledCells: CompiledCell[];
+  patch: FixtureInstance[];
+  groups: FixtureGroupDef[];
+  targetGroup?: string | null;
+  fallbackFixtureIds?: string[];
+}): TargetGizmoBounds {
+  const { compiledCells, patch, groups, targetGroup, fallbackFixtureIds } = params;
+  const rawTarget = (targetGroup ?? "").trim();
+
+  const cellKeyFilter = new Set<string>();
+  const fixtureIdFilter = new Set<string>();
+
+  if (rawTarget && rawTarget !== "all" && rawTarget !== "*") {
+    const grp = groups.find((g) => g.id === rawTarget);
+    const refs = grp ? grp.targets : [rawTarget];
+    for (const ref of refs) {
+      const trimmed = ref.trim();
+      if (!trimmed) continue;
+      const colonIdx = trimmed.indexOf(":");
+      const fxId = colonIdx === -1 ? trimmed : trimmed.slice(0, colonIdx).trim();
+      if (!fxId) continue;
+      fixtureIdFilter.add(fxId);
+      const fxCells = compiledCells.filter((c) => c.fixture_id === fxId);
+      const cellCount = fxCells.length > 0 ? Math.max(...fxCells.map((c) => c.cell_index)) + 1 : 1;
+      for (const cIdx of expandTargetRange(trimmed, cellCount)) {
+        cellKeyFilter.add(`${fxId}:${cIdx}`);
+      }
+    }
+  } else if (fallbackFixtureIds && fallbackFixtureIds.length > 0) {
+    for (const id of fallbackFixtureIds) fixtureIdFilter.add(id);
+  } else {
+    for (const fx of patch) fixtureIdFilter.add(fx.id);
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const cell of compiledCells) {
+    if (cellKeyFilter.size > 0) {
+      if (!cellKeyFilter.has(`${cell.fixture_id}:${cell.cell_index}`)) continue;
+    } else if (!fixtureIdFilter.has(cell.fixture_id)) {
+      continue;
+    }
+    minX = Math.min(minX, cell.canvas_xy[0]);
+    maxX = Math.max(maxX, cell.canvas_xy[0]);
+    minY = Math.min(minY, cell.canvas_xy[1]);
+    maxY = Math.max(maxY, cell.canvas_xy[1]);
+  }
+
+  if (!Number.isFinite(minX)) {
+    for (const fx of patch) {
+      if (!fixtureIdFilter.has(fx.id)) continue;
+      const hx = Math.max(0.02, fx.grid_pos.scale_x * 0.5);
+      const hy = Math.max(0.02, fx.grid_pos.scale_y * 0.5);
+      minX = Math.min(minX, fx.grid_pos.x - hx);
+      maxX = Math.max(maxX, fx.grid_pos.x + hx);
+      minY = Math.min(minY, fx.grid_pos.y - hy);
+      maxY = Math.max(maxY, fx.grid_pos.y + hy);
+    }
+  }
+
+  if (!Number.isFinite(minX)) {
+    return {
+      centerX: 0.5,
+      centerY: 0.5,
+      spatialFreq: 1.0,
+      boxHalfX: 0.2,
+      boxHalfY: 0.2,
+    };
+  }
+
+  const centerX = Number(((minX + maxX) * 0.5).toFixed(3));
+  const centerY = Number(((minY + maxY) * 0.5).toFixed(3));
+  const boxHalfX = Number(
+    Math.min(2.0, Math.max(0.08, (maxX - minX) * 0.5 + 0.03)).toFixed(3),
+  );
+  const boxHalfY = Number(
+    Math.min(2.0, Math.max(0.08, (maxY - minY) * 0.5 + 0.03)).toFixed(3),
+  );
+  const neededHalf = Math.max(boxHalfX, boxHalfY);
+  const patternScale = Math.min(10.0, Math.max(0.4, neededHalf / 0.2));
+  const spatialFreq = Number(patternScaleToSpatialFreq(patternScale).toFixed(3));
+  return { centerX, centerY, spatialFreq, boxHalfX, boxHalfY };
 }
 
 export function buildCurve1DSvgPreview(params: {
@@ -960,12 +1227,14 @@ export function evaluateSpatialShader2DPhase(args: {
     centerY,
     transform,
   } = args;
+  const patternScale = Math.min(10, Math.max(0.25, 1 / Math.max(0.05, spatialFreq)));
+  const boxHalfNorm = patternScaleToBoxHalfNorm(patternScale);
   let dx = normXy[0] - centerX;
   let dy = normXy[1] - centerY;
   if (transform === "mirror_x") {
-    dx = -dx;
+    dx = Math.abs(dx) - 0.5 * boxHalfNorm;
   } else if (transform === "mirror_y") {
-    dy = -dy;
+    dy = Math.abs(dy) - 0.5 * boxHalfNorm;
   } else if (transform === "invert") {
     dx = -dx;
     dy = -dy;
@@ -1537,7 +1806,11 @@ export function evaluateSimulationLayersToDmx(args: {
   ): number => {
     if (speedHz && speedHz > 0) return tLocal * speedHz;
     if (legacyBeats && legacyBeats > 0) return bBlock / legacyBeats;
-    return cycleCycles * Math.max(1e-4, rateCycles ?? 1);
+    if (rateCycles !== undefined && rateCycles !== null) {
+      if (rateCycles <= 0) return 0;
+      return cycleCycles * rateCycles;
+    }
+    return cycleCycles;
   };
 
   const applyScalarTraitToCell = (
@@ -1620,6 +1893,7 @@ export function evaluateSimulationLayersToDmx(args: {
     tLocal: number,
     bLocal: number,
     sceneDuration?: { value: number; unit: DurationUnit },
+    depth = 0,
   ) => {
     const durBeats = Math.max(
       0.05,
@@ -1648,6 +1922,84 @@ export function evaluateSimulationLayersToDmx(args: {
     }
 
     for (const elem of block.elements) {
+      if (elem.kind === "scene_sequence") {
+        if (depth >= 4 || elem.steps.length === 0 || alpha <= 0) continue;
+        const secPerBeat =
+          tLocal > 1e-6 && bLocal > 1e-6
+            ? Math.max(0.05, Math.min(10, tLocal / bLocal))
+            : 60 / Math.max(1, show.bpm || 120);
+        const effBpm = 60 / secPerBeat;
+        const info = getActiveSequenceStepAt(
+          elem.steps,
+          elem.playback_mode,
+          tLocal,
+          effBpm,
+        );
+        if (!info) continue;
+        const honorStepTargets =
+          !targetGroup.trim() || targetGroup.trim().toLowerCase() === "all";
+
+        const evalStep = (
+          stepIdx: number,
+          weightAlpha: number,
+          localTSec: number,
+        ) => {
+          if (weightAlpha <= 1e-6) return;
+          const stepScene = show.scenes.find(
+            (s) => s.id === elem.steps[stepIdx].scene_id,
+          );
+          if (!stepScene || stepScene.timeline_ref) return;
+          const stepBLocal = localTSec / secPerBeat;
+          const stepDur =
+            stepScene.duration_value !== undefined
+              ? {
+                  value: stepScene.duration_value,
+                  unit: stepScene.duration_unit ?? ("beats" as DurationUnit),
+                }
+              : undefined;
+          for (const blockId of stepScene.block_refs) {
+            if (block.id && blockId === block.id) continue;
+            const stepBlock = show.fx_library.find((b) => b.id === blockId);
+            if (!stepBlock) continue;
+            const resolvedTarget = honorStepTargets
+              ? stepScene.target_group?.trim() ||
+                stepBlock.target_group?.trim() ||
+                targetGroup
+              : targetGroup;
+            foldFxBlock(
+              stepBlock,
+              resolvedTarget,
+              weightAlpha,
+              localTSec,
+              stepBLocal,
+              stepDur,
+              depth + 1,
+            );
+          }
+        };
+
+        if (
+          info.fadeAlpha < 1 &&
+          info.prevIndex !== null &&
+          info.prevIndex !== info.activeIndex
+        ) {
+          const prevStep = elem.steps[info.prevIndex];
+          const prevDurSec =
+            prevStep.duration_unit === "seconds"
+              ? Math.max(0.05, prevStep.duration_value)
+              : Math.max(0.05, prevStep.duration_value) * secPerBeat;
+          evalStep(
+            info.prevIndex,
+            alpha * (1 - info.fadeAlpha),
+            prevDurSec + info.stepLocalSec,
+          );
+          evalStep(info.activeIndex, alpha * info.fadeAlpha, info.stepLocalSec);
+        } else {
+          evalStep(info.activeIndex, alpha, info.stepLocalSec);
+        }
+        continue;
+      }
+
       const orderOverride = "order" in elem ? elem.order : null;
       const { cells, fixtures } = resolveTarget(
         targetGroup,
@@ -1887,25 +2239,29 @@ export function evaluateSimulationLayersToDmx(args: {
         }
       } else if (elem.kind === "spatial_shader_2d") {
         const isColor = elem.trait === "color";
-        const basePhase = resolveBasePhase(
-          bBlock,
-          tLocal,
-          cycleCycles,
-          elem.rate_beats,
-          elem.speed_hz,
-          elem.rate_cycles,
-        );
+        const basePhase =
+          resolveBasePhase(
+            bBlock,
+            tLocal,
+            cycleCycles,
+            elem.rate_beats,
+            elem.speed_hz,
+            elem.rate_cycles,
+          ) + (elem.phase_offset ?? 0);
         const gradient = elem.gradient ?? 1;
         const grayscale = elem.grayscale ?? false;
         const colorWidth = elem.color_width ?? 1;
-        const patternScale = spatialFreqToPatternScale(elem.spatial_freq);
-        const boxHalfNorm = Math.min(0.45, Math.max(0.08, 0.2 * patternScale));
+        const [boxHalfX, boxHalfY] = resolveGizmoHalfExtents(
+          elem.spatial_freq,
+          elem.box_half_x,
+          elem.box_half_y,
+        );
 
         for (const [cellIdx] of cells) {
           const xy = cellCanvasXy[cellIdx] ?? [0.5, 0.5];
           if (
-            Math.abs(xy[0] - elem.center_x) > boxHalfNorm + 1e-6 ||
-            Math.abs(xy[1] - elem.center_y) > boxHalfNorm + 1e-6
+            Math.abs(xy[0] - elem.center_x) > boxHalfX + 1e-6 ||
+            Math.abs(xy[1] - elem.center_y) > boxHalfY + 1e-6
           ) {
             continue;
           }
@@ -1980,11 +2336,20 @@ export function evaluateSimulationLayersToDmx(args: {
           if (!block) continue;
           const targetGroup = trackTarget || block.target_group?.trim() || "";
           if (!targetGroup) continue;
+          const seqElem = block.elements.find(
+            (el): el is Extract<FxElementDef, { kind: "scene_sequence" }> =>
+              el.kind === "scene_sequence",
+          );
+          const seqDurSec =
+            seqElem && seqElem.steps.length > 0
+              ? computeSceneSequenceDurationSec(seqElem.steps, show.bpm || 120)
+              : null;
           const phaseScale =
             clip.time_stretch && clip.duration_sec > 1e-6
               ? Math.max(
                   0.01,
                   (clip.source_duration_sec ??
+                    seqDurSec ??
                     block.duration_sec ??
                     Math.max(0.25, block.duration_beats) *
                       (60 / Math.max(1, show.bpm || 120))) / clip.duration_sec,
