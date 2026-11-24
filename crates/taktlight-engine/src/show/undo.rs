@@ -332,14 +332,17 @@ impl ShowCommand {
                 Ok(())
             }
             Self::RenameSceneBank {
+                old_name,
                 new_name,
                 affected_scene_ids,
-                ..
             } => {
                 for sc in &mut state.scenes {
                     if affected_scene_ids.iter().any(|id| id == &sc.id) {
                         sc.bank = Some(new_name.clone());
                     }
+                }
+                if let Some(color) = state.bank_colors.remove(old_name) {
+                    state.bank_colors.insert(new_name.clone(), color);
                 }
                 Ok(())
             }
@@ -501,13 +504,16 @@ impl ShowCommand {
             }
             Self::RenameSceneBank {
                 old_name,
+                new_name,
                 affected_scene_ids,
-                ..
             } => {
                 for sc in &mut state.scenes {
                     if affected_scene_ids.iter().any(|id| id == &sc.id) {
                         sc.bank = Some(old_name.clone());
                     }
+                }
+                if let Some(color) = state.bank_colors.remove(new_name) {
+                    state.bank_colors.insert(old_name.clone(), color);
                 }
                 Ok(())
             }
@@ -851,5 +857,313 @@ mod tests {
         assert!(AutosaveManager::has_newer_autosave(&show_path));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_show_command_variants_apply_undo_redo_and_coalesce() {
+        use crate::show::patch::WhiteMode;
+        use crate::show::spatial::OrderRule;
+        use crate::show::xml::DurationUnit;
+
+        let mut show = ShowState::default();
+        let mut history = UndoHistory::default();
+
+        // Empty undo/redo are no-ops
+        assert!(!history.can_undo());
+        assert!(!history.can_redo());
+        assert!(history.undo(&mut show).unwrap().is_none());
+        assert!(history.redo(&mut show).unwrap().is_none());
+
+        // Patch -> Calibration (coalesced) -> Unpatch
+        let fx = sample_fixture("fx_all", 1);
+        history
+            .execute(
+                &mut show,
+                ShowCommand::PatchFixtures {
+                    added: vec![fx.clone()],
+                    auto_created_universes: vec![],
+                },
+            )
+            .unwrap();
+
+        let cal0 = show.patch[0].calibration.clone();
+        let mut cal1 = cal0.clone();
+        cal1.gamma = 2.4;
+        cal1.white_mode = WhiteMode::Add;
+        let mut cal2 = cal1.clone();
+        cal2.gamma = 2.8;
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpdateFixtureCalibration {
+                    fixture_id: "fx_all".into(),
+                    before: cal0.clone(),
+                    after: cal1.clone(),
+                    coalesce_key: Some("cal_fx_all".into()),
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpdateFixtureCalibration {
+                    fixture_id: "fx_all".into(),
+                    before: cal1,
+                    after: cal2.clone(),
+                    coalesce_key: Some("cal_fx_all".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(history.undo_len(), 2);
+        assert!((show.patch[0].calibration.gamma - 2.8).abs() < 1e-5);
+        history.undo(&mut show).unwrap();
+        assert!((show.patch[0].calibration.gamma - cal0.gamma).abs() < 1e-5);
+        history.redo(&mut show).unwrap();
+        assert!((show.patch[0].calibration.gamma - 2.8).abs() < 1e-5);
+
+        let removed_fx = show.patch[0].clone();
+        history
+            .execute(&mut show, ShowCommand::UnpatchFixture { removed: removed_fx })
+            .unwrap();
+        assert!(show.patch.is_empty());
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.patch.len(), 1);
+
+        // ConfigureUniverse (insert + update + undo)
+        let u5 = UniverseConfig::new(
+            5,
+            ProtocolKind::ArtNet {
+                mode: ArtNetOutputMode::Broadcast,
+                net: 0,
+                subnet: 0,
+                uni: 4,
+            },
+        );
+        history
+            .execute(
+                &mut show,
+                ShowCommand::ConfigureUniverse {
+                    before: None,
+                    after: u5.clone(),
+                },
+            )
+            .unwrap();
+        assert!(show.network_outputs.universes.iter().any(|u| u.id == 5));
+        history.undo(&mut show).unwrap();
+        assert!(!show.network_outputs.universes.iter().any(|u| u.id == 5));
+
+        // Group upsert + update + delete + undo
+        let grp = FixtureGroupDef {
+            id: "grp_1".into(),
+            name: "Front".into(),
+            order: OrderRule::Linear,
+            targets: vec!["fx_all:0..7".into()],
+        };
+        let mut grp2 = grp.clone();
+        grp2.name = "Front Updated".into();
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertGroup {
+                    before: None,
+                    after: grp.clone(),
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertGroup {
+                    before: Some(grp.clone()),
+                    after: grp2.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(show.groups[0].name, "Front Updated");
+        history
+            .execute(&mut show, ShowCommand::DeleteGroup { removed: grp2 })
+            .unwrap();
+        assert!(show.groups.is_empty());
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.groups.len(), 1);
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.groups[0].name, "Front");
+        history.undo(&mut show).unwrap();
+        assert!(show.groups.is_empty());
+
+        // ColorPalette & DimmerPalette upsert + delete + undo
+        let cp = ColorPaletteDef {
+            id: "cp_1".into(),
+            name: "Fire".into(),
+            hex_start: "#FF0000".into(),
+            hex_end: "#FFAA00".into(),
+            colors: vec!["#FF0000".into(), "#FFAA00".into()],
+        };
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertColorPalette {
+                    before: None,
+                    after: cp.clone(),
+                },
+            )
+            .unwrap();
+        history
+            .execute(&mut show, ShowCommand::DeleteColorPalette { removed: cp })
+            .unwrap();
+        assert!(show.color_palettes.is_empty());
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.color_palettes.len(), 1);
+
+        let dp = DimmerPaletteDef {
+            id: "dp_1".into(),
+            name: "Half".into(),
+            value_start: 0.5,
+            value_end: 0.5,
+        };
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertDimmerPalette {
+                    before: None,
+                    after: dp.clone(),
+                },
+            )
+            .unwrap();
+        history
+            .execute(&mut show, ShowCommand::DeleteDimmerPalette { removed: dp })
+            .unwrap();
+        assert!(show.dimmer_palettes.is_empty());
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.dimmer_palettes.len(), 1);
+
+        // FxBlock upsert + delete + undo
+        let blk = FxBlockDef {
+            id: "blk_1".into(),
+            name: "Pulse".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![],
+        };
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertFxBlock {
+                    before: None,
+                    after: blk.clone(),
+                },
+            )
+            .unwrap();
+        history
+            .execute(&mut show, ShowCommand::DeleteFxBlock { removed: blk })
+            .unwrap();
+        assert!(show.fx_library.is_empty());
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.fx_library.len(), 1);
+
+        // Scene upsert + RenameSceneBank + DeleteScene + undo
+        let scn = SceneDef {
+            id: "sc_1".into(),
+            name: "Intro".into(),
+            bank: Some("Bank 1".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_1".into()],
+            timeline_ref: None,
+        };
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertScene {
+                    before: None,
+                    after: scn.clone(),
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut show,
+                ShowCommand::RenameSceneBank {
+                    old_name: "Bank 1".into(),
+                    new_name: "Main Bank".into(),
+                    affected_scene_ids: vec!["sc_1".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(show.scenes[0].bank.as_deref(), Some("Main Bank"));
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.scenes[0].bank.as_deref(), Some("Bank 1"));
+        history
+            .execute(&mut show, ShowCommand::DeleteScene { removed: scn })
+            .unwrap();
+        assert!(show.scenes.is_empty());
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.scenes.len(), 1);
+
+        // Timeline upsert (coalesced) + delete + undo
+        let tl1 = TimelineDef {
+            id: "tl_1".into(),
+            name: "Song".into(),
+            duration_sec: 16.0,
+            grid_offset_sec: 0.0,
+            tempo_map: vec![],
+            audio_track: None,
+            loop_timeline: false,
+            tracks: vec![],
+        };
+        let mut tl2 = tl1.clone();
+        tl2.duration_sec = 24.0;
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertTimeline {
+                    before: None,
+                    after: tl1.clone(),
+                    coalesce_key: Some("tl_edit".into()),
+                },
+            )
+            .unwrap();
+        let len_before = history.undo_len();
+        history
+            .execute(
+                &mut show,
+                ShowCommand::UpsertTimeline {
+                    before: Some(tl1),
+                    after: tl2.clone(),
+                    coalesce_key: Some("tl_edit".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(history.undo_len(), len_before);
+        assert!((show.timelines[0].duration_sec - 24.0).abs() < 1e-5);
+        history
+            .execute(&mut show, ShowCommand::DeleteTimeline { removed: tl2 })
+            .unwrap();
+        assert!(show.timelines.is_empty());
+        history.undo(&mut show).unwrap();
+        assert_eq!(show.timelines.len(), 1);
+
+        // ReplaceShowState + undo
+        let before_show = show.clone();
+        let mut replaced = ShowState::default();
+        replaced.name = "Imported Show".into();
+        history
+            .execute(
+                &mut show,
+                ShowCommand::ReplaceShowState {
+                    before: Box::new(before_show),
+                    after: Box::new(replaced),
+                },
+            )
+            .unwrap();
+        assert_eq!(show.name, "Imported Show");
+        history.undo(&mut show).unwrap();
+        assert_ne!(show.name, "Imported Show");
     }
 }

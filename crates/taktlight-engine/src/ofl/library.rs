@@ -237,9 +237,9 @@ impl FixtureLibrary {
         let (def, modes) =
             validate_and_parse_ofl(raw_json).map_err(SaveFixtureError::Validation)?;
 
-        let formatted_json = serde_json::from_str::<serde_json::Value>(raw_json)
-            .and_then(|v| serde_json::to_string_pretty(&v))
-            .unwrap_or_else(|_| raw_json.to_string());
+        // Preserve original JSON key order (avoid serde_json::Value BTreeMap alphabetical sorting,
+        // which reorders templateChannels from Red/Green/Blue into Blue/Green/Red).
+        let formatted_json = raw_json.to_string();
         let file_name = format!("{slug}.json");
         let id = format!("user/{file_name}");
 
@@ -341,6 +341,41 @@ mod tests {
         assert!(!temp_dir.join("user/custom_studio_par.json").exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn save_user_fixture_preserves_rgb_channel_key_order() {
+        let mut lib = FixtureLibrary::load(None);
+        let raw = r#"{
+          "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+          "name": "RGB Order Test",
+          "categories": ["Pixel Bar"],
+          "meta": { "authors": ["User"], "createDate": "2026-11-23", "lastModifyDate": "2026-11-23" },
+          "matrix": { "pixelCount": [4, 1, 1] },
+          "templateChannels": {
+            "Red $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+            "Green $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+            "Blue $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } }
+          },
+          "modes": [
+            {
+              "name": "12ch RGB",
+              "channels": [
+                {
+                  "insert": "matrixChannels",
+                  "repeatFor": "eachPixelABC",
+                  "channelOrder": "perPixel",
+                  "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey"]
+                }
+              ]
+            }
+          ]
+        }"#;
+        let saved = lib.save_user_fixture("rgb_order_test", raw).unwrap();
+        let red_pos = saved.raw_json.find("\"Red $pixelKey\"").unwrap();
+        let green_pos = saved.raw_json.find("\"Green $pixelKey\"").unwrap();
+        let blue_pos = saved.raw_json.find("\"Blue $pixelKey\"").unwrap();
+        assert!(red_pos < green_pos && green_pos < blue_pos);
     }
 
     #[test]

@@ -139,10 +139,11 @@ impl RenderPlan {
                 ),
                 UniverseConfig::new(
                     2,
-                    ProtocolKind::Sacn {
-                        mode: SacnOutputMode::Multicast,
-                        sacn_universe: 2,
-                        priority: 100,
+                    ProtocolKind::ArtNet {
+                        mode: ArtNetOutputMode::Broadcast,
+                        net: 0,
+                        subnet: 0,
+                        uni: 1,
                     },
                 ),
             ],

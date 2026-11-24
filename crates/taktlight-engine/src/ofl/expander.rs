@@ -215,6 +215,7 @@ pub fn expand_fixture_mode(
     }
 
     let mut pending: Vec<PendingChannel> = Vec::new();
+    let mut mode_cells_override: Option<Vec<MatrixCell>> = None;
 
     for entry in &mode.channels {
         match entry {
@@ -260,6 +261,11 @@ pub fn expand_fixture_mode(
             OflModeChannelEntry::MatrixInsert(insert) => {
                 let matrix = fixture.matrix.as_ref().ok_or(OflError::MissingMatrix)?;
                 let ordered_cells = order_matrix_cells_for_repeat(matrix, &insert.repeat_for)?;
+                if matches!(insert.repeat_for, super::model::OflRepeatFor::ExplicitKeys(_))
+                    && !ordered_cells.is_empty()
+                {
+                    mode_cells_override = Some(ordered_cells.clone());
+                }
 
                 match insert.channel_order {
                     ChannelOrder::PerPixel => {
@@ -375,7 +381,7 @@ pub fn expand_fixture_mode(
             .clone()
             .unwrap_or_else(|| format!("{}ch", channels.len())),
         channel_count: channels.len(),
-        cells: canonical_cells,
+        cells: mode_cells_override.unwrap_or(canonical_cells),
         channels,
     })
 }
@@ -565,5 +571,67 @@ mod tests {
                 capability_type: "NoFunction".into()
             }
         );
+    }
+
+    #[test]
+    fn expands_24_pixel_tube_with_per_mode_segment_pixel_groups() {
+        let json = r#"{
+          "name": "24px Tube",
+          "categories": ["Pixel Bar"],
+          "meta": { "authors": ["AGE"], "createDate": "2026-11-22", "lastModifyDate": "2026-11-22" },
+          "matrix": {
+            "pixelCount": [24, 1, 1],
+            "pixelGroups": {
+              "All": "all",
+              "Seg4_1": ["1","2","3","4","5","6"],
+              "Seg4_2": ["7","8","9","10","11","12"],
+              "Seg4_3": ["13","14","15","16","17","18"],
+              "Seg4_4": ["19","20","21","22","23","24"]
+            }
+          },
+          "availableChannels": {
+            "Master Dimmer": { "defaultValue": 0, "capability": { "type": "Intensity" } }
+          },
+          "templateChannels": {
+            "Red $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+            "Green $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+            "Blue $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } }
+          },
+          "modes": [
+            {
+              "name": "24-Seg Mode",
+              "channels": [
+                "Master Dimmer",
+                { "insert": "matrixChannels", "repeatFor": "eachPixelABC", "channelOrder": "perPixel", "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey"] }
+              ]
+            },
+            {
+              "name": "4-Seg Mode",
+              "channels": [
+                "Master Dimmer",
+                { "insert": "matrixChannels", "repeatFor": ["Seg4_1","Seg4_2","Seg4_3","Seg4_4"], "channelOrder": "perPixel", "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey"] }
+              ]
+            },
+            {
+              "name": "1-Seg Mode",
+              "channels": [
+                "Master Dimmer",
+                { "insert": "matrixChannels", "repeatFor": ["All"], "channelOrder": "perPixel", "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey"] }
+              ]
+            }
+          ]
+        }"#;
+
+        let parsed: OflFixtureDefinition = serde_json::from_str(json).unwrap();
+        let m24 = expand_fixture_mode(&parsed, "24-Seg Mode").unwrap();
+        let m4 = expand_fixture_mode(&parsed, "4-Seg Mode").unwrap();
+        let m1 = expand_fixture_mode(&parsed, "1-Seg Mode").unwrap();
+        assert_eq!(m24.cells.len(), 24);
+        assert_eq!(m24.channel_count, 1 + 24 * 3);
+        assert_eq!(m4.cells.len(), 4);
+        assert_eq!(m4.channel_count, 1 + 4 * 3);
+        assert!(m4.cells[0].local_uv[0] < m4.cells[3].local_uv[0]);
+        assert_eq!(m1.cells.len(), 1);
+        assert_eq!(m1.channel_count, 1 + 3);
     }
 }

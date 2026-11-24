@@ -79,6 +79,26 @@ pub struct TickTransmitter {
     discovery_tracker: NodeDiscoveryTracker,
 }
 
+fn universe_has_active_output(
+    plan: &RenderPlan,
+    uni_idx: usize,
+    uni_id: u16,
+    eval_dmx: &[u8; 512],
+) -> bool {
+    let has_fixture = plan
+        .fixtures
+        .iter()
+        .any(|fx| fx.channels.iter().any(|ch| ch.universe_id == uni_id));
+    if has_fixture {
+        return true;
+    }
+    let has_base_dmx = plan
+        .base_dmx
+        .get(uni_idx)
+        .is_some_and(|base| base.iter().any(|&v| v != 0));
+    has_base_dmx || eval_dmx.iter().any(|&v| v != 0)
+}
+
 impl TickTransmitter {
     pub fn new(cid: [u8; 16], source_name: impl Into<String>) -> Self {
         Self {
@@ -116,12 +136,18 @@ impl TickTransmitter {
             .map(|i| i.broadcast)
             .unwrap_or(Ipv4Addr::BROADCAST);
 
-        // Terminate any sACN universe that was removed from the plan
+        // Terminate any sACN universe that was removed from the plan or has no active output
         let current_sacn_ids: Vec<u16> = plan
             .universes
             .iter()
-            .filter_map(|u| match u.protocol {
-                ProtocolKind::Sacn { .. } => Some(u.id),
+            .zip(frame.universes.iter())
+            .enumerate()
+            .filter_map(|(idx, (u, eval_uni))| match u.protocol {
+                ProtocolKind::Sacn { .. }
+                    if universe_has_active_output(plan, idx, u.id, &eval_uni.dmx) =>
+                {
+                    Some(u.id)
+                }
                 _ => None,
             })
             .collect();
@@ -139,8 +165,11 @@ impl TickTransmitter {
 
         let mut sent_any_artnet = false;
 
-        // 2. Transmit per-universe DMX packets
-        for (uni_cfg, eval_uni) in plan.universes.iter().zip(frame.universes.iter()) {
+        // 2. Transmit per-universe DMX packets (skip empty universes with no fixtures or active output)
+        for (idx, (uni_cfg, eval_uni)) in plan.universes.iter().zip(frame.universes.iter()).enumerate() {
+            if !universe_has_active_output(plan, idx, uni_cfg.id, &eval_uni.dmx) {
+                continue;
+            }
             match &uni_cfg.protocol {
                 ProtocolKind::ArtNet {
                     mode,
@@ -513,6 +542,14 @@ mod tests {
     #[test]
     fn transmitter_emits_artdmx_artsync_sacn_artpoll_and_discovery() {
         let mut plan = RenderPlan::default_studio_plan();
+        plan.universes[1] = UniverseConfig::new(
+            2,
+            ProtocolKind::Sacn {
+                mode: SacnOutputMode::Multicast,
+                sacn_universe: 2,
+                priority: 100,
+            },
+        );
         plan.base_dmx[0][0] = 255;
         plan.base_dmx[1][10] = 128;
 
@@ -653,5 +690,92 @@ mod tests {
             Some(Duration::from_millis(60)),
         );
         assert!(!telemetry.read().output_enabled);
+    }
+
+    #[test]
+    fn skips_empty_universes_and_terminates_sacn_when_universe_becomes_empty() {
+        let mut plan = RenderPlan::default_studio_plan();
+        plan.universes[1] = UniverseConfig::new(
+            2,
+            ProtocolKind::Sacn {
+                mode: SacnOutputMode::Multicast,
+                sacn_universe: 2,
+                priority: 100,
+            },
+        );
+        // Only Universe 1 (Art-Net) has active output; Universe 2 (sACN) is empty
+        plan.base_dmx[0][0] = 200;
+
+        let mut rt = RuntimeControl::new();
+        let mut q = QuantizerState::default();
+        let mut sink = MockPacketSink::new();
+        let mut tx = TickTransmitter::new([0x55u8; 16], "TaktLightTest");
+
+        let f0 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 0,
+            },
+            &rt,
+            &mut q,
+        );
+        tx.transmit_frame(&plan, &f0, &mut sink, None).unwrap();
+
+        // Expect ArtDmx + ArtSync + ArtPoll only; zero sACN data or discovery packets
+        assert!(sink.sent.iter().all(|(ch, _, _)| *ch == SinkChannel::ArtNet));
+        assert_eq!(sink.sent.len(), 3);
+
+        // Parking a channel on Universe 2 activates sACN output
+        sink.sent.clear();
+        rt.set_park(2, 1, Some(128)).unwrap();
+        let f1 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.023,
+                frame_index: 1,
+            },
+            &rt,
+            &mut q,
+        );
+        tx.transmit_frame(&plan, &f1, &mut sink, None).unwrap();
+        assert!(sink
+            .sent
+            .iter()
+            .any(|(ch, _, pkt)| *ch == SinkChannel::Sacn && pkt.len() == 638 && pkt[112] == 0x00));
+
+        // Unparking Universe 2 sends 3 Stream_Terminated packets and stops transmitting sACN
+        sink.sent.clear();
+        rt.set_park(2, 1, None).unwrap();
+        let f2 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.046,
+                frame_index: 2,
+            },
+            &rt,
+            &mut q,
+        );
+        tx.transmit_frame(&plan, &f2, &mut sink, None).unwrap();
+        let term_count = sink
+            .sent
+            .iter()
+            .filter(|(ch, _, pkt)| *ch == SinkChannel::Sacn && pkt.len() == 638 && pkt[112] == 0x40)
+            .count();
+        assert_eq!(term_count, 3);
+
+        // Next tick emits zero sACN packets
+        sink.sent.clear();
+        let f3 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.069,
+                frame_index: 3,
+            },
+            &rt,
+            &mut q,
+        );
+        tx.transmit_frame(&plan, &f3, &mut sink, None).unwrap();
+        assert!(sink.sent.iter().all(|(ch, _, _)| *ch == SinkChannel::ArtNet));
     }
 }

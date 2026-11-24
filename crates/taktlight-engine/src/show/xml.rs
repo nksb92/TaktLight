@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -44,6 +44,26 @@ pub enum DurationUnit {
     #[default]
     Beats,
     Seconds,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SequencePlaybackMode {
+    #[default]
+    Loop,
+    OneShot,
+    Bounce,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneSequenceStepDef {
+    pub scene_id: String,
+    #[serde(default = "default_beats")]
+    pub duration_value: f32,
+    #[serde(default)]
+    pub duration_unit: DurationUnit,
+    #[serde(default)]
+    pub fade_sec: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -153,6 +173,8 @@ pub enum FxElementDef {
         speed_hz: Option<f32>,
         #[serde(default)]
         rate_cycles: Option<f32>,
+        #[serde(default)]
+        phase_offset: Option<f32>,
         #[serde(default = "default_one")]
         spatial_freq: f32,
         #[serde(default = "default_one")]
@@ -173,6 +195,16 @@ pub enum FxElementDef {
         center_x: f32,
         #[serde(default = "default_half")]
         center_y: f32,
+        #[serde(default)]
+        box_half_x: Option<f32>,
+        #[serde(default)]
+        box_half_y: Option<f32>,
+    },
+    SceneSequence {
+        #[serde(default)]
+        playback_mode: SequencePlaybackMode,
+        #[serde(default)]
+        steps: Vec<SceneSequenceStepDef>,
     },
 }
 
@@ -356,10 +388,11 @@ impl Default for NetworkOutputsConfig {
                 ),
                 UniverseConfig::new(
                     2,
-                    ProtocolKind::Sacn {
-                        mode: SacnOutputMode::Multicast,
-                        sacn_universe: 2,
-                        priority: 100,
+                    ProtocolKind::ArtNet {
+                        mode: ArtNetOutputMode::Broadcast,
+                        net: 0,
+                        subnet: 0,
+                        uni: 1,
                     },
                 ),
             ],
@@ -389,6 +422,8 @@ pub struct ShowState {
     pub scenes: Vec<SceneDef>,
     #[serde(default)]
     pub timelines: Vec<TimelineDef>,
+    #[serde(default)]
+    pub bank_colors: BTreeMap<String, String>,
 }
 
 impl Default for ShowState {
@@ -406,6 +441,7 @@ impl Default for ShowState {
             fx_library: Vec::new(),
             scenes: Vec::new(),
             timelines: Vec::new(),
+            bank_colors: BTreeMap::new(),
         }
     }
 }
@@ -436,6 +472,28 @@ struct TaktLightShowXml {
     scenes: ScenesXml,
     #[serde(rename = "Timelines", default)]
     timelines: TimelinesXml,
+    #[serde(rename = "BankColors", default, skip_serializing_if = "BankColorsXml::is_empty")]
+    bank_colors: BankColorsXml,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BankColorsXml {
+    #[serde(rename = "BankColor", default)]
+    entries: Vec<BankColorXml>,
+}
+
+impl BankColorsXml {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BankColorXml {
+    #[serde(rename = "@bank")]
+    bank: String,
+    #[serde(rename = "@color")]
+    color: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -855,6 +913,12 @@ enum FxElementXml {
             skip_serializing_if = "Option::is_none"
         )]
         rate_cycles: Option<f32>,
+        #[serde(
+            rename = "@phase_offset",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        phase_offset: Option<f32>,
         #[serde(rename = "@spatial_freq", default = "default_one")]
         spatial_freq: f32,
         #[serde(rename = "@color_width", default = "default_one")]
@@ -887,7 +951,45 @@ enum FxElementXml {
         center_x: f32,
         #[serde(rename = "@center_y", default = "default_half")]
         center_y: f32,
+        #[serde(
+            rename = "@box_half_x",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        box_half_x: Option<f32>,
+        #[serde(
+            rename = "@box_half_y",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        box_half_y: Option<f32>,
     },
+    SceneSequence {
+        #[serde(
+            rename = "@playback_mode",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        playback_mode: Option<String>,
+        #[serde(rename = "Step", default)]
+        steps: Vec<SceneSequenceStepXml>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SceneSequenceStepXml {
+    #[serde(rename = "@scene_id")]
+    scene_id: String,
+    #[serde(rename = "@duration_value", default = "default_beats")]
+    duration_value: f32,
+    #[serde(
+        rename = "@duration_unit",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    duration_unit: Option<String>,
+    #[serde(rename = "@fade_sec", default)]
+    fade_sec: f32,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1243,6 +1345,7 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             rate_beats,
             speed_hz,
             rate_cycles,
+            phase_offset,
             spatial_freq,
             color_width,
             gradient,
@@ -1253,6 +1356,8 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             direction_deg,
             center_x,
             center_y,
+            box_half_x,
+            box_half_y,
         } => Ok(FxElementDef::SpatialShader2D {
             trait_name,
             op,
@@ -1261,6 +1366,7 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             rate_beats,
             speed_hz,
             rate_cycles,
+            phase_offset,
             spatial_freq,
             color_width,
             gradient,
@@ -1271,7 +1377,49 @@ fn fx_from_xml(el: FxElementXml) -> Result<FxElementDef, ShowError> {
             direction_deg,
             center_x,
             center_y,
+            box_half_x,
+            box_half_y,
         }),
+        FxElementXml::SceneSequence {
+            playback_mode,
+            steps,
+        } => {
+            let mode = match playback_mode
+                .as_deref()
+                .map(str::trim)
+                .map(|m| m.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("one_shot") | Some("oneshot") => SequencePlaybackMode::OneShot,
+                Some("bounce") => SequencePlaybackMode::Bounce,
+                _ => SequencePlaybackMode::Loop,
+            };
+            let converted_steps = steps
+                .into_iter()
+                .map(|st| {
+                    let unit = match st
+                        .duration_unit
+                        .as_deref()
+                        .map(str::trim)
+                        .map(|u| u.to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("seconds") | Some("sec") | Some("s") => DurationUnit::Seconds,
+                        _ => DurationUnit::Beats,
+                    };
+                    SceneSequenceStepDef {
+                        scene_id: st.scene_id,
+                        duration_value: st.duration_value.max(0.05),
+                        duration_unit: unit,
+                        fade_sec: st.fade_sec.max(0.0),
+                    }
+                })
+                .collect();
+            Ok(FxElementDef::SceneSequence {
+                playback_mode: mode,
+                steps: converted_steps,
+            })
+        }
     }
 }
 
@@ -1374,6 +1522,7 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             rate_beats,
             speed_hz,
             rate_cycles,
+            phase_offset,
             spatial_freq,
             color_width,
             gradient,
@@ -1384,6 +1533,8 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             direction_deg,
             center_x,
             center_y,
+            box_half_x,
+            box_half_y,
         } => FxElementXml::SpatialShader2D {
             trait_name: trait_name.clone(),
             op: op.clone(),
@@ -1392,6 +1543,7 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             rate_beats: *rate_beats,
             speed_hz: *speed_hz,
             rate_cycles: *rate_cycles,
+            phase_offset: *phase_offset,
             spatial_freq: *spatial_freq,
             color_width: *color_width,
             gradient: *gradient,
@@ -1402,6 +1554,30 @@ fn fx_to_xml(el: &FxElementDef) -> FxElementXml {
             direction_deg: *direction_deg,
             center_x: *center_x,
             center_y: *center_y,
+            box_half_x: *box_half_x,
+            box_half_y: *box_half_y,
+        },
+        FxElementDef::SceneSequence {
+            playback_mode,
+            steps,
+        } => FxElementXml::SceneSequence {
+            playback_mode: Some(match playback_mode {
+                SequencePlaybackMode::Loop => "loop".to_string(),
+                SequencePlaybackMode::OneShot => "one_shot".to_string(),
+                SequencePlaybackMode::Bounce => "bounce".to_string(),
+            }),
+            steps: steps
+                .iter()
+                .map(|st| SceneSequenceStepXml {
+                    scene_id: st.scene_id.clone(),
+                    duration_value: st.duration_value,
+                    duration_unit: Some(match st.duration_unit {
+                        DurationUnit::Beats => "beats".to_string(),
+                        DurationUnit::Seconds => "seconds".to_string(),
+                    }),
+                    fade_sec: st.fade_sec,
+                })
+                .collect(),
         },
     }
 }
@@ -1660,6 +1836,17 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
         scenes: ScenesXml { scenes: scenes_xml },
         timelines: TimelinesXml {
             timelines: timelines_xml,
+        },
+        bank_colors: BankColorsXml {
+            entries: show
+                .bank_colors
+                .iter()
+                .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+                .map(|(bank, color)| BankColorXml {
+                    bank: bank.clone(),
+                    color: color.clone(),
+                })
+                .collect(),
         },
     };
 
@@ -1968,6 +2155,15 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
         });
     }
 
+    let mut bank_colors = BTreeMap::new();
+    for entry in parsed.bank_colors.entries {
+        let bank = entry.bank.trim();
+        let color = entry.color.trim();
+        if !bank.is_empty() && !color.is_empty() {
+            bank_colors.insert(bank.to_string(), color.to_string());
+        }
+    }
+
     Ok(ShowState {
         version: if read_only_newer {
             raw_version
@@ -1992,6 +2188,7 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
         fx_library,
         scenes,
         timelines,
+        bank_colors,
     })
 }
 
@@ -2001,6 +2198,7 @@ fn validate_fx_palette_ref(el: &FxElementDef, palette_ids: &HashSet<String>) -> 
         | FxElementDef::Curve1D { palette_ref, .. }
         | FxElementDef::StepChase { palette_ref, .. }
         | FxElementDef::SpatialShader2D { palette_ref, .. } => palette_ref.as_deref(),
+        FxElementDef::SceneSequence { .. } => None,
     };
     if let Some(id) = pref {
         if !palette_ids.contains(id) {
@@ -2301,6 +2499,7 @@ mod tests {
                     rate_beats: None,
                     speed_hz: None,
                     rate_cycles: Some(1.0),
+                    phase_offset: None,
                     spatial_freq: 1.0,
                     color_width: 1.25,
                     gradient: 0.25,
@@ -2311,6 +2510,8 @@ mod tests {
                     direction_deg: 90.0,
                     center_x: 0.5,
                     center_y: 0.5,
+                    box_half_x: None,
+                    box_half_y: None,
                 },
             ],
         });
@@ -2335,5 +2536,92 @@ mod tests {
         assert_eq!(parsed.scenes[0].duration_unit, DurationUnit::Seconds);
         assert_eq!(parsed.fx_library[0].duration_sec, Some(2.5));
         assert_eq!(parsed.fx_library[0].elements, show.fx_library[0].elements);
+    }
+
+    #[test]
+    fn round_trips_scene_sequence_xml_steps_and_playback_mode() {
+        let mut show = ShowState::default();
+        show.fx_library.push(FxBlockDef {
+            id: "blk_a".into(),
+            name: "Look A".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![FxElementDef::StaticTrait {
+                trait_name: "dimmer".into(),
+                op: "ltp".into(),
+                palette_ref: None,
+                value_start: Some(1.0),
+                value_end: Some(1.0),
+                hex_start: None,
+                hex_end: None,
+                order: None,
+            }],
+        });
+        show.fx_library.push(FxBlockDef {
+            id: "blk_seq".into(),
+            name: "Main Sequence".into(),
+            target_group: Some("all".into()),
+            duration_beats: 8.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![FxElementDef::SceneSequence {
+                playback_mode: SequencePlaybackMode::Bounce,
+                steps: vec![
+                    SceneSequenceStepDef {
+                        scene_id: "sc_a".into(),
+                        duration_value: 2.0,
+                        duration_unit: DurationUnit::Beats,
+                        fade_sec: 0.25,
+                    },
+                    SceneSequenceStepDef {
+                        scene_id: "sc_b".into(),
+                        duration_value: 1.5,
+                        duration_unit: DurationUnit::Seconds,
+                        fade_sec: 0.5,
+                    },
+                ],
+            }],
+        });
+        show.scenes.push(SceneDef {
+            id: "sc_a".into(),
+            name: "Scene A".into(),
+            bank: Some("Bank 1".into()),
+            target_group: Some("all".into()),
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_a".into()],
+            timeline_ref: None,
+        });
+        show.scenes.push(SceneDef {
+            id: "sc_seq".into(),
+            name: "Sequence Scene".into(),
+            bank: Some("Bank 1".into()),
+            target_group: Some("all".into()),
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 8.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_seq".into()],
+            timeline_ref: None,
+        });
+
+        let xml_out = serialize_show_xml(&show).expect("serialize");
+        assert!(xml_out.contains("<SceneSequence"));
+        assert!(xml_out.contains("playback_mode=\"bounce\""));
+        assert!(xml_out.contains("<Step "));
+
+        let parsed = deserialize_show_xml(&xml_out).expect("deserialize");
+        let seq_blk = parsed
+            .fx_library
+            .iter()
+            .find(|b| b.id == "blk_seq")
+            .expect("blk_seq present");
+        assert_eq!(seq_blk.elements, show.fx_library[1].elements);
     }
 }

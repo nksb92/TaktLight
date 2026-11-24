@@ -243,6 +243,24 @@ impl FromStr for Shader2DKind {
     }
 }
 
+/// Convert `spatial_freq` to the normalized gizmo half-extent (`0.08..=2.0`).
+pub fn spatial_freq_to_box_half_norm(spatial_freq: f32) -> f32 {
+    let pattern_scale = (1.0f32 / spatial_freq.max(0.05)).clamp(0.25, 10.0);
+    (0.2 * pattern_scale).clamp(0.08, 2.0)
+}
+
+/// Resolve independent `(box_half_x, box_half_y)` gizmo bounds, falling back to `spatial_freq`.
+pub fn resolve_gizmo_half_extents(
+    spatial_freq: f32,
+    box_half_x: Option<f32>,
+    box_half_y: Option<f32>,
+) -> (f32, f32) {
+    let fallback = spatial_freq_to_box_half_norm(spatial_freq);
+    let hx = box_half_x.unwrap_or(fallback).clamp(0.05, 2.0);
+    let hy = box_half_y.unwrap_or(fallback).clamp(0.05, 2.0);
+    (hx, hy)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_spatial_shader_2d_phase(
     shader: Shader2DKind,
@@ -255,11 +273,12 @@ pub fn evaluate_spatial_shader_2d_phase(
     center_y: f32,
     transform: Option<&str>,
 ) -> f32 {
+    let box_half_norm = spatial_freq_to_box_half_norm(spatial_freq);
     let mut dx = norm_xy[0] - center_x;
     let mut dy = norm_xy[1] - center_y;
     match transform {
-        Some("mirror_x") => dx = -dx,
-        Some("mirror_y") => dy = -dy,
+        Some("mirror_x") => dx = dx.abs() - 0.5 * box_half_norm,
+        Some("mirror_y") => dy = dy.abs() - 0.5 * box_half_norm,
         Some("invert") => {
             dx = -dx;
             dy = -dy;

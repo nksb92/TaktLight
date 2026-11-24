@@ -1307,6 +1307,7 @@ mod tests {
                 rate_beats: None,
                 speed_hz: None,
                 rate_cycles: Some(1.0),
+                phase_offset: None,
                 spatial_freq: 1.0,
                 color_width: 1.0,
                 gradient: 1.0,
@@ -1317,6 +1318,8 @@ mod tests {
                 direction_deg: 0.0,
                 center_x: 0.5,
                 center_y: 0.5,
+                box_half_x: None,
+                box_half_y: None,
             };
             let f0 = eval_elements(vec![static_dim.clone(), cmap.clone()], 0.0);
             let f1 = eval_elements(vec![static_dim.clone(), cmap], 0.5);
@@ -1331,6 +1334,7 @@ mod tests {
             rate_beats: None,
             speed_hz: None,
             rate_cycles: Some(1.0),
+            phase_offset: None,
             spatial_freq: 1.0,
             color_width: 1.0,
             gradient: 1.0,
@@ -1341,9 +1345,37 @@ mod tests {
             direction_deg: 0.0,
             center_x: 0.99,
             center_y: 0.99,
+            box_half_x: None,
+            box_half_y: None,
         };
         let f_oob = eval_elements(vec![static_dim.clone(), cmap_oob], 0.0);
         assert!(f_oob.universes[0].dmx[2..34].iter().all(|&v| v == 0));
+
+        // Wide scale (spatial_freq = 0.25 => pattern_scale = 4.0 => box_half_norm = 0.8) covers cells beyond 0.45 from center
+        let cmap_wide = FxElementDef::SpatialShader2D {
+            trait_name: "color".into(),
+            op: "ltp".into(),
+            shader: "linear_sweep".into(),
+            palette_ref: None,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(1.0),
+            phase_offset: None,
+            spatial_freq: 0.25,
+            color_width: 1.0,
+            gradient: 1.0,
+            grayscale: false,
+            transform: None,
+            inline_colors: vec!["#FF0000".into(), "#0000FF".into()],
+            value_stops: Vec::new(),
+            direction_deg: 0.0,
+            center_x: 0.99,
+            center_y: 0.5,
+            box_half_x: None,
+            box_half_y: None,
+        };
+        let f_wide = eval_elements(vec![static_dim.clone(), cmap_wide], 0.0);
+        assert!(f_wide.universes[0].dmx[2..34].iter().any(|&v| v > 0));
 
         // 3. FX-03: chaser_fx (pixels_on, one_way bounce, fade, reverse order)
         let make_chase = |pixels_on: u16, one_way: bool, fade: f32, order: OrderRule| {
@@ -1477,6 +1509,7 @@ mod tests {
                 rate_beats: None,
                 speed_hz: None,
                 rate_cycles: Some(1.0),
+                phase_offset: None,
                 spatial_freq: 1.0,
                 color_width: 1.0,
                 gradient: 1.0,
@@ -1487,6 +1520,8 @@ mod tests {
                 direction_deg: 0.0,
                 center_x: cx,
                 center_y: 0.5,
+                box_half_x: None,
+                box_half_y: None,
             }
         };
         let f_mhalf = eval_elements(
@@ -1512,6 +1547,7 @@ mod tests {
             0.0,
         );
         assert_ne!(cell_rgb(&f_mnorm, 0)[0], cell_rgb(&f_mmirr, 0)[0]);
+        assert_eq!(cell_rgb(&f_mmirr, 0)[0], cell_rgb(&f_mmirr, 7)[0]);
         let f_moob = eval_elements(
             vec![static_white, make_dim_map(vec![1.0, 0.0], None, 0.99)],
             0.0,
@@ -1587,5 +1623,351 @@ mod tests {
         };
         let f_mchase = eval_elements(vec![master_chase], 0.0);
         assert_eq!(f_mchase.universes[0].dmx[0], 255);
+    }
+
+    #[test]
+    fn edge_cases_zero_and_single_cell_split_universe_dangling_refs_and_xml_dmx_invariance() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::{GridPos, OrderRule};
+        use crate::show::xml::{DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState};
+
+        let lib = FixtureLibrary::load(None);
+
+        // 1. 0-fixture show with active FX scene + dangling palette_ref & target_group -> zero panic, zero DMX
+        let mut empty_show = ShowState::default();
+        empty_show.fx_library.push(FxBlockDef {
+            id: "blk_dangling".into(),
+            name: "Dangling".into(),
+            target_group: Some("grp_missing".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![FxElementDef::Curve1D {
+                trait_name: "color".into(),
+                op: "ltp".into(),
+                waveform: "sine".into(),
+                amplitude: 1.0,
+                offset: 0.0,
+                rate_beats: None,
+                speed_hz: None,
+                rate_cycles: Some(1.0),
+                phase_deg: 0.0,
+                phase_spread_deg: 360.0,
+                duty: None,
+                grayscale: false,
+                color_width: 1.0,
+                gradient: 1.0,
+                angle_deg: 0.0,
+                fx_kind_tag: Some("color_fx".into()),
+                inline_colors: Vec::new(),
+                value_stops: Vec::new(),
+                palette_ref: Some("pal_nonexistent".into()),
+                order: Some(OrderRule::Linear),
+            }],
+        });
+        let sc_empty = SceneDef {
+            id: "sc_empty".into(),
+            name: "Empty".into(),
+            bank: Some("Bank 1".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 10.0,
+            fade_out_sec: 10.0,
+            duration_value: 2.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_dangling".into()],
+            timeline_ref: None,
+        };
+        empty_show.scenes.push(sc_empty.clone());
+        let plan_empty = compile_render_plan(1, &empty_show, &lib).unwrap();
+        let mut rt_empty = RuntimeControl::new();
+        rt_empty.trigger_scene(&sc_empty, 0.0);
+        let mut q = QuantizerState::default();
+        let f_empty = Engine::evaluate_frame(
+            &plan_empty,
+            &ClockInput {
+                t_sec: 0.5,
+                frame_index: 1,
+            },
+            &rt_empty,
+            &mut q,
+        );
+        assert!(f_empty.universes[0].dmx.iter().all(|&v| v == 0));
+
+        // 2. Split 16-segment RLCV4 across U1.490 -> U2 under color_fx + chaser_fx (pixels_on > cell_count)
+        let mut split_show = ShowState::default();
+        split_show.patch.push(FixtureInstance {
+            id: "fx_rlcv4".into(),
+            profile: "age/rlcv4_16_segment_tube.json".into(),
+            mode: "66ch Pixel Mode".into(),
+            name: "Split RLCV4".into(),
+            universe: 1,
+            address: 490,
+            channel_count: 66,
+            grid_pos: GridPos {
+                x: 0.5,
+                y: 0.5,
+                rotation: 0.0,
+                scale_x: 0.3,
+                scale_y: 0.05,
+            },
+            calibration: FixtureCalibration {
+                gamma: 1.0,
+                min_dimmer_dmx: 0,
+                max_dimmer_dmx: 255,
+                white_mode: WhiteMode::Off,
+                white_gain: 1.0,
+            },
+        });
+        split_show.fx_library.push(FxBlockDef {
+            id: "blk_split_fx".into(),
+            name: "Split FX".into(),
+            target_group: Some("all".into()),
+            duration_beats: 4.0,
+            duration_sec: None,
+            loop_block: true,
+            elements: vec![
+                FxElementDef::Curve1D {
+                    trait_name: "color".into(),
+                    op: "ltp".into(),
+                    waveform: "saw".into(),
+                    amplitude: 1.0,
+                    offset: 0.0,
+                    rate_beats: None,
+                    speed_hz: None,
+                    rate_cycles: Some(1.0),
+                    phase_deg: 0.0,
+                    phase_spread_deg: 360.0,
+                    duty: None,
+                    grayscale: false,
+                    color_width: 1.0,
+                    gradient: 1.0,
+                    angle_deg: 0.0,
+                    fx_kind_tag: Some("color_fx".into()),
+                    inline_colors: vec!["#FF0000".into(), "#00FF00".into(), "#0000FF".into()],
+                    value_stops: Vec::new(),
+                    palette_ref: None,
+                    order: Some(OrderRule::Linear),
+                },
+                FxElementDef::StepChase {
+                    trait_name: "dimmer".into(),
+                    op: "ltp".into(),
+                    step_beats: None,
+                    speed_hz: None,
+                    rate_cycles: Some(1.0),
+                    one_way: false,
+                    pixels_on: Some(99), // > cell_count (16) must clamp cleanly to all on
+                    active_ratio: None,
+                    fade: 0.25,
+                    amplitude: 1.0,
+                    palette_ref: None,
+                    order: Some(OrderRule::Linear),
+                },
+            ],
+        });
+        let sc_split = SceneDef {
+            id: "sc_split".into(),
+            name: "Split Scene".into(),
+            bank: Some("Bank 1".into()),
+            target_group: None,
+            priority: 10,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            duration_value: 4.0,
+            duration_unit: DurationUnit::Beats,
+            block_refs: vec!["blk_split_fx".into()],
+            timeline_ref: None,
+        };
+        split_show.scenes.push(sc_split.clone());
+
+        let plan_before = compile_render_plan(1, &split_show, &lib).unwrap();
+        let mut rt_split = RuntimeControl::new();
+        rt_split.trigger_scene(&sc_split, 0.0);
+        let f_before = Engine::evaluate_frame(
+            &plan_before,
+            &ClockInput {
+                t_sec: 0.35,
+                frame_index: 15,
+            },
+            &rt_split,
+            &mut q,
+        );
+        // Both Universe 1 (head at ch 490..512) and Universe 2 (tail at ch 1..43) must have non-zero DMX
+        assert!(f_before.universes[0].dmx[489..512].iter().any(|&v| v > 0));
+        assert!(f_before.universes[1].dmx[0..43].iter().any(|&v| v > 0));
+
+        // 3. Full XML export -> import round-trip produces byte-identical DMX output
+        let xml = crate::show::xml::serialize_show_xml(&split_show).unwrap();
+        let reloaded = crate::show::xml::deserialize_show_xml(&xml).unwrap();
+        let plan_after = compile_render_plan(2, &reloaded, &lib).unwrap();
+        let f_after = Engine::evaluate_frame(
+            &plan_after,
+            &ClockInput {
+                t_sec: 0.35,
+                frame_index: 15,
+            },
+            &rt_split,
+            &mut q,
+        );
+        assert_eq!(f_before.universes[0].dmx, f_after.universes[0].dmx);
+        assert_eq!(f_before.universes[1].dmx, f_after.universes[1].dmx);
+    }
+
+    #[test]
+    fn static_spatial_shader_2d_freezes_over_time_and_respects_phase_offset() {
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::GridPos;
+        use crate::show::xml::{DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState};
+
+        let mut show = ShowState::default();
+        show.bpm = 120.0;
+        show.patch.push(FixtureInstance {
+            id: "fx_tube".into(),
+            profile: "age/rlcv3_8_segment_tube.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Tube".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos {
+                x: 0.5,
+                y: 0.5,
+                rotation: 0.0,
+                scale_x: 0.3,
+                scale_y: 0.05,
+            },
+            calibration: FixtureCalibration::default(),
+        });
+        let lib = FixtureLibrary::load(None);
+        let mut q = QuantizerState::default();
+
+        let mut eval_elements = |elements: Vec<FxElementDef>, t_sec: f64| -> EvaluatedFrame {
+            let mut s = show.clone();
+            s.fx_library.push(FxBlockDef {
+                id: "blk_static_map".into(),
+                name: "Static Map".into(),
+                target_group: Some("all".into()),
+                duration_beats: 4.0,
+                duration_sec: None,
+                loop_block: true,
+                elements,
+            });
+            let sc = SceneDef {
+                id: "sc_static_map".into(),
+                name: "Static Map".into(),
+                bank: Some("Bank 1".into()),
+                target_group: None,
+                priority: 10,
+                fade_in_sec: 0.0,
+                fade_out_sec: 0.0,
+                duration_value: 4.0,
+                duration_unit: DurationUnit::Beats,
+                block_refs: vec!["blk_static_map".into()],
+                timeline_ref: None,
+            };
+            s.scenes.push(sc.clone());
+            let plan = compile_render_plan(1, &s, &lib).unwrap();
+            let mut rt = RuntimeControl::new();
+            rt.trigger_scene(&sc, 0.0);
+            Engine::evaluate_frame(
+                &plan,
+                &ClockInput {
+                    t_sec,
+                    frame_index: (t_sec * 44.0) as u64,
+                },
+                &rt,
+                &mut q,
+            )
+        };
+
+        let static_dim = FxElementDef::StaticTrait {
+            trait_name: "dimmer".into(),
+            op: "ltp".into(),
+            palette_ref: None,
+            value_start: Some(1.0),
+            value_end: Some(1.0),
+            hex_start: None,
+            hex_end: None,
+            order: None,
+        };
+        let static_white = FxElementDef::StaticTrait {
+            trait_name: "color".into(),
+            op: "ltp".into(),
+            palette_ref: None,
+            value_start: None,
+            value_end: None,
+            hex_start: Some("#FFFFFF".into()),
+            hex_end: Some("#FFFFFF".into()),
+            order: None,
+        };
+
+        // 1. Color mapping with rate_cycles = 0 freezes across time
+        let make_color_map = |phase_offset: Option<f32>| FxElementDef::SpatialShader2D {
+            trait_name: "color".into(),
+            op: "ltp".into(),
+            shader: "linear_sweep".into(),
+            palette_ref: None,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(0.0),
+            phase_offset,
+            spatial_freq: 1.0,
+            color_width: 1.0,
+            gradient: 1.0,
+            grayscale: false,
+            transform: None,
+            inline_colors: vec!["#FF0000".into(), "#00FF00".into(), "#0000FF".into()],
+            value_stops: Vec::new(),
+            direction_deg: 0.0,
+            center_x: 0.5,
+            center_y: 0.5,
+            box_half_x: None,
+            box_half_y: None,
+        };
+        let c0 = eval_elements(vec![static_dim.clone(), make_color_map(None)], 0.0);
+        let c1 = eval_elements(vec![static_dim.clone(), make_color_map(None)], 0.5);
+        let c2 = eval_elements(vec![static_dim.clone(), make_color_map(None)], 1.25);
+        assert_eq!(c0.universes[0].dmx[2..34], c1.universes[0].dmx[2..34]);
+        assert_eq!(c0.universes[0].dmx[2..34], c2.universes[0].dmx[2..34]);
+        // Must still have spatial variation across cells
+        assert_ne!(c0.universes[0].dmx[2..6], c0.universes[0].dmx[30..34]);
+
+        // phase_offset shifts the static color pattern
+        let c_shifted = eval_elements(vec![static_dim, make_color_map(Some(0.5))], 0.0);
+        assert_ne!(c0.universes[0].dmx[2..34], c_shifted.universes[0].dmx[2..34]);
+
+        // 2. Dimmer mapping with rate_cycles = 0 freezes across time and shifts with phase_offset
+        let make_dim_map = |phase_offset: Option<f32>| FxElementDef::SpatialShader2D {
+            trait_name: "dimmer".into(),
+            op: "ltp".into(),
+            shader: "linear_sweep".into(),
+            palette_ref: None,
+            rate_beats: None,
+            speed_hz: None,
+            rate_cycles: Some(0.0),
+            phase_offset,
+            spatial_freq: 1.0,
+            color_width: 1.0,
+            gradient: 1.0,
+            grayscale: false,
+            transform: None,
+            inline_colors: Vec::new(),
+            value_stops: vec![1.0, 0.0],
+            direction_deg: 0.0,
+            center_x: 0.5,
+            center_y: 0.5,
+            box_half_x: None,
+            box_half_y: None,
+        };
+        let d0 = eval_elements(vec![static_white.clone(), make_dim_map(None)], 0.0);
+        let d1 = eval_elements(vec![static_white.clone(), make_dim_map(None)], 0.75);
+        assert_eq!(d0.universes[0].dmx[2..34], d1.universes[0].dmx[2..34]);
+
+        let d_shifted = eval_elements(vec![static_white, make_dim_map(Some(0.5))], 0.0);
+        assert_ne!(d0.universes[0].dmx[2..34], d_shifted.universes[0].dmx[2..34]);
     }
 }
