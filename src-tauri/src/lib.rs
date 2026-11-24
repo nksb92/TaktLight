@@ -111,7 +111,50 @@ pub struct AppState {
     pub output_enabled: AtomicBool,
     pub app_epoch: Instant,
     pub audio_cache: Mutex<AudioAnalysisCache>,
+    pub current_project_path: Mutex<Option<PathBuf>>,
+    pub recent_projects: Mutex<Vec<String>>,
+    pub recent_projects_file: Mutex<Option<PathBuf>>,
     next_fixture_seq: AtomicU64,
+}
+
+const MAX_RECENT_PROJECTS: usize = 10;
+
+fn resolve_default_recent_projects_file() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
+        .map(PathBuf::from)
+    {
+        return Some(dir.join("TaktLight").join("recent_projects.txt"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        return Some(home.join(".config").join("TaktLight").join("recent_projects.txt"));
+    }
+    None
+}
+
+fn load_recent_projects_from_file(path: &std::path::Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !out.iter().any(|p| p == trimmed) {
+            out.push(trimmed.to_string());
+            if out.len() >= MAX_RECENT_PROJECTS {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn save_recent_projects_to_file(path: &std::path::Path, items: &[String]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = items.join("\n");
+    let _ = std::fs::write(path, body);
 }
 
 fn resolve_default_fixtures_dir() -> Option<PathBuf> {
@@ -172,6 +215,16 @@ impl AppState {
             None
         };
 
+        let recent_projects_file = if start_engine_thread {
+            resolve_default_recent_projects_file()
+        } else {
+            None
+        };
+        let initial_recent = recent_projects_file
+            .as_deref()
+            .map(load_recent_projects_from_file)
+            .unwrap_or_default();
+
         Self {
             plan,
             runtime,
@@ -189,6 +242,9 @@ impl AppState {
             output_enabled: AtomicBool::new(false),
             app_epoch: Instant::now(),
             audio_cache: Mutex::new(AudioAnalysisCache::new()),
+            current_project_path: Mutex::new(None),
+            recent_projects: Mutex::new(initial_recent),
+            recent_projects_file: Mutex::new(recent_projects_file),
             next_fixture_seq: AtomicU64::new(1),
         }
     }
@@ -299,6 +355,59 @@ impl AppState {
         if let Ok(compiled) = compile_render_plan(rev, &show, &lib) {
             self.plan.store(Arc::new(compiled));
         }
+    }
+
+    pub fn record_recent_project(&self, path: &std::path::Path) {
+        let normalized = path.to_string_lossy().to_string();
+        if normalized.trim().is_empty() {
+            return;
+        }
+        let mut recent = self.recent_projects.lock();
+        recent.retain(|p| p != &normalized);
+        recent.insert(0, normalized);
+        recent.truncate(MAX_RECENT_PROJECTS);
+        let snapshot = recent.clone();
+        drop(recent);
+        if let Some(storage_path) = self.recent_projects_file.lock().clone() {
+            save_recent_projects_to_file(&storage_path, &snapshot);
+        }
+    }
+
+    pub fn get_recent_projects(&self) -> Vec<String> {
+        self.recent_projects.lock().clone()
+    }
+
+    pub fn new_project(&self) -> ShowSnapshotDto {
+        {
+            let mut show = self.show_state.write();
+            *show = ShowState::default();
+        }
+        {
+            let mut history = self.undo_history.lock();
+            *history = UndoHistory::default();
+        }
+        *self.current_project_path.lock() = None;
+        self.next_fixture_seq.store(1, Ordering::Release);
+        self.update_runtime(|rt| {
+            rt.active_scenes.clear();
+            rt.live_layers.clear();
+            rt.active_timeline_id = None;
+            rt.timeline_playing = false;
+            rt.timeline_playhead_sec = 0.0;
+            rt.parked_channels.clear();
+            rt.beat_clock.bpm = 120.0;
+        });
+        self.seed_default_studio_show();
+        self.build_show_snapshot(Some("Started new project".to_string()), false)
+    }
+
+    pub fn open_project_path(&self, path: &std::path::Path) -> Result<ShowSnapshotDto, String> {
+        let xml = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read project file '{}': {e}", path.display()))?;
+        let snapshot = self.import_show_xml(&xml)?;
+        *self.current_project_path.lock() = Some(path.to_path_buf());
+        self.record_recent_project(path);
+        Ok(snapshot)
     }
 
     pub fn update_runtime<F, R>(&self, f: F) -> R
@@ -945,6 +1054,11 @@ impl AppState {
             .map(|s| s.id.clone())
             .collect();
         if affected_scene_ids.is_empty() {
+            let mut show = self.show_state.write();
+            if let Some(color) = show.bank_colors.remove(from) {
+                show.bank_colors.insert(to.to_string(), color);
+            }
+            drop(show);
             return Ok(self.build_show_snapshot(None, false));
         }
         self.execute_show_command(
@@ -956,6 +1070,23 @@ impl AppState {
             Some(format!("Renamed bank {from} to {to}")),
             false,
         )
+    }
+
+    pub fn set_bank_color(&self, bank_name: &str, color: Option<String>) -> ShowSnapshotDto {
+        let target = bank_name.trim();
+        if !target.is_empty() {
+            let mut show = self.show_state.write();
+            match color.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                Some(clean) => {
+                    show.bank_colors
+                        .insert(target.to_string(), clean.to_string());
+                }
+                None => {
+                    show.bank_colors.remove(target);
+                }
+            }
+        }
+        self.build_show_snapshot(None, false)
     }
 
     pub fn set_live_bpm(&self, bpm: f32, t_sec: Option<f64>) -> EngineSnapshotDto {
@@ -1374,7 +1505,134 @@ fn import_show_xml_command(
     state: State<'_, AppState>,
     xml_str: String,
 ) -> Result<ShowSnapshotDto, String> {
-    state.import_show_xml(&xml_str)
+    let snapshot = state.import_show_xml(&xml_str)?;
+    *state.current_project_path.lock() = None;
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn open_project_file_command(
+    state: State<'_, AppState>,
+) -> Result<Option<ShowSnapshotDto>, String> {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Open TaktLight Project")
+            .add_filter("TaktLight Show XML", &["xml"])
+            .pick_file()
+    })
+    .await
+    .map_err(|e| format!("Failed to open file dialog: {e}"))?;
+
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+
+    let snapshot = state.open_project_path(&path)?;
+    Ok(Some(snapshot))
+}
+
+#[tauri::command]
+async fn open_project_path_command(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<ShowSnapshotDto, String> {
+    state.open_project_path(std::path::Path::new(&path))
+}
+
+#[tauri::command]
+fn new_project_command(state: State<'_, AppState>) -> ShowSnapshotDto {
+    state.new_project()
+}
+
+#[tauri::command]
+fn get_recent_projects_command(state: State<'_, AppState>) -> Vec<String> {
+    state.get_recent_projects()
+}
+
+#[tauri::command]
+async fn save_project_file_command(
+    state: State<'_, AppState>,
+    suggested_name: String,
+) -> Result<bool, String> {
+    let existing_path = state.current_project_path.lock().clone();
+    let target_path = match existing_path {
+        Some(path) => path,
+        None => {
+            let file_name = if suggested_name.trim().is_empty() {
+                "taktlight_show.takt.xml".to_string()
+            } else {
+                suggested_name
+            };
+            let picked = tokio::task::spawn_blocking(move || {
+                rfd::FileDialog::new()
+                    .set_title("Save TaktLight Project")
+                    .set_file_name(&file_name)
+                    .add_filter("TaktLight Show XML", &["xml"])
+                    .save_file()
+            })
+            .await
+            .map_err(|e| format!("Failed to open save dialog: {e}"))?;
+
+            match picked {
+                Some(path) => path,
+                None => return Ok(false),
+            }
+        }
+    };
+
+    let xml = {
+        let show = state.show_state.read();
+        serialize_show_xml(&show).map_err(|e| e.to_string())?
+    };
+    std::fs::write(&target_path, xml)
+        .map_err(|e| format!("Failed to write project file '{}': {e}", target_path.display()))?;
+    *state.current_project_path.lock() = Some(target_path.clone());
+    state.record_recent_project(&target_path);
+    Ok(true)
+}
+
+#[tauri::command]
+async fn save_project_as_command(
+    state: State<'_, AppState>,
+    suggested_name: String,
+) -> Result<bool, String> {
+    let file_name = if suggested_name.trim().is_empty() {
+        "taktlight_show.takt.xml".to_string()
+    } else {
+        suggested_name
+    };
+    let picked = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("Save TaktLight Project As")
+            .set_file_name(&file_name)
+            .add_filter("TaktLight Show XML", &["xml"])
+            .save_file()
+    })
+    .await
+    .map_err(|e| format!("Failed to open save dialog: {e}"))?;
+
+    let Some(target_path) = picked else {
+        return Ok(false);
+    };
+
+    let xml = {
+        let show = state.show_state.read();
+        serialize_show_xml(&show).map_err(|e| e.to_string())?
+    };
+    std::fs::write(&target_path, xml)
+        .map_err(|e| format!("Failed to write project file '{}': {e}", target_path.display()))?;
+    *state.current_project_path.lock() = Some(target_path.clone());
+    state.record_recent_project(&target_path);
+    Ok(true)
+}
+
+#[tauri::command]
+fn set_bank_color_command(
+    state: State<'_, AppState>,
+    bank_name: String,
+    color: Option<String>,
+) -> ShowSnapshotDto {
+    state.set_bank_color(&bank_name, color)
 }
 
 #[tauri::command]
@@ -1563,6 +1821,108 @@ fn resolve_split_fixtures_command(state: State<'_, AppState>) -> Result<ShowSnap
     state.resolve_split_fixtures()
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioFileBytesDto {
+    pub resolved_path: String,
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedAudioMatchDto {
+    pub requested: String,
+    pub resolved_path: String,
+    pub file_name: String,
+}
+
+fn collect_files_recursive(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            out.push(path);
+        } else if path.is_dir() && depth > 0 {
+            collect_files_recursive(&path, depth - 1, out);
+        }
+    }
+}
+
+#[tauri::command]
+fn read_audio_file_bytes_command(path: String) -> Result<AudioFileBytesDto, String> {
+    let p = PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(format!("Audio file not found: {}", p.display()));
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("Failed to read audio file: {e}"))?;
+    let resolved_path = p
+        .canonicalize()
+        .unwrap_or_else(|_| p.clone())
+        .to_string_lossy()
+        .to_string();
+    let file_name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("audio")
+        .to_string();
+    Ok(AudioFileBytesDto {
+        resolved_path,
+        file_name,
+        bytes,
+    })
+}
+
+#[tauri::command]
+fn resolve_audio_in_folder_command(
+    folder_path: String,
+    file_names: Vec<String>,
+) -> Result<Vec<ResolvedAudioMatchDto>, String> {
+    let dir = PathBuf::from(folder_path.trim());
+    if !dir.is_dir() {
+        return Err(format!("Folder not found: {}", dir.display()));
+    }
+    let mut candidates = Vec::new();
+    collect_files_recursive(&dir, 2, &mut candidates);
+
+    let mut by_lower_name: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
+    for path in candidates {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            by_lower_name
+                .entry(name.to_ascii_lowercase())
+                .or_insert(path);
+        }
+    }
+
+    let mut matches = Vec::new();
+    for requested in file_names {
+        let base = PathBuf::from(&requested)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&requested)
+            .to_ascii_lowercase();
+        if let Some(found) = by_lower_name.get(&base) {
+            let resolved_path = found
+                .canonicalize()
+                .unwrap_or_else(|_| found.clone())
+                .to_string_lossy()
+                .to_string();
+            let file_name = found
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&requested)
+                .to_string();
+            matches.push(ResolvedAudioMatchDto {
+                requested,
+                resolved_path,
+                file_name,
+            });
+        }
+    }
+    Ok(matches)
+}
+
 #[tauri::command]
 fn close_splashscreen(app: tauri::AppHandle) {
     if let Some(splash) = app.get_webview_window("splashscreen") {
@@ -1582,6 +1942,16 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(app_state)
         .setup(|app| {
+            if let Ok(config_dir) = app.path().app_config_dir() {
+                let recent_file = config_dir.join("recent_projects.txt");
+                if let Some(state) = app.try_state::<AppState>() {
+                    let loaded = load_recent_projects_from_file(&recent_file);
+                    if !loaded.is_empty() {
+                        *state.recent_projects.lock() = loaded;
+                    }
+                    *state.recent_projects_file.lock() = Some(recent_file);
+                }
+            }
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(6));
@@ -1623,6 +1993,13 @@ pub fn run() {
             redo_command,
             export_show_xml_command,
             import_show_xml_command,
+            open_project_file_command,
+            open_project_path_command,
+            new_project_command,
+            get_recent_projects_command,
+            save_project_file_command,
+            save_project_as_command,
+            set_bank_color_command,
             upsert_color_palette_command,
             delete_color_palette_command,
             upsert_dimmer_palette_command,
@@ -1645,6 +2022,8 @@ pub fn run() {
             set_latency_offset_ms_command,
             analyze_audio_command,
             resolve_split_fixtures_command,
+            read_audio_file_bytes_command,
+            resolve_audio_in_folder_command,
             close_splashscreen,
         ])
         .build(tauri::generate_context!())
@@ -1744,6 +2123,14 @@ mod tests {
     #[test]
     fn app_state_patches_moves_undoes_and_recompiles_render_plan() {
         let state = AppState::new(false);
+        state.show_state.write().network_outputs.universes[1] = UniverseConfig::new(
+            2,
+            taktlight_engine::state::plan::ProtocolKind::Sacn {
+                mode: taktlight_engine::state::plan::SacnOutputMode::Multicast,
+                sacn_universe: 2,
+                priority: 100,
+            },
+        );
         let snap = state
             .patch_fixtures(
                 "age/rlcv3_8_segment_tube.json",
@@ -2080,5 +2467,227 @@ mod tests {
         assert!(snap.show.fx_library.is_empty());
         assert_eq!(snap.show.color_palettes.len(), 12);
         assert!(!snap.can_undo);
+    }
+
+    #[test]
+    fn audio_file_check_and_folder_relink_commands_resolve_and_report_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "taktlight_audio_cmd_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("stems");
+        std::fs::create_dir_all(&sub).unwrap();
+        let track_path = sub.join("Intro.WAV");
+        std::fs::write(&track_path, b"RIFFtestbytes").unwrap();
+
+        // Direct read succeeds for existing file and fails for missing file
+        let ok = read_audio_file_bytes_command(track_path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(ok.file_name, "Intro.WAV");
+        assert_eq!(ok.bytes, b"RIFFtestbytes");
+        assert!(read_audio_file_bytes_command(
+            dir.join("does_not_exist.wav").to_string_lossy().to_string()
+        )
+        .is_err());
+
+        // Folder scan matches case-insensitively across nested subfolders
+        let matches = resolve_audio_in_folder_command(
+            dir.to_string_lossy().to_string(),
+            vec![
+                "C:\\Old\\intro.wav".to_string(),
+                "C:\\Old\\missing.mp3".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].requested, "C:\\Old\\intro.wav");
+        assert_eq!(matches[0].file_name, "Intro.WAV");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_state_xml_export_import_roundtrip_and_malformed_rejection() {
+        let state = AppState::new(false);
+        state
+            .patch_fixtures(
+                "age/rlcv3_8_segment_tube.json",
+                "34ch Pixel Mode",
+                "Tube XML",
+                1,
+                1,
+                1,
+                true,
+            )
+            .unwrap();
+        let xml = serialize_show_xml(&state.show_state.read()).expect("export XML");
+        assert!(xml.contains("Tube XML"));
+
+        let fresh = AppState::new(false);
+        let imported = fresh.import_show_xml(&xml).expect("import exported XML");
+        assert_eq!(imported.show.patch.len(), 1);
+        assert_eq!(imported.show.patch[0].name, "Tube XML");
+        assert_eq!(fresh.plan.load().cell_count, 8);
+
+        assert!(fresh.import_show_xml("<TaktLightShow><broken").is_err());
+        assert!(fresh.import_show_xml("<WrongRoot />").is_err());
+    }
+
+    #[test]
+    fn app_state_resolves_splits_configures_universes_manages_bank_colors_and_deletions() {
+        use taktlight_engine::state::plan::{ProtocolKind, SacnOutputMode};
+
+        let state = AppState::new(false);
+        state.seed_default_studio_show();
+
+        // Patch a split fixture straddling U1.505 -> U2 and resolve splits
+        state
+            .patch_fixtures(
+                "age/rlcv3_8_segment_tube.json",
+                "34ch Pixel Mode",
+                "SplitTube",
+                1,
+                1,
+                505,
+                true,
+            )
+            .unwrap();
+        let resolved = state.resolve_split_fixtures().unwrap();
+        assert!(resolved
+            .show
+            .patch
+            .iter()
+            .all(|f| f.address + f.channel_count - 1 <= 512));
+
+        // Configure universe 2 as sACN
+        let u2 = UniverseConfig::new(
+            2,
+            ProtocolKind::Sacn {
+                mode: SacnOutputMode::Multicast,
+                sacn_universe: 2,
+                priority: 120,
+            },
+        );
+        let cfg_snap = state.configure_universe(u2).unwrap();
+        assert!(matches!(
+            cfg_snap.show.network_outputs.universes.iter().find(|u| u.id == 2).unwrap().protocol,
+            ProtocolKind::Sacn { priority: 120, .. }
+        ));
+
+        // Bank color set & clear
+        let colored = state.set_bank_color("Bank 1", Some("#FF5500".into()));
+        assert_eq!(
+            colored.show.bank_colors.get("Bank 1").map(|s| s.as_str()),
+            Some("#FF5500")
+        );
+        let cleared = state.set_bank_color("Bank 1", None);
+        assert!(!cleared.show.bank_colors.contains_key("Bank 1"));
+
+        // Delete scene, fx_block, palette, group, and timeline cleanly
+        let first_scene_id = state.show_state.read().scenes[0].id.clone();
+        state.delete_scene(&first_scene_id).unwrap();
+        assert!(state.show_state.read().scenes.is_empty());
+        state.undo().unwrap();
+        assert_eq!(state.show_state.read().scenes.len(), 1);
+
+        let first_cp_id = state.show_state.read().color_palettes[0].id.clone();
+        state.delete_color_palette(&first_cp_id).unwrap();
+        state.undo().unwrap();
+
+        state
+            .upsert_group(FixtureGroupDef {
+                id: "grp_del".into(),
+                name: "Temp".into(),
+                order: taktlight_engine::show::spatial::OrderRule::Linear,
+                targets: vec![],
+            })
+            .unwrap();
+        state.delete_group("grp_del").unwrap();
+        assert!(state.show_state.read().groups.is_empty());
+
+        state
+            .upsert_fx_block(FxBlockDef {
+                id: "blk_del".into(),
+                name: "Temp".into(),
+                target_group: Some("all".into()),
+                duration_beats: 4.0,
+                duration_sec: None,
+                loop_block: true,
+                elements: vec![],
+            })
+            .unwrap();
+        state.delete_fx_block("blk_del").unwrap();
+        assert!(state.show_state.read().fx_library.is_empty());
+
+        state
+            .upsert_timeline(
+                TimelineDef {
+                    id: "tl_del".into(),
+                    name: "Temp TL".into(),
+                    duration_sec: 8.0,
+                    grid_offset_sec: 0.0,
+                    tempo_map: vec![],
+                    audio_track: None,
+                    loop_timeline: false,
+                    tracks: vec![],
+                },
+                None,
+            )
+            .unwrap();
+        state.delete_timeline("tl_del").unwrap();
+        assert!(state.show_state.read().timelines.is_empty());
+    }
+
+    #[test]
+    fn new_project_and_recent_projects_manage_lifecycle_and_dedup() {
+        let dir = std::env::temp_dir().join(format!(
+            "taktlight_project_lifecycle_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = AppState::new(false);
+        *state.recent_projects_file.lock() = Some(dir.join("recent.txt"));
+        state.seed_default_studio_show();
+        state
+            .patch_fixtures(
+                "age/rlcv3_8_segment_tube.json",
+                "34ch Pixel Mode",
+                "LifecycleTube",
+                1,
+                1,
+                1,
+                true,
+            )
+            .unwrap();
+
+        let p1 = dir.join("alpha.takt.xml");
+        let p2 = dir.join("beta.takt.xml");
+        let xml = serialize_show_xml(&state.show_state.read()).unwrap();
+        std::fs::write(&p1, &xml).unwrap();
+        std::fs::write(&p2, &xml).unwrap();
+
+        // Open p1 then p2 then p1 again -> deduplicated, p1 first
+        state.open_project_path(&p1).unwrap();
+        state.open_project_path(&p2).unwrap();
+        state.open_project_path(&p1).unwrap();
+
+        let recent = state.get_recent_projects();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0], p1.to_string_lossy().to_string());
+        assert_eq!(recent[1], p2.to_string_lossy().to_string());
+
+        // Missing path returns a clear error
+        assert!(state.open_project_path(&dir.join("does_not_exist.takt.xml")).is_err());
+
+        // new_project resets patch, undo, current_project_path, and keeps 1 default scene
+        let reset_snap = state.new_project();
+        assert!(reset_snap.show.patch.is_empty());
+        assert_eq!(reset_snap.show.scenes.len(), 1);
+        assert!(!reset_snap.can_undo);
+        assert!(state.current_project_path.lock().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

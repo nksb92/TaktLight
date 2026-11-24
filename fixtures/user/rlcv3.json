@@ -1,12 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
   "availableChannels": {
-    "Macro 1": {
-      "capability": {
-        "type": "NoFunction"
-      },
-      "defaultValue": 0
-    },
     "Master Dimmer": {
       "capability": {
         "type": "Intensity"
@@ -15,7 +9,7 @@
     }
   },
   "categories": [
-    "LED Tube"
+    "Pixel Bar"
   ],
   "matrix": {
     "pixelCount": [
@@ -24,17 +18,419 @@
       1
     ],
     "pixelGroups": {
-      "All": "all"
+      "All": "all",
+      "Seg1_1": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24"
+      ],
+      "Seg2_1": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12"
+      ],
+      "Seg2_2": [
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24"
+      ],
+      "Seg3_1": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "Seg3_2": [
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16"
+      ],
+      "Seg3_3": [
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24"
+      ],
+      "Seg4_1": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6"
+      ],
+      "Seg4_2": [
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12"
+      ],
+      "Seg4_3": [
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18"
+      ],
+      "Seg4_4": [
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24"
+      ],
+      "Seg6_1": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "Seg6_2": [
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "Seg6_3": [
+        "9",
+        "10",
+        "11",
+        "12"
+      ],
+      "Seg6_4": [
+        "13",
+        "14",
+        "15",
+        "16"
+      ],
+      "Seg6_5": [
+        "17",
+        "18",
+        "19",
+        "20"
+      ],
+      "Seg6_6": [
+        "21",
+        "22",
+        "23",
+        "24"
+      ],
+      "Seg8_1": [
+        "1",
+        "2",
+        "3"
+      ],
+      "Seg8_2": [
+        "4",
+        "5",
+        "6"
+      ],
+      "Seg8_3": [
+        "7",
+        "8",
+        "9"
+      ],
+      "Seg8_4": [
+        "10",
+        "11",
+        "12"
+      ],
+      "Seg8_5": [
+        "13",
+        "14",
+        "15"
+      ],
+      "Seg8_6": [
+        "16",
+        "17",
+        "18"
+      ],
+      "Seg8_7": [
+        "19",
+        "20",
+        "21"
+      ],
+      "Seg8_8": [
+        "22",
+        "23",
+        "24"
+      ],
+      "Seg12_1": [
+        "1",
+        "2"
+      ],
+      "Seg12_2": [
+        "3",
+        "4"
+      ],
+      "Seg12_3": [
+        "5",
+        "6"
+      ],
+      "Seg12_4": [
+        "7",
+        "8"
+      ],
+      "Seg12_5": [
+        "9",
+        "10"
+      ],
+      "Seg12_6": [
+        "11",
+        "12"
+      ],
+      "Seg12_7": [
+        "13",
+        "14"
+      ],
+      "Seg12_8": [
+        "15",
+        "16"
+      ],
+      "Seg12_9": [
+        "17",
+        "18"
+      ],
+      "Seg12_10": [
+        "19",
+        "20"
+      ],
+      "Seg12_11": [
+        "21",
+        "22"
+      ],
+      "Seg12_12": [
+        "23",
+        "24"
+      ]
     }
   },
   "meta": {
     "authors": [
       "Another German Engineer"
     ],
-    "createDate": "2026-11-19",
-    "lastModifyDate": "2026-11-19"
+    "createDate": "2026-11-22",
+    "lastModifyDate": "2026-11-23"
   },
   "modes": [
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": [
+            "Seg1_1"
+          ],
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "1 Segment",
+      "shortName": "4ch"
+    },
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": [
+            "Seg2_1",
+            "Seg2_2"
+          ],
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "2 Segments",
+      "shortName": "7ch"
+    },
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": [
+            "Seg3_1",
+            "Seg3_2",
+            "Seg3_3"
+          ],
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "3 Segments",
+      "shortName": "10ch"
+    },
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": [
+            "Seg4_1",
+            "Seg4_2",
+            "Seg4_3",
+            "Seg4_4"
+          ],
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "4 Segments",
+      "shortName": "13ch"
+    },
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": [
+            "Seg6_1",
+            "Seg6_2",
+            "Seg6_3",
+            "Seg6_4",
+            "Seg6_5",
+            "Seg6_6"
+          ],
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "6 Segments",
+      "shortName": "19ch"
+    },
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": [
+            "Seg8_1",
+            "Seg8_2",
+            "Seg8_3",
+            "Seg8_4",
+            "Seg8_5",
+            "Seg8_6",
+            "Seg8_7",
+            "Seg8_8"
+          ],
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "8 Segments",
+      "shortName": "25ch"
+    },
+    {
+      "channels": [
+        "Master Dimmer",
+        {
+          "channelOrder": "perPixel",
+          "insert": "matrixChannels",
+          "repeatFor": [
+            "Seg12_1",
+            "Seg12_2",
+            "Seg12_3",
+            "Seg12_4",
+            "Seg12_5",
+            "Seg12_6",
+            "Seg12_7",
+            "Seg12_8",
+            "Seg12_9",
+            "Seg12_10",
+            "Seg12_11",
+            "Seg12_12"
+          ],
+          "templateChannels": [
+            "Red $pixelKey",
+            "Green $pixelKey",
+            "Blue $pixelKey"
+          ]
+        }
+      ],
+      "name": "12 Segments",
+      "shortName": "37ch"
+    },
     {
       "channels": [
         "Master Dimmer",
@@ -49,16 +445,16 @@
           ]
         }
       ],
-      "name": "73 CH Mode",
-      "shortName": "74ch"
+      "name": "24 Segments",
+      "shortName": "73ch"
     }
   ],
   "name": "RLCV3",
   "shortName": "RLCV3",
   "templateChannels": {
-    "Blue $pixelKey": {
+    "Red $pixelKey": {
       "capability": {
-        "color": "Blue",
+        "color": "Red",
         "type": "ColorIntensity"
       },
       "defaultValue": 0
@@ -70,9 +466,9 @@
       },
       "defaultValue": 0
     },
-    "Red $pixelKey": {
+    "Blue $pixelKey": {
       "capability": {
-        "color": "Red",
+        "color": "Blue",
         "type": "ColorIntensity"
       },
       "defaultValue": 0
