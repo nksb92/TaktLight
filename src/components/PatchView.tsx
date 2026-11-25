@@ -5,6 +5,7 @@ import {
   Download,
   Move,
   Redo2,
+  Sun,
   Trash2,
   Undo2,
   Upload,
@@ -58,8 +59,10 @@ export function PatchView() {
     (s) => s.selectedFixtureInstanceId,
   );
   const focusedPatchUniverse = useTaktStore((s) => s.focusedPatchUniverse);
+  const identifiedFixtureId = useTaktStore((s) => s.identifiedFixtureId);
 
   const patchFixtures = useTaktStore((s) => s.patchFixtures);
+  const setIdentifiedFixture = useTaktStore((s) => s.setIdentifiedFixture);
   const moveFixturePatch = useTaktStore((s) => s.moveFixturePatch);
   const unpatchFixture = useTaktStore((s) => s.unpatchFixture);
   const updateFixtureCalibration = useTaktStore(
@@ -78,6 +81,7 @@ export function PatchView() {
   const setFocusedPatchUniverse = useTaktStore(
     (s) => s.setFocusedPatchUniverse,
   );
+  const setActiveTab = useTaktStore((s) => s.setActiveTab);
 
   const [selectedProfileId, setSelectedProfileId] = useState<string>(
     fixtureSummaries[0]?.id ?? "",
@@ -601,6 +605,26 @@ export function PatchView() {
         </div>
       )}
 
+      {fixtureSummaries.length === 0 && (
+        <div
+          data-testid="empty-fixtures-onboarding-banner"
+          className="bg-slate-dark border border-ember/60 rounded-panel px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3"
+        >
+          <div className="text-xs text-mist">
+            <span className="font-semibold text-frost">No fixture profiles loaded yet.</span>{" "}
+            Create a custom fixture or import an Open Fixture Library (.json) profile before patching.
+          </div>
+          <button
+            type="button"
+            data-testid="go-to-fixtures-btn"
+            onClick={() => setActiveTab("fixtures")}
+            className="px-3 py-1.5 rounded bg-ember hover:bg-burnt text-frost font-sans text-xs font-semibold transition-colors"
+          >
+            Open Fixture Builder
+          </button>
+        </div>
+      )}
+
       {/* Auto-Patch Bar */}
       <section className="bg-slate border border-steel rounded-panel p-3">
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-2.5 items-end">
@@ -618,11 +642,15 @@ export function PatchView() {
               onChange={(e) => setSelectedProfileId(e.target.value)}
               className="bg-ink border border-steel rounded px-2.5 py-1.5 text-xs text-frost font-sans focus:outline-none focus:border-ember"
             >
-              {fixtureSummaries.map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.name}
-                </option>
-              ))}
+              {fixtureSummaries.length === 0 ? (
+                <option value="">No fixture profiles (add in Fixtures)</option>
+              ) : (
+                fixtureSummaries.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.name}
+                  </option>
+                ))
+              )}
             </select>
           </div>
 
@@ -1163,6 +1191,30 @@ export function PatchView() {
                           )}
                         </div>
                         <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            data-testid={`locate-fixture-${fx.id}`}
+                            aria-label={`Locate ${fx.name}`}
+                            aria-pressed={identifiedFixtureId === fx.id}
+                            title={
+                              identifiedFixtureId === fx.id
+                                ? "Stop Locating Fixture"
+                                : "Locate / Identify Fixture (100% Open White)"
+                            }
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void setIdentifiedFixture(
+                                identifiedFixtureId === fx.id ? null : fx.id,
+                              );
+                            }}
+                            className={`p-1 rounded border transition-colors ${
+                              identifiedFixtureId === fx.id
+                                ? "bg-frost border-frost text-void"
+                                : "bg-slate-dark border-steel text-mist hover:border-frost"
+                            }`}
+                          >
+                            <Sun className="w-3 h-3" />
+                          </button>
                           <button
                             type="button"
                             aria-label={`Move ${fx.name}`}

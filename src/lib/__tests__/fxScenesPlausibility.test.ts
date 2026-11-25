@@ -4,11 +4,12 @@ import {
   evaluateSimulationLayersToDmx,
   type FxElementDef,
 } from "../mixerLogic";
-import { getDefaultShippedFixtures } from "../oflBuilder";
+import {
+  getTestFixtureCache,
+  TEST_TUBE_8SEG_ID,
+} from "../../test/testFixtures";
 
-const FIXTURE_CACHE = Object.fromEntries(
-  getDefaultShippedFixtures().map((f) => [f.summary.id, f]),
-);
+const FIXTURE_CACHE = getTestFixtureCache();
 const UNIVERSES = [
   {
     id: 1,
@@ -43,7 +44,7 @@ function buildTubeShow(elements: FxElementDef[], gamma = 1.0, whiteMode: "off" |
       {
         id: "fx_tube",
         name: "Tube 8-Seg",
-        profile: "age/rlcv3_8_segment_tube.json",
+        profile: TEST_TUBE_8SEG_ID,
         mode: "34ch Pixel Mode",
         universe: 1,
         address: 1,

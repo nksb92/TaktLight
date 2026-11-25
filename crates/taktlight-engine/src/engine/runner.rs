@@ -10,6 +10,7 @@ use parking_lot::RwLock;
 use spin_sleep::SpinSleeper;
 use tokio::sync::watch;
 
+use crate::audio::{AudioClock, InterpolatedAudioClock};
 use crate::engine::evaluator::{ClockInput, Engine, EvaluatedFrame, QuantizerState};
 use crate::frame::binary::{
     encode_binary_frame, FrameSnapshot, BINARY_FRAME_LAYOUT_VERSION,
@@ -34,11 +35,57 @@ use crate::telemetry::jitter::{JitterStats, JitterTracker, FRAME_PERIOD_US};
 pub const ARTPOLL_INTERVAL_SEC: f64 = 2.5;
 pub const SACN_DISCOVERY_INTERVAL_SEC: f64 = 10.0;
 pub const SACN_TERMINATION_GAP: Duration = Duration::from_millis(20);
+pub const NIC_RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(windows)]
+struct WindowsRealtimeGuard {
+    timer_period_set: bool,
+}
+
+#[cfg(windows)]
+impl WindowsRealtimeGuard {
+    fn activate() -> Self {
+        #[link(name = "winmm")]
+        extern "system" {
+            fn timeBeginPeriod(uPeriod: u32) -> u32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn SetThreadPriority(hThread: *mut std::ffi::c_void, nPriority: i32) -> i32;
+        }
+        const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+        let timer_period_set = unsafe { timeBeginPeriod(1) == 0 };
+        unsafe {
+            let thread = GetCurrentThread();
+            let _ = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
+        }
+        Self { timer_period_set }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsRealtimeGuard {
+    fn drop(&mut self) {
+        if self.timer_period_set {
+            #[link(name = "winmm")]
+            extern "system" {
+                fn timeEndPeriod(uPeriod: u32) -> u32;
+            }
+            unsafe {
+                let _ = timeEndPeriod(1);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub cid: [u8; 16],
     pub source_name: String,
+    pub initial_adapter: AdapterSelection,
+    pub audio_clock: Option<Arc<InterpolatedAudioClock>>,
+    pub app_epoch: Option<Instant>,
 }
 
 impl Default for EngineConfig {
@@ -46,6 +93,9 @@ impl Default for EngineConfig {
         Self {
             cid: *uuid::Uuid::new_v4().as_bytes(),
             source_name: "TaktLight".to_string(),
+            initial_adapter: AdapterSelection::Auto,
+            audio_clock: None,
+            app_epoch: None,
         }
     }
 }
@@ -59,6 +109,7 @@ pub struct EngineTelemetrySnapshot {
     pub discovery_available: bool,
     pub active_interface: Option<NetworkInterfaceInfo>,
     pub discovered_nodes: Vec<TrackedArtNetNode>,
+    pub last_network_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +120,19 @@ struct ActiveSacnStream {
     last_sequence: u8,
 }
 
+#[derive(Debug, Clone)]
+struct PendingSacnTermination {
+    target: SocketAddr,
+    packets: [[u8; 638]; 3],
+    next_index: usize,
+}
+
 pub struct TickTransmitter {
     cid: [u8; 16],
     source_name: String,
     artnet_sequences: HashMap<u16, u8>,
     sacn_streams: HashMap<u16, ActiveSacnStream>,
+    pending_sacn_terminations: Vec<PendingSacnTermination>,
     last_artpoll_sec: Option<f64>,
     last_sacn_discovery_sec: Option<f64>,
     discovery_tracker: NodeDiscoveryTracker,
@@ -106,6 +165,7 @@ impl TickTransmitter {
             source_name: source_name.into(),
             artnet_sequences: HashMap::new(),
             sacn_streams: HashMap::new(),
+            pending_sacn_terminations: Vec::new(),
             last_artpoll_sec: None,
             last_sacn_discovery_sec: None,
             discovery_tracker: NodeDiscoveryTracker::new(),
@@ -116,6 +176,104 @@ impl TickTransmitter {
         self.discovery_tracker.nodes()
     }
 
+    pub fn pending_termination_count(&self) -> usize {
+        self.pending_sacn_terminations.len()
+    }
+
+    fn flush_one_pending_termination_tick(
+        &mut self,
+        sink: &mut dyn PacketSink,
+    ) -> Result<(), ProtocolError> {
+        let mut idx = 0;
+        while idx < self.pending_sacn_terminations.len() {
+            let entry = &mut self.pending_sacn_terminations[idx];
+            if entry.next_index < entry.packets.len() {
+                let pkt = &entry.packets[entry.next_index];
+                let target = entry.target;
+                sink.send_to(SinkChannel::Sacn, pkt, target)?;
+                entry.next_index += 1;
+            }
+            if entry.next_index >= entry.packets.len() {
+                self.pending_sacn_terminations.swap_remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs Art-Net node discovery (`ArtPoll` / `ArtPollReply`) and flushes any
+    /// queued non-blocking sACN stream termination packets without transmitting DMX.
+    pub fn poll_discovery_and_flush(
+        &mut self,
+        t_sec: f64,
+        sink: &mut dyn PacketSink,
+    ) -> Result<(), ProtocolError> {
+        for (_addr, buf) in sink.poll_artnet_replies() {
+            if let Ok(node) = parse_artpoll_reply(&buf) {
+                self.discovery_tracker.record_reply(node, t_sec);
+            }
+        }
+        self.discovery_tracker.refresh_status(t_sec);
+        self.flush_one_pending_termination_tick(sink)?;
+
+        let broadcast_ip = sink
+            .active_interface()
+            .map(|i| i.broadcast)
+            .unwrap_or(Ipv4Addr::BROADCAST);
+        let should_artpoll = match self.last_artpoll_sec {
+            None => true,
+            Some(prev) => (t_sec - prev) >= ARTPOLL_INTERVAL_SEC,
+        };
+        if should_artpoll && !sink.is_offline() {
+            let poll_pkt = build_artpoll_packet(0x02, 0x00);
+            let target = SocketAddr::V4(SocketAddrV4::new(broadcast_ip, ARTNET_PORT));
+            sink.send_to(SinkChannel::ArtNet, &poll_pkt, target)?;
+            self.last_artpoll_sec = Some(t_sec);
+        }
+        Ok(())
+    }
+
+    pub fn enqueue_terminate_all_sacn_nonblocking(
+        &mut self,
+        sink: &mut dyn PacketSink,
+    ) -> Result<(), ProtocolError> {
+        let streams: Vec<ActiveSacnStream> = self.sacn_streams.drain().map(|(_, s)| s).collect();
+        for stream in streams {
+            self.enqueue_or_send_termination(&stream, sink, true)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_or_send_termination(
+        &mut self,
+        stream: &ActiveSacnStream,
+        sink: &mut dyn PacketSink,
+        nonblocking_paced: bool,
+    ) -> Result<(), ProtocolError> {
+        let burst = build_sacn_stream_termination_sequence(
+            &self.cid,
+            &self.source_name,
+            stream.priority,
+            stream.last_sequence,
+            stream.sacn_universe,
+        )?;
+        if nonblocking_paced {
+            // Emit first packet on this tick; emit packets 2 & 3 on the next 2 ticks (~22.7 ms apart) with zero blocking sleep.
+            sink.send_to(SinkChannel::Sacn, &burst[0], stream.target)?;
+            self.pending_sacn_terminations.push(PendingSacnTermination {
+                target: stream.target,
+                packets: burst,
+                next_index: 1,
+            });
+        } else {
+            for pkt in &burst {
+                sink.send_to(SinkChannel::Sacn, pkt, stream.target)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn transmit_frame(
         &mut self,
         plan: &RenderPlan,
@@ -123,13 +281,14 @@ impl TickTransmitter {
         sink: &mut dyn PacketSink,
         termination_gap: Option<Duration>,
     ) -> Result<(), ProtocolError> {
-        // 1. Poll ArtPollReply packets and refresh discovery timeout status
+        // 1. Poll ArtPollReply packets, refresh discovery timeout status, and advance any queued sACN terminations
         for (_addr, buf) in sink.poll_artnet_replies() {
             if let Ok(node) = parse_artpoll_reply(&buf) {
                 self.discovery_tracker.record_reply(node, frame.t_sec);
             }
         }
         self.discovery_tracker.refresh_status(frame.t_sec);
+        self.flush_one_pending_termination_tick(sink)?;
 
         let broadcast_ip = sink
             .active_interface()
@@ -157,13 +316,16 @@ impl TickTransmitter {
             .copied()
             .filter(|id| !current_sacn_ids.contains(id))
             .collect();
+        let nonblocking_paced = termination_gap.is_some();
         for removed_id in removed_sacn_ids {
             if let Some(stream) = self.sacn_streams.remove(&removed_id) {
-                self.send_stream_termination(&stream, sink, termination_gap)?;
+                self.enqueue_or_send_termination(&stream, sink, nonblocking_paced)?;
             }
         }
 
         let mut sent_any_artnet = false;
+        let mut artnet_used_broadcast = false;
+        let mut artnet_unicast_targets: Vec<Ipv4Addr> = Vec::new();
 
         // 2. Transmit per-universe DMX packets (skip empty universes with no fixtures or active output)
         for (idx, (uni_cfg, eval_uni)) in plan.universes.iter().zip(frame.universes.iter()).enumerate() {
@@ -183,8 +345,16 @@ impl TickTransmitter {
 
                     let pkt = build_artdmx_packet(seq, 0, *net, *subnet, *uni, &eval_uni.dmx);
                     let target_ip = match mode {
-                        ArtNetOutputMode::Broadcast => broadcast_ip,
-                        ArtNetOutputMode::Unicast { target_ip } => *target_ip,
+                        ArtNetOutputMode::Broadcast => {
+                            artnet_used_broadcast = true;
+                            broadcast_ip
+                        }
+                        ArtNetOutputMode::Unicast { target_ip } => {
+                            if !artnet_unicast_targets.contains(target_ip) {
+                                artnet_unicast_targets.push(*target_ip);
+                            }
+                            *target_ip
+                        }
                     };
                     let target = SocketAddr::V4(SocketAddrV4::new(target_ip, ARTNET_PORT));
                     sink.send_to(SinkChannel::ArtNet, &pkt, target)?;
@@ -228,11 +398,18 @@ impl TickTransmitter {
             }
         }
 
-        // 3. ArtSync once per tick after all ArtDmx packets
+        // 3. ArtSync once per tick after all ArtDmx packets (unicast to target(s) when all Art-Net universes are unicast)
         if sent_any_artnet && plan.artsync_enabled {
             let sync_pkt = build_artsync_packet();
-            let target = SocketAddr::V4(SocketAddrV4::new(broadcast_ip, ARTNET_PORT));
-            sink.send_to(SinkChannel::ArtNet, &sync_pkt, target)?;
+            if artnet_used_broadcast {
+                let target = SocketAddr::V4(SocketAddrV4::new(broadcast_ip, ARTNET_PORT));
+                sink.send_to(SinkChannel::ArtNet, &sync_pkt, target)?;
+            } else {
+                for unicast_ip in artnet_unicast_targets {
+                    let target = SocketAddr::V4(SocketAddrV4::new(unicast_ip, ARTNET_PORT));
+                    sink.send_to(SinkChannel::ArtNet, &sync_pkt, target)?;
+                }
+            }
         }
 
         // 4. Periodic ArtPoll every 2.5 seconds
@@ -302,6 +479,20 @@ impl TickTransmitter {
         sink: &mut dyn PacketSink,
         gap: Option<Duration>,
     ) -> Result<(), ProtocolError> {
+        let pending: Vec<PendingSacnTermination> =
+            self.pending_sacn_terminations.drain(..).collect();
+        for entry in pending {
+            for idx in entry.next_index..entry.packets.len() {
+                sink.send_to(SinkChannel::Sacn, &entry.packets[idx], entry.target)?;
+                if idx + 1 < entry.packets.len() {
+                    if let Some(d) = gap {
+                        if !d.is_zero() {
+                            std::thread::sleep(d);
+                        }
+                    }
+                }
+            }
+        }
         let streams: Vec<ActiveSacnStream> = self.sacn_streams.drain().map(|(_, s)| s).collect();
         for stream in streams {
             self.send_stream_termination(&stream, sink, gap)?;
@@ -353,19 +544,37 @@ impl Drop for EngineRunnerHandle {
     }
 }
 
-pub fn create_sink_for_selection(selection: &AdapterSelection) -> Box<dyn PacketSink> {
+pub fn create_sink_for_selection_with_error(
+    selection: &AdapterSelection,
+) -> (Box<dyn PacketSink>, Option<String>) {
+    if matches!(selection, AdapterSelection::Offline) {
+        return (Box::new(OfflineSink), None);
+    }
     let interfaces = enumerate_ipv4_interfaces();
     match resolve_adapter(&interfaces, selection) {
-        Some(iface) => match UdpSocketSink::bind(iface) {
-            Ok(sink) => Box::new(sink),
-            Err(_) => Box::new(OfflineSink),
+        Some(iface) => match UdpSocketSink::bind(iface.clone()) {
+            Ok(sink) => (Box::new(sink), None),
+            Err(err) => (
+                Box::new(OfflineSink),
+                Some(format!(
+                    "Failed to bind {} ({}): {err}",
+                    iface.name, iface.ipv4
+                )),
+            ),
         },
-        None => Box::new(OfflineSink),
+        None => (
+            Box::new(OfflineSink),
+            Some("No active IPv4 network interface available".to_string()),
+        ),
     }
 }
 
+pub fn create_sink_for_selection(selection: &AdapterSelection) -> Box<dyn PacketSink> {
+    create_sink_for_selection_with_error(selection).0
+}
+
 pub fn spawn_engine_loop(
-    config: EngineConfig,
+    mut config: EngineConfig,
     plan: Arc<ArcSwap<RenderPlan>>,
     runtime: Arc<ArcSwap<RuntimeControl>>,
     frame_tx: watch::Sender<Vec<u8>>,
@@ -374,7 +583,11 @@ pub fn spawn_engine_loop(
     initial_output_enabled: bool,
 ) -> EngineRunnerHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let sink = create_sink_for_selection(&initial_selection);
+    config.initial_adapter = initial_selection.clone();
+    let (sink, initial_net_err) = create_sink_for_selection_with_error(&initial_selection);
+    if initial_net_err.is_some() {
+        telemetry.write().last_network_error = initial_net_err;
+    }
     let join_handle = std::thread::Builder::new()
         .name("taktlight-44hz".into())
         .spawn(move || {
@@ -410,6 +623,9 @@ pub fn run_realtime_loop_with_sink(
     initial_output_enabled: bool,
     max_duration: Option<Duration>,
 ) -> JitterStats {
+    #[cfg(windows)]
+    let _rt_guard = WindowsRealtimeGuard::activate();
+
     // 2 ms spin cushion prevents Windows WaitableTimer wakeups (>700 us) from overshooting the deadline
     let sleeper = SpinSleeper::new(2_000_000);
     let mut transmitter = TickTransmitter::new(config.cid, config.source_name);
@@ -417,6 +633,14 @@ pub fn run_realtime_loop_with_sink(
     let mut quantizer_state = QuantizerState::default();
 
     let t0 = Instant::now();
+    let epoch = config.app_epoch.unwrap_or(t0);
+    let audio_clock = config.audio_clock;
+    let mut current_selection = config.initial_adapter;
+    let mut last_network_error = telemetry.read().last_network_error.clone();
+    let mut needs_nic_reconnect =
+        sink.is_offline() && !matches!(current_selection, AdapterSelection::Offline);
+    let mut last_reconnect_attempt = Instant::now();
+
     let mut tick_index: u64 = 0;
     let mut prev_post_send: Option<Instant> = None;
     let mut output_enabled = initial_output_enabled;
@@ -436,12 +660,17 @@ pub fn run_realtime_loop_with_sink(
                 }
                 EngineCommand::SetAdapter(selection) => {
                     let _ = transmitter.terminate_all_sacn(&mut *sink, Some(SACN_TERMINATION_GAP));
-                    sink = create_sink_for_selection(&selection);
+                    current_selection = selection.clone();
+                    let (new_sink, net_err) = create_sink_for_selection_with_error(&selection);
+                    sink = new_sink;
+                    last_network_error = net_err;
+                    needs_nic_reconnect =
+                        sink.is_offline() && !matches!(current_selection, AdapterSelection::Offline);
+                    last_reconnect_attempt = Instant::now();
                 }
                 EngineCommand::SetOutputEnabled(enabled) => {
                     if output_enabled && !enabled {
-                        let _ =
-                            transmitter.terminate_all_sacn(&mut *sink, Some(SACN_TERMINATION_GAP));
+                        let _ = transmitter.enqueue_terminate_all_sacn_nonblocking(&mut *sink);
                     }
                     output_enabled = enabled;
                 }
@@ -449,6 +678,22 @@ pub fn run_realtime_loop_with_sink(
         }
         if should_shutdown {
             break;
+        }
+
+        // Periodically attempt to rebind the configured NIC after a mid-stream drop
+        if needs_nic_reconnect
+            && !matches!(current_selection, AdapterSelection::Offline)
+            && last_reconnect_attempt.elapsed() >= NIC_RECONNECT_INTERVAL
+        {
+            last_reconnect_attempt = Instant::now();
+            let (candidate, net_err) = create_sink_for_selection_with_error(&current_selection);
+            if !candidate.is_offline() {
+                sink = candidate;
+                last_network_error = None;
+                needs_nic_reconnect = false;
+            } else if net_err.is_some() {
+                last_network_error = net_err;
+            }
         }
 
         let deadline = t0 + Duration::from_micros(tick_index * FRAME_PERIOD_US);
@@ -468,25 +713,40 @@ pub fn run_realtime_loop_with_sink(
 
         let current_plan = plan.load();
         let current_runtime = runtime.load();
+        let now_eval = Instant::now();
         let clock = ClockInput {
-            t_sec: Instant::now().duration_since(t0).as_secs_f64(),
+            t_sec: now_eval.duration_since(epoch).as_secs_f64(),
             frame_index: tick_index,
         };
+        let audio_playhead_sec = audio_clock.as_ref().and_then(|clk| {
+            let now_ns = now_eval.duration_since(epoch).as_nanos() as u64;
+            clk.timeline_time_sec(now_ns, current_runtime.latency_offset_ms)
+        });
 
-        let evaluated = Engine::evaluate_frame(
+        let evaluated = Engine::evaluate_frame_with_audio_clock(
             &current_plan,
             &clock,
             &current_runtime,
             &mut quantizer_state,
+            audio_playhead_sec,
         );
 
-        if output_enabled
-            && transmitter
-                .transmit_frame(&current_plan, &evaluated, &mut *sink, Some(SACN_TERMINATION_GAP))
-                .is_err()
-        {
-            // Graceful offline fallback if network adapter drops mid-stream
+        let tx_res = if output_enabled {
+            transmitter.transmit_frame(
+                &current_plan,
+                &evaluated,
+                &mut *sink,
+                Some(SACN_TERMINATION_GAP),
+            )
+        } else {
+            transmitter.poll_discovery_and_flush(clock.t_sec, &mut *sink)
+        };
+        if let Err(err) = tx_res {
+            // Graceful offline fallback if network adapter drops mid-stream; schedule periodic reconnect
+            last_network_error = Some(format!("DMX transmit failed: {err}"));
             sink = Box::new(OfflineSink);
+            needs_nic_reconnect = !matches!(current_selection, AdapterSelection::Offline);
+            last_reconnect_attempt = Instant::now();
         }
 
         // Timestamp AFTER the last packet of the tick has been handed to the socket
@@ -523,6 +783,9 @@ pub fn run_realtime_loop_with_sink(
             guard.discovery_available = sink.discovery_available();
             guard.active_interface = sink.active_interface().cloned();
             guard.discovered_nodes = transmitter.discovered_nodes();
+            if guard.last_network_error != last_network_error {
+                guard.last_network_error = last_network_error.clone();
+            }
         }
 
         tick_index += 1;
@@ -777,5 +1040,195 @@ mod tests {
         );
         tx.transmit_frame(&plan, &f3, &mut sink, None).unwrap();
         assert!(sink.sent.iter().all(|(ch, _, _)| *ch == SinkChannel::ArtNet));
+    }
+
+    #[test]
+    fn nonblocking_sacn_termination_paces_across_three_ticks_without_sleeping() {
+        let mut plan = RenderPlan::default_studio_plan();
+        plan.universes = vec![UniverseConfig::new(
+            1,
+            ProtocolKind::Sacn {
+                mode: SacnOutputMode::Multicast,
+                sacn_universe: 1,
+                priority: 100,
+            },
+        )];
+        plan.base_dmx = vec![[0u8; 512]];
+        plan.base_dmx[0][0] = 200;
+
+        let rt = RuntimeControl::new();
+        let mut q = QuantizerState::default();
+        let mut sink = MockPacketSink::new();
+        let mut tx = TickTransmitter::new([0x66u8; 16], "TaktLightPaced");
+
+        let f0 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 0,
+            },
+            &rt,
+            &mut q,
+        );
+        tx.transmit_frame(&plan, &f0, &mut sink, Some(SACN_TERMINATION_GAP))
+            .unwrap();
+        sink.sent.clear();
+
+        // Empty universe triggers non-blocking termination: 1 packet per tick over 3 ticks, zero blocking sleep
+        plan.base_dmx[0][0] = 0;
+        let t_start = Instant::now();
+        let mut total_term = 0usize;
+        for tick in 1..=4u64 {
+            let f = Engine::evaluate_frame(
+                &plan,
+                &ClockInput {
+                    t_sec: (tick as f64) * 0.023,
+                    frame_index: tick,
+                },
+                &rt,
+                &mut q,
+            );
+            sink.sent.clear();
+            tx.transmit_frame(&plan, &f, &mut sink, Some(SACN_TERMINATION_GAP))
+                .unwrap();
+            let count = sink
+                .sent
+                .iter()
+                .filter(|(ch, _, pkt)| {
+                    *ch == SinkChannel::Sacn && pkt.len() == 638 && pkt[112] == 0x40
+                })
+                .count();
+            if tick <= 3 {
+                assert_eq!(count, 1, "expected 1 termination packet on tick {tick}");
+            } else {
+                assert_eq!(count, 0, "expected 0 termination packets after 3 ticks");
+            }
+            total_term += count;
+        }
+        assert_eq!(total_term, 3);
+        assert_eq!(tx.pending_termination_count(), 0);
+        assert!(
+            t_start.elapsed() < Duration::from_millis(30),
+            "non-blocking termination must not sleep synchronously"
+        );
+    }
+
+    #[test]
+    fn discovery_runs_while_output_disabled_and_unicast_artsync_targets_unicast_ip() {
+        let mut plan = RenderPlan::default_studio_plan();
+        let target_ip = Ipv4Addr::new(192, 168, 10, 42);
+        plan.universes = vec![UniverseConfig::new(
+            1,
+            ProtocolKind::ArtNet {
+                mode: ArtNetOutputMode::Unicast { target_ip },
+                net: 0,
+                subnet: 0,
+                uni: 0,
+            },
+        )];
+        plan.base_dmx = vec![[0u8; 512]];
+        plan.base_dmx[0][0] = 180;
+
+        let rt = RuntimeControl::new();
+        let mut q = QuantizerState::default();
+        let mut sink = MockPacketSink::new();
+        let mut tx = TickTransmitter::new([0x77u8; 16], "TaktLightUnicast");
+
+        // Poll discovery when output is disabled
+        tx.poll_discovery_and_flush(0.0, &mut sink).unwrap();
+        assert_eq!(sink.sent.len(), 1);
+        assert_eq!(
+            u16::from_le_bytes([sink.sent[0].2[8], sink.sent[0].2[9]]),
+            OPCODE_ARTPOLL
+        );
+
+        // Transmit unicast ArtDmx -> ArtSync must go to unicast target IP, not broadcast
+        sink.sent.clear();
+        let f0 = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.1,
+                frame_index: 4,
+            },
+            &rt,
+            &mut q,
+        );
+        tx.transmit_frame(&plan, &f0, &mut sink, None).unwrap();
+        let sync = sink
+            .sent
+            .iter()
+            .find(|(_, _, pkt)| {
+                pkt.len() == 14 && u16::from_le_bytes([pkt[8], pkt[9]]) == OPCODE_ARTSYNC
+            })
+            .expect("expected ArtSync packet");
+        assert_eq!(sync.1, SocketAddr::V4(SocketAddrV4::new(target_ip, ARTNET_PORT)));
+    }
+
+    struct FailingPacketSink;
+
+    impl PacketSink for FailingPacketSink {
+        fn send_to(
+            &mut self,
+            _channel: SinkChannel,
+            _payload: &[u8],
+            _target: SocketAddr,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "firewall blocked UDP socket",
+            )))
+        }
+
+        fn poll_artnet_replies(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
+            Vec::new()
+        }
+
+        fn is_offline(&self) -> bool {
+            false
+        }
+
+        fn discovery_available(&self) -> bool {
+            false
+        }
+
+        fn active_interface(&self) -> Option<&NetworkInterfaceInfo> {
+            None
+        }
+    }
+
+    #[test]
+    fn mid_stream_transmit_error_falls_back_offline_and_records_network_error() {
+        let mut plan = RenderPlan::default_studio_plan();
+        plan.base_dmx = vec![[0u8; 512]];
+        plan.base_dmx[0][0] = 128;
+
+        let plan_arc = Arc::new(ArcSwap::from_pointee(plan));
+        let runtime_arc = Arc::new(ArcSwap::from_pointee(RuntimeControl::new()));
+        let (frame_tx, _frame_rx) = watch::channel(Vec::new());
+        let telemetry = Arc::new(RwLock::new(EngineTelemetrySnapshot::default()));
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+
+        run_realtime_loop_with_sink(
+            EngineConfig::default(),
+            plan_arc,
+            runtime_arc,
+            frame_tx,
+            Arc::clone(&telemetry),
+            Box::new(FailingPacketSink),
+            cmd_rx,
+            true,
+            Some(Duration::from_millis(60)),
+        );
+
+        let tel = telemetry.read();
+        assert!(tel.is_offline);
+        let err = tel
+            .last_network_error
+            .as_deref()
+            .expect("expected last_network_error to be populated");
+        assert!(
+            err.contains("firewall blocked UDP socket"),
+            "unexpected network error message: {err}"
+        );
     }
 }

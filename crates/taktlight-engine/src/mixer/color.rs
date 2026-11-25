@@ -232,6 +232,17 @@ pub fn sample_hex_stops_linear(
     grayscale: bool,
     cyclic: bool,
 ) -> [f32; 3] {
+    if hex_stops.len() <= 16 {
+        let mut stack_stops = [[0.0f32; 3]; 16];
+        let mut count = 0usize;
+        for h in hex_stops {
+            if let Some(lab) = parse_hex_to_oklab(h) {
+                stack_stops[count] = lab;
+                count += 1;
+            }
+        }
+        return sample_oklab_stops_linear(&stack_stops[..count], w, gradient, grayscale, cyclic);
+    }
     let oklab_stops: Vec<[f32; 3]> = hex_stops
         .iter()
         .filter_map(|h| parse_hex_to_oklab(h))

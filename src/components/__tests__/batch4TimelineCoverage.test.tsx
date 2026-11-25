@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TimelineEditor } from "../TimelineEditor";
 import { useTaktStore } from "../../store/useTaktStore";
 import * as audioEngine from "../../lib/audioEngine";
@@ -386,7 +386,7 @@ describe("Batch 4 Coverage — TimelineEditor", () => {
     fireEvent.click(screen.getByTestId("timeline-zoom-in"));
     fireEvent.click(screen.getByTestId("timeline-zoom-out"));
     fireEvent.click(screen.getByTestId("timeline-zoom-reset"));
-    const scroller = screen.getByTestId("timeline-ruler").parentElement!.parentElement!;
+    const scroller = screen.getByTestId("timeline-scroll-container");
     fireEvent.wheel(scroller, { deltaY: -100, ctrlKey: true, clientX: 200 });
     fireEvent.wheel(scroller, { deltaY: 100, ctrlKey: true, clientX: 200 });
 
@@ -706,5 +706,119 @@ describe("Batch 4 Coverage — TimelineEditor", () => {
     });
 
     expect(startFromSpy).not.toHaveBeenCalled();
+  });
+
+  it("synchronously anchors scrollLeft on Ctrl+Wheel zoom without requestAnimationFrame delay and prevents default browser zoom", () => {
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 1);
+    render(<TimelineEditor />);
+
+    const viewport = screen.getByTestId("timeline-ruler").parentElement as HTMLDivElement;
+    const scroller = screen.getByTestId("timeline-scroll-container") as HTMLDivElement;
+
+    // Seed a scrolled viewport (default 1.0x zoom -> 32s * 24px = 768px)
+    Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue({
+      x: 100,
+      y: 0,
+      left: 100,
+      top: 0,
+      right: 500,
+      bottom: 200,
+      width: 400,
+      height: 200,
+      toJSON: () => ({}),
+    });
+    scroller.scrollLeft = 200;
+
+    // Cursor is at clientX = 300 => cursorOffsetX = 200px from scroller left.
+    // At 1.0x (viewportWidth = 768px), cursor points to x = 400px (time = 400/768 * 32s).
+    const wheelEv = new WheelEvent("wheel", {
+      deltaY: -100,
+      ctrlKey: true,
+      clientX: 300,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      scroller.dispatchEvent(wheelEv);
+    });
+
+    // Native non-passive wheel listener must prevent default WebView/browser zoom
+    expect(wheelEv.defaultPrevented).toBe(true);
+
+    // Zoom updated to 1.25x (viewportWidth = 32 * 24 * 1.25 = 960px)
+    expect(screen.getByTestId("timeline-zoom-reset")).toHaveTextContent("1.3×");
+    expect(viewport.style.width).toBe("960px");
+
+    // scrollLeft must ALREADY be adjusted synchronously via useLayoutEffect (before any RAF runs):
+    // targetScrollLeft = (400 / 768) * 960 - 200 = 500 - 200 = 300
+    expect(rafSpy).not.toHaveBeenCalled();
+    expect(scroller.scrollLeft).toBeCloseTo(300, 1);
+
+    // Zooming back out returns to the exact same anchor synchronously
+    const wheelOutEv = new WheelEvent("wheel", {
+      deltaY: 100,
+      ctrlKey: true,
+      clientX: 300,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      scroller.dispatchEvent(wheelOutEv);
+    });
+    expect(wheelOutEv.defaultPrevented).toBe(true);
+    expect(viewport.style.width).toBe("768px");
+    expect(scroller.scrollLeft).toBeCloseTo(200, 1);
+  });
+
+  it("quantizes music clip waveform canvas backing width to power-of-2 buckets so minor zoom steps do not wipe/reallocate the canvas", () => {
+    const clearRectSpy = vi.fn();
+    const origGetContext = HTMLCanvasElement.prototype.getContext;
+    const getContextSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(function (this: HTMLCanvasElement, type: string) {
+        const ctx = origGetContext.call(this, type as "2d");
+        if (ctx && "clearRect" in ctx) {
+          ctx.clearRect = clearRectSpy;
+        }
+        return ctx;
+      } as typeof HTMLCanvasElement.prototype.getContext);
+
+    try {
+      render(<TimelineEditor />);
+      const canvas = screen.getByTestId("clip-waveform-trk_music-0") as HTMLCanvasElement;
+      const initialWidth = canvas.width;
+      // 8s music clip at 1.0x (24px/s) = 192px -> quantized power-of-2 bucket = 256
+      expect(initialWidth).toBe(256);
+      expect(clearRectSpy).toHaveBeenCalledTimes(1);
+
+      // Zoom out to 0.8x (153.6px) -> still in the 256px bucket, so canvas must NOT wipe/redraw
+      const scroller = screen.getByTestId("timeline-scroll-container");
+      act(() => {
+        scroller.dispatchEvent(
+          new WheelEvent("wheel", {
+            deltaY: 100,
+            ctrlKey: true,
+            clientX: 200,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+      expect(canvas.width).toBe(256);
+      expect(clearRectSpy).toHaveBeenCalledTimes(1);
+
+      // Zoom in to 1.3x (249.6px) -> still in the 256px bucket, still no wipe/redraw
+      fireEvent.click(screen.getByTestId("timeline-zoom-in"));
+      expect(canvas.width).toBe(256);
+      expect(clearRectSpy).toHaveBeenCalledTimes(1);
+
+      // Zoom in to 1.8x (345.6px) -> crosses 256 into 512px bucket and redraws once cleanly
+      fireEvent.click(screen.getByTestId("timeline-zoom-in"));
+      expect(canvas.width).toBe(512);
+      expect(clearRectSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      getContextSpy.mockRestore();
+    }
   });
 });

@@ -401,6 +401,43 @@ impl Default for NetworkOutputsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupMixerStripDef {
+    #[serde(default = "default_one")]
+    pub dimmer: f32,
+    #[serde(default)]
+    pub hue_shift_deg: f32,
+    #[serde(default = "default_one")]
+    pub saturation: f32,
+    #[serde(default)]
+    pub strobe_enabled: bool,
+    #[serde(default = "default_strobe_hz")]
+    pub strobe_hz: f32,
+    #[serde(default = "default_strip_mode")]
+    pub mode: String,
+}
+
+fn default_strobe_hz() -> f32 {
+    6.0
+}
+
+fn default_strip_mode() -> String {
+    "normal".to_string()
+}
+
+impl Default for GroupMixerStripDef {
+    fn default() -> Self {
+        Self {
+            dimmer: 1.0,
+            hue_shift_deg: 0.0,
+            saturation: 1.0,
+            strobe_enabled: false,
+            strobe_hz: 6.0,
+            mode: "normal".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShowState {
     pub version: String,
     pub name: String,
@@ -424,6 +461,10 @@ pub struct ShowState {
     pub timelines: Vec<TimelineDef>,
     #[serde(default)]
     pub bank_colors: BTreeMap<String, String>,
+    #[serde(default)]
+    pub key_bindings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub group_mixer_strips: BTreeMap<String, GroupMixerStripDef>,
 }
 
 impl Default for ShowState {
@@ -442,6 +483,8 @@ impl Default for ShowState {
             scenes: Vec::new(),
             timelines: Vec::new(),
             bank_colors: BTreeMap::new(),
+            key_bindings: BTreeMap::new(),
+            group_mixer_strips: BTreeMap::new(),
         }
     }
 }
@@ -474,6 +517,60 @@ struct TaktLightShowXml {
     timelines: TimelinesXml,
     #[serde(rename = "BankColors", default, skip_serializing_if = "BankColorsXml::is_empty")]
     bank_colors: BankColorsXml,
+    #[serde(rename = "KeyBindings", default, skip_serializing_if = "KeyBindingsXml::is_empty")]
+    key_bindings: KeyBindingsXml,
+    #[serde(rename = "GroupMixerStrips", default, skip_serializing_if = "GroupMixerStripsXml::is_empty")]
+    group_mixer_strips: GroupMixerStripsXml,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct KeyBindingsXml {
+    #[serde(rename = "Binding", default)]
+    entries: Vec<KeyBindingXml>,
+}
+
+impl KeyBindingsXml {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KeyBindingXml {
+    #[serde(rename = "@target")]
+    target: String,
+    #[serde(rename = "@key")]
+    key: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct GroupMixerStripsXml {
+    #[serde(rename = "Strip", default)]
+    entries: Vec<GroupMixerStripXml>,
+}
+
+impl GroupMixerStripsXml {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GroupMixerStripXml {
+    #[serde(rename = "@group")]
+    group: String,
+    #[serde(rename = "@dimmer", default = "default_one")]
+    dimmer: f32,
+    #[serde(rename = "@hue_shift_deg", default)]
+    hue_shift_deg: f32,
+    #[serde(rename = "@saturation", default = "default_one")]
+    saturation: f32,
+    #[serde(rename = "@strobe_enabled", default)]
+    strobe_enabled: bool,
+    #[serde(rename = "@strobe_hz", default = "default_strobe_hz")]
+    strobe_hz: f32,
+    #[serde(rename = "@mode", default = "default_strip_mode")]
+    mode: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1848,6 +1945,33 @@ pub fn serialize_show_xml(show: &ShowState) -> Result<String, ShowError> {
                 })
                 .collect(),
         },
+        key_bindings: KeyBindingsXml {
+            entries: show
+                .key_bindings
+                .iter()
+                .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+                .map(|(target, key)| KeyBindingXml {
+                    target: target.clone(),
+                    key: key.clone(),
+                })
+                .collect(),
+        },
+        group_mixer_strips: GroupMixerStripsXml {
+            entries: show
+                .group_mixer_strips
+                .iter()
+                .filter(|(k, _)| !k.trim().is_empty())
+                .map(|(group, strip)| GroupMixerStripXml {
+                    group: group.clone(),
+                    dimmer: strip.dimmer,
+                    hue_shift_deg: strip.hue_shift_deg,
+                    saturation: strip.saturation,
+                    strobe_enabled: strip.strobe_enabled,
+                    strobe_hz: strip.strobe_hz,
+                    mode: strip.mode.clone(),
+                })
+                .collect(),
+        },
     };
 
     let mut buffer = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -2164,6 +2288,33 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
         }
     }
 
+    let mut key_bindings = BTreeMap::new();
+    for entry in parsed.key_bindings.entries {
+        let target = entry.target.trim();
+        let key = entry.key.trim();
+        if !target.is_empty() && !key.is_empty() {
+            key_bindings.insert(target.to_string(), key.to_string());
+        }
+    }
+
+    let mut group_mixer_strips = BTreeMap::new();
+    for entry in parsed.group_mixer_strips.entries {
+        let group = entry.group.trim();
+        if !group.is_empty() {
+            group_mixer_strips.insert(
+                group.to_string(),
+                GroupMixerStripDef {
+                    dimmer: entry.dimmer.clamp(0.0, 1.0),
+                    hue_shift_deg: entry.hue_shift_deg,
+                    saturation: entry.saturation.clamp(0.0, 2.0),
+                    strobe_enabled: entry.strobe_enabled,
+                    strobe_hz: entry.strobe_hz.clamp(0.5, 25.0),
+                    mode: entry.mode,
+                },
+            );
+        }
+    }
+
     Ok(ShowState {
         version: if read_only_newer {
             raw_version
@@ -2189,6 +2340,8 @@ pub fn deserialize_show_xml(raw_xml: &str) -> Result<ShowState, ShowError> {
         scenes,
         timelines,
         bank_colors,
+        key_bindings,
+        group_mixer_strips,
     })
 }
 

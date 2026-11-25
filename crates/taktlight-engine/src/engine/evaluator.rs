@@ -1,8 +1,12 @@
-use crate::fx::scene::evaluate_scenes_and_live_layers;
-use crate::mixer::quantizer::quantize_fixture_to_dmx;
+use crate::fx::scene::evaluate_scenes_and_live_layers_with_audio_clock;
+use crate::mixer::color::{linear_rgb_to_srgb_u8, oklab_to_linear_rgb};
+use crate::mixer::quantizer::{
+    quantize_fixture_to_dmx, resolve_slot_oklab, software_strobe_gate,
+};
 pub use crate::mixer::quantizer::QuantizerState;
+use crate::mixer::traits::ShutterState;
 use crate::ofl::expander::{ChannelRole, ChannelTarget};
-use crate::ofl::model::OflColor;
+use crate::ofl::model::{OflColor, OflShutterEffect};
 use crate::state::plan::RenderPlan;
 use crate::state::runtime::RuntimeControl;
 
@@ -46,6 +50,16 @@ impl Engine {
         runtime: &RuntimeControl,
         quantizer_state: &mut QuantizerState,
     ) -> EvaluatedFrame {
+        Self::evaluate_frame_with_audio_clock(plan, clock, runtime, quantizer_state, None)
+    }
+
+    pub fn evaluate_frame_with_audio_clock(
+        plan: &RenderPlan,
+        clock: &ClockInput,
+        runtime: &RuntimeControl,
+        quantizer_state: &mut QuantizerState,
+        audio_clock_playhead_sec: Option<f64>,
+    ) -> EvaluatedFrame {
         quantizer_state.prepare_for_time(clock.t_sec);
 
         let master_scale = if runtime.blackout {
@@ -74,14 +88,42 @@ impl Engine {
         }
 
         // Stages 1 to 4: Timeline + Scenes + Layer Stack -> Trait-Space Mixer -> Hardware Quantizer
+        let has_identified = runtime.identified_fixture_id.is_some();
         if !plan.fixtures.is_empty()
-            && ((runtime.active_timeline_id.is_some() && !plan.timelines.is_empty())
+            && (has_identified
+                || (runtime.active_timeline_id.is_some() && !plan.timelines.is_empty())
                 || !runtime.active_scenes.is_empty()
                 || !plan.static_layers.is_empty()
                 || !runtime.live_layers.is_empty())
         {
-            let (fx_states, cell_states) =
-                evaluate_scenes_and_live_layers(plan, clock, runtime);
+            let (mut fx_states, mut cell_states) =
+                evaluate_scenes_and_live_layers_with_audio_clock(
+                    plan,
+                    clock,
+                    runtime,
+                    audio_clock_playhead_sec,
+                );
+
+            // Benchtop Locate / Identify override: force target fixture to 100% open white
+            if let Some(ref ident_id) = runtime.identified_fixture_id {
+                for (fx_idx, fixture) in plan.fixtures.iter().enumerate() {
+                    if fixture.id == *ident_id {
+                        fx_states[fx_idx].master_dimmer = 1.0;
+                        fx_states[fx_idx].master_dimmer_touched = true;
+                        fx_states[fx_idx].shutter = ShutterState::Open;
+                        fx_states[fx_idx].shutter_touched = true;
+                        let start = fixture.cell_start.min(cell_states.len());
+                        let end =
+                            (fixture.cell_start + fixture.cell_count as usize).min(cell_states.len());
+                        for cell in &mut cell_states[start..end] {
+                            cell.dimmer = 1.0;
+                            cell.dimmer_touched = true;
+                            cell.color = [1.0, 1.0, 1.0];
+                            cell.color_touched = true;
+                        }
+                    }
+                }
+            }
 
             for (fx_idx, fixture) in plan.fixtures.iter().enumerate() {
                 quantize_fixture_to_dmx(
@@ -104,7 +146,7 @@ impl Engine {
             }
         }
 
-        // Stage 4 Step 7: Session-only Channel Park overrides everything including Blackout
+        // Stage 4 Step 7: Session-only Channel Park overrides everything including Blackout & Identify
         for (idx, uni_cfg) in plan.universes.iter().enumerate() {
             for (&(parked_uni, parked_ch), &parked_val) in &runtime.parked_channels {
                 if parked_uni == uni_cfg.id && (1..=512).contains(&parked_ch) {
@@ -113,20 +155,79 @@ impl Engine {
             }
         }
 
-        // Compute cell preview RGBD bytes from live DMX output (supports Channel Park visualization on 2D grid!)
+        // Compute cell preview RGBD bytes from live DMX output (supports Channel Park, Color Wheels & Strobe on 2D grid!)
         let mut cell_preview_rgbd = vec![0u8; (plan.cell_count as usize) * 4];
-        for fx in &plan.fixtures {
+        for (fx_idx, fx) in plan.fixtures.iter().enumerate() {
             let mut fixture_master: Option<u8> = None;
+            let mut fixture_wheel_srgb: Option<[u8; 3]> = None;
+            let mut fixture_shutter_open = true;
+
             for ch in &fx.channels {
-                if ch.target == ChannelTarget::Fixture && ch.role == ChannelRole::Intensity {
-                    if let Some(u_idx) = ch.universe_index {
-                        if let Some(u) = universes.get(u_idx) {
-                            fixture_master = Some(dmx_to_perceptual_u8(
-                                u.dmx[(ch.dmx_address - 1) as usize],
-                                fx.calibration.gamma,
-                            ));
+                if ch.target != ChannelTarget::Fixture {
+                    continue;
+                }
+                let val = ch
+                    .universe_index
+                    .and_then(|u_idx| universes.get(u_idx))
+                    .map(|u| u.dmx[(ch.dmx_address - 1) as usize])
+                    .unwrap_or(0);
+                match &ch.role {
+                    ChannelRole::Intensity => {
+                        fixture_master = Some(dmx_to_perceptual_u8(val, fx.calibration.gamma));
+                    }
+                    ChannelRole::WheelSlot { slots, .. } => {
+                        if let Some((slot_idx, slot)) = slots
+                            .iter()
+                            .enumerate()
+                            .find(|(_, s)| val >= s.dmx_range[0] && val <= s.dmx_range[1])
+                        {
+                            let lab_opt = ch
+                                .wheel_slot_oklabs
+                                .get(slot_idx)
+                                .copied()
+                                .flatten()
+                                .or_else(|| resolve_slot_oklab(slot));
+                            if let Some(lab) = lab_opt {
+                                fixture_wheel_srgb =
+                                    Some(linear_rgb_to_srgb_u8(oklab_to_linear_rgb(lab)));
+                            }
                         }
                     }
+                    ChannelRole::ShutterStrobe { capabilities } => {
+                        if let Some(cap) = capabilities
+                            .iter()
+                            .find(|c| val >= c.dmx_range[0] && val <= c.dmx_range[1])
+                        {
+                            match cap.effect {
+                                OflShutterEffect::Open => {
+                                    fixture_shutter_open = true;
+                                }
+                                OflShutterEffect::Closed => {
+                                    fixture_shutter_open = false;
+                                }
+                                _ => {
+                                    let d0 = cap.dmx_range[0] as f32;
+                                    let d1 = cap.dmx_range[1] as f32;
+                                    let f_start = cap.speed_start_hz.unwrap_or(1.0);
+                                    let f_end = cap.speed_end_hz.unwrap_or(20.0);
+                                    let t = if (d1 - d0).abs() > 1e-6 {
+                                        ((val as f32 - d0) / (d1 - d0)).clamp(0.0, 1.0)
+                                    } else {
+                                        0.5
+                                    };
+                                    let hz = f_start + t * (f_end - f_start);
+                                    let st = if cap.random_timing {
+                                        ShutterState::RandomStrobe(hz)
+                                    } else {
+                                        ShutterState::StrobeHz(hz)
+                                    };
+                                    let (gate, _) = software_strobe_gate(st, clock.t_sec, fx_idx);
+                                    fixture_shutter_open = gate > 0.5;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -140,6 +241,7 @@ impl Engine {
                 let mut b: u16 = 0;
                 let mut w: u16 = 0;
                 let mut cell_intensity: Option<u8> = None;
+                let mut cell_wheel_srgb: Option<[u8; 3]> = None;
 
                 for ch in &fx.channels {
                     let applies = match &ch.target {
@@ -154,7 +256,7 @@ impl Engine {
                         .and_then(|u_idx| universes.get(u_idx))
                         .map(|u| u.dmx[(ch.dmx_address - 1) as usize])
                         .unwrap_or(0);
-                    match ch.role {
+                    match &ch.role {
                         ChannelRole::Intensity => {
                             cell_intensity = Some(dmx_to_perceptual_u8(val, fx.calibration.gamma))
                         }
@@ -183,14 +285,40 @@ impl Engine {
                             }
                             _ => {}
                         },
+                        ChannelRole::WheelSlot { slots, .. } => {
+                            if let Some((slot_idx, slot)) = slots
+                                .iter()
+                                .enumerate()
+                                .find(|(_, s)| val >= s.dmx_range[0] && val <= s.dmx_range[1])
+                            {
+                                let lab_opt = ch
+                                    .wheel_slot_oklabs
+                                    .get(slot_idx)
+                                    .copied()
+                                    .flatten()
+                                    .or_else(|| resolve_slot_oklab(slot));
+                                if let Some(lab) = lab_opt {
+                                    cell_wheel_srgb =
+                                        Some(linear_rgb_to_srgb_u8(oklab_to_linear_rgb(lab)));
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
 
-                let rr = dmx_to_perceptual_u8((r + w).min(255) as u8, fx.calibration.gamma);
-                let gg = dmx_to_perceptual_u8((g + w).min(255) as u8, fx.calibration.gamma);
-                let bb = dmx_to_perceptual_u8((b + w).min(255) as u8, fx.calibration.gamma);
-                let eff_dim = match (cell_intensity, fixture_master) {
+                let mut rr = dmx_to_perceptual_u8((r + w).min(255) as u8, fx.calibration.gamma);
+                let mut gg = dmx_to_perceptual_u8((g + w).min(255) as u8, fx.calibration.gamma);
+                let mut bb = dmx_to_perceptual_u8((b + w).min(255) as u8, fx.calibration.gamma);
+                if rr == 0 && gg == 0 && bb == 0 {
+                    if let Some([wr, wg, wb]) = cell_wheel_srgb.or(fixture_wheel_srgb) {
+                        rr = wr;
+                        gg = wg;
+                        bb = wb;
+                    }
+                }
+
+                let mut eff_dim = match (cell_intensity, fixture_master) {
                     (Some(ci), Some(fm)) => (((ci as u16) * (fm as u16)) / 255) as u8,
                     (Some(ci), None) => ci,
                     (None, Some(fm)) => fm,
@@ -202,6 +330,9 @@ impl Engine {
                         }
                     }
                 };
+                if !fixture_shutter_open {
+                    eff_dim = 0;
+                }
                 let base_idx = global_cell * 4;
                 cell_preview_rgbd[base_idx] = rr;
                 cell_preview_rgbd[base_idx + 1] = gg;
@@ -264,7 +395,7 @@ mod tests {
         use crate::show::spatial::GridPos;
         use crate::show::xml::{ColorPaletteDef, DimmerPaletteDef, ShowState};
 
-        let library = FixtureLibrary::load(None);
+        let library = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.color_palettes.push(ColorPaletteDef {
             id: "pal_white".into(),
@@ -281,7 +412,7 @@ mod tests {
         });
         show.patch.push(FixtureInstance {
             id: "fx_tube".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube 1".into(),
             universe: 1,
@@ -366,7 +497,7 @@ mod tests {
             FxElementDef, SceneDef, ShowState,
         };
 
-        let library = FixtureLibrary::load(None);
+        let library = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.bpm = 120.0;
         show.color_palettes.push(ColorPaletteDef {
@@ -384,7 +515,7 @@ mod tests {
         });
         show.patch.push(FixtureInstance {
             id: "fx_201".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube Left".into(),
             universe: 1,
@@ -581,7 +712,7 @@ mod tests {
             TempoPointDef, TimelineDef, TrackDef,
         };
 
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.color_palettes.push(ColorPaletteDef {
             id: "pal_orange".into(),
@@ -599,7 +730,7 @@ mod tests {
         });
         show.patch.push(FixtureInstance {
             id: "fx_201".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube".into(),
             universe: 1,
@@ -810,7 +941,7 @@ mod tests {
             ColorPaletteDef, DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState,
         };
 
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.color_palettes.push(ColorPaletteDef {
             id: "pal_o".into(),
@@ -821,7 +952,7 @@ mod tests {
         });
         show.patch.push(FixtureInstance {
             id: "fx_1".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube".into(),
             universe: 1,
@@ -915,7 +1046,7 @@ mod tests {
             ColorPaletteDef, DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState,
         };
 
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.color_palettes.push(ColorPaletteDef {
             id: "pal_red".into(),
@@ -926,7 +1057,7 @@ mod tests {
         });
         show.patch.push(FixtureInstance {
             id: "fx_1".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube".into(),
             universe: 1,
@@ -1045,12 +1176,12 @@ mod tests {
         use crate::show::spatial::GridPos;
         use crate::show::xml::{DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState};
 
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.bpm = 60.0; // 1 beat = 1.0 sec
         show.patch.push(FixtureInstance {
             id: "fx_1".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube".into(),
             universe: 1,
@@ -1160,13 +1291,13 @@ mod tests {
         use crate::show::spatial::{GridPos, OrderRule};
         use crate::show::xml::{DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState};
 
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let eval_elements = |elements: Vec<FxElementDef>, t_sec: f64| -> EvaluatedFrame {
             let mut show = ShowState::default();
             show.bpm = 120.0;
             show.patch.push(FixtureInstance {
                 id: "fx_tube".into(),
-                profile: "age/rlcv3_8_segment_tube.json".into(),
+                profile: "user/test_tube_8seg.json".into(),
                 mode: "34ch Pixel Mode".into(),
                 name: "Tube".into(),
                 universe: 1,
@@ -1633,7 +1764,7 @@ mod tests {
         use crate::show::spatial::{GridPos, OrderRule};
         use crate::show::xml::{DurationUnit, FxBlockDef, FxElementDef, SceneDef, ShowState};
 
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
 
         // 1. 0-fixture show with active FX scene + dangling palette_ref & target_group -> zero panic, zero DMX
         let mut empty_show = ShowState::default();
@@ -1700,7 +1831,7 @@ mod tests {
         let mut split_show = ShowState::default();
         split_show.patch.push(FixtureInstance {
             id: "fx_rlcv4".into(),
-            profile: "age/rlcv4_16_segment_tube.json".into(),
+            profile: "user/test_tube_16seg.json".into(),
             mode: "66ch Pixel Mode".into(),
             name: "Split RLCV4".into(),
             universe: 1,
@@ -1827,7 +1958,7 @@ mod tests {
         show.bpm = 120.0;
         show.patch.push(FixtureInstance {
             id: "fx_tube".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube".into(),
             universe: 1,
@@ -1842,7 +1973,7 @@ mod tests {
             },
             calibration: FixtureCalibration::default(),
         });
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let mut q = QuantizerState::default();
 
         let mut eval_elements = |elements: Vec<FxElementDef>, t_sec: f64| -> EvaluatedFrame {
@@ -1969,5 +2100,172 @@ mod tests {
 
         let d_shifted = eval_elements(vec![static_white, make_dim_map(Some(0.5))], 0.0);
         assert_ne!(d0.universes[0].dmx[2..34], d_shifted.universes[0].dmx[2..34]);
+    }
+
+    #[test]
+    fn identified_fixture_forces_open_white_and_preview_reflects_wheel_and_strobe() {
+        use crate::ofl::expander::{ResolvedWheelSlot, StrobeRange};
+        use crate::ofl::library::FixtureLibrary;
+        use crate::show::compiler::compile_render_plan;
+        use crate::show::patch::{FixtureCalibration, FixtureInstance};
+        use crate::show::spatial::GridPos;
+        use crate::show::xml::ShowState;
+        use crate::state::plan::{CompiledChannelSlot, CompiledFixture};
+
+        // 1. Identify/Locate forces a patched fixture to full white even with no active scenes
+        let library = FixtureLibrary::load_with_test_fixtures();
+        let mut show = ShowState::default();
+        show.patch.push(FixtureInstance {
+            id: "fx_locate".into(),
+            profile: "user/test_tube_8seg.json".into(),
+            mode: "34ch Pixel Mode".into(),
+            name: "Locate Tube".into(),
+            universe: 1,
+            address: 1,
+            channel_count: 34,
+            grid_pos: GridPos::default(),
+            calibration: FixtureCalibration::default(),
+        });
+        let plan = compile_render_plan(1, &show, &library).unwrap();
+        let mut rt = RuntimeControl::new();
+        rt.set_identified_fixture(Some("fx_locate".into()));
+        let mut q = QuantizerState::default();
+        let frame = Engine::evaluate_frame(
+            &plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 1,
+            },
+            &rt,
+            &mut q,
+        );
+        assert_eq!(frame.universes[0].dmx[0], 255); // Master dimmer 100%
+        assert_eq!(frame.universes[0].dmx[1], 11); // Shutter open
+        assert!(frame.universes[0].dmx[5] > 200 || frame.universes[0].dmx[2] > 200);
+
+        // 2. 2D preview resolves WheelSlot color and ShutterStrobe closed/strobe gating
+        let mut wheel_plan = RenderPlan::default_studio_plan();
+        let mut fx = CompiledFixture {
+            id: "fx_wheel".into(),
+            name: "Wheel Spot".into(),
+            profile: "test".into(),
+            mode: "3ch".into(),
+            calibration: FixtureCalibration {
+                gamma: 1.0,
+                min_dimmer_dmx: 0,
+                max_dimmer_dmx: 255,
+                white_mode: WhiteMode::Off,
+                white_gain: 1.0,
+            },
+            cell_start: 0,
+            cell_count: 1,
+            channels: vec![
+                CompiledChannelSlot {
+                    universe_id: 1,
+                    universe_index: Some(0),
+                    dmx_address: 1,
+                    name: "Dimmer".into(),
+                    default_value: 255,
+                    target: ChannelTarget::Fixture,
+                    role: ChannelRole::Intensity,
+                    fine_channel_offset: None,
+                    wheel_slot_oklabs: Vec::new(),
+                },
+                CompiledChannelSlot {
+                    universe_id: 1,
+                    universe_index: Some(0),
+                    dmx_address: 2,
+                    name: "Color Wheel".into(),
+                    default_value: 25,
+                    target: ChannelTarget::Fixture,
+                    role: ChannelRole::WheelSlot {
+                        wheel_name: Some("Color".into()),
+                        slots: vec![
+                            ResolvedWheelSlot {
+                                slot_number: 1,
+                                dmx_range: [0, 19],
+                                name: Some("Open".into()),
+                                colors_hex: vec!["#FFFFFF".into()],
+                            },
+                            ResolvedWheelSlot {
+                                slot_number: 2,
+                                dmx_range: [20, 39],
+                                name: Some("Red".into()),
+                                colors_hex: vec!["#FF0000".into()],
+                            },
+                        ],
+                    },
+                    fine_channel_offset: None,
+                    wheel_slot_oklabs: Vec::new(),
+                },
+                CompiledChannelSlot {
+                    universe_id: 1,
+                    universe_index: Some(0),
+                    dmx_address: 3,
+                    name: "Shutter".into(),
+                    default_value: 10,
+                    target: ChannelTarget::Fixture,
+                    role: ChannelRole::ShutterStrobe {
+                        capabilities: vec![
+                            StrobeRange {
+                                dmx_range: [0, 7],
+                                effect: OflShutterEffect::Closed,
+                                random_timing: false,
+                                speed_start_hz: None,
+                                speed_end_hz: None,
+                            },
+                            StrobeRange {
+                                dmx_range: [8, 15],
+                                effect: OflShutterEffect::Open,
+                                random_timing: false,
+                                speed_start_hz: None,
+                                speed_end_hz: None,
+                            },
+                        ],
+                    },
+                    fine_channel_offset: None,
+                    wheel_slot_oklabs: Vec::new(),
+                },
+            ],
+            has_hardware_shutter: false,
+            fixture_has_master_intensity: false,
+            has_fixture_white: false,
+            cell_has_dedicated_intensity: Vec::new(),
+            cell_has_white: Vec::new(),
+        };
+        fx.compute_precomputed_flags();
+        wheel_plan.fixtures = vec![fx];
+        wheel_plan.cell_count = 1;
+        wheel_plan.base_dmx[0][0] = 255;
+        wheel_plan.base_dmx[0][1] = 25; // Red wheel slot
+        wheel_plan.base_dmx[0][2] = 10; // Shutter open
+
+        let rt_open = RuntimeControl::new();
+        let f_open = Engine::evaluate_frame(
+            &wheel_plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 1,
+            },
+            &rt_open,
+            &mut q,
+        );
+        assert!(f_open.cell_preview_rgbd[0] > 240); // R
+        assert!(f_open.cell_preview_rgbd[1] < 10); // G
+        assert!(f_open.cell_preview_rgbd[2] < 10); // B
+        assert_eq!(f_open.cell_preview_rgbd[3], 255); // Dimmer open
+
+        // Closing shutter zeroes preview dimmer
+        wheel_plan.base_dmx[0][2] = 3; // Closed
+        let f_closed = Engine::evaluate_frame(
+            &wheel_plan,
+            &ClockInput {
+                t_sec: 0.0,
+                frame_index: 2,
+            },
+            &rt_open,
+            &mut q,
+        );
+        assert_eq!(f_closed.cell_preview_rgbd[3], 0);
     }
 }

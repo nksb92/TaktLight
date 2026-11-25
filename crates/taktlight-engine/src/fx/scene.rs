@@ -1103,6 +1103,15 @@ pub fn evaluate_scenes_and_live_layers(
     clock: &ClockInput,
     runtime: &RuntimeControl,
 ) -> (Vec<FixtureTraitState>, Vec<CellTraitState>) {
+    evaluate_scenes_and_live_layers_with_audio_clock(plan, clock, runtime, None)
+}
+
+pub fn evaluate_scenes_and_live_layers_with_audio_clock(
+    plan: &RenderPlan,
+    clock: &ClockInput,
+    runtime: &RuntimeControl,
+    audio_clock_playhead_sec: Option<f64>,
+) -> (Vec<FixtureTraitState>, Vec<CellTraitState>) {
     let cell_count = plan.cell_count as usize;
     let mut fixture_states = vec![FixtureTraitState::default(); plan.fixtures.len()];
     let mut cell_states = vec![CellTraitState::default(); cell_count];
@@ -1133,9 +1142,14 @@ pub fn evaluate_scenes_and_live_layers(
         plan.scenes.iter().map(|s| (s.id.as_str(), s)).collect();
 
     // 1. Timeline layer (bottom of stack): tracks evaluated in document order (later track on top)
+    let resolved_timeline_playhead = if runtime.timeline_playing {
+        audio_clock_playhead_sec.or_else(|| runtime.effective_timeline_playhead_sec(clock.t_sec))
+    } else {
+        runtime.effective_timeline_playhead_sec(clock.t_sec)
+    };
     if let (Some(tl_id), Some(t_tl)) = (
         runtime.active_timeline_id.as_deref(),
-        runtime.effective_timeline_playhead_sec(clock.t_sec),
+        resolved_timeline_playhead,
     ) {
         if let Some(timeline) = plan.timelines.iter().find(|t| t.id == tl_id) {
             for track in &timeline.tracks {
@@ -1461,14 +1475,14 @@ mod tests {
         use crate::show::spatial::{GridPos, OrderRule};
         use crate::show::xml::{FixtureGroupDef, ShowState, TimelineDef, TrackDef, TrackType};
 
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.bpm = 120.0;
 
         for (i, id) in ["fx_1", "fx_2"].iter().enumerate() {
             show.patch.push(FixtureInstance {
                 id: (*id).into(),
-                profile: "age/rlcv3_8_segment_tube.json".into(),
+                profile: "user/test_tube_8seg.json".into(),
                 mode: "34ch Pixel Mode".into(),
                 name: format!("Tube {}", i + 1),
                 universe: 1,

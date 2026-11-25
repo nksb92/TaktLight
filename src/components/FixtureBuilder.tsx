@@ -70,7 +70,7 @@ export function FixtureBuilder() {
   const [editingSource, setEditingSource] = useState<
     | { kind: "new" }
     | { kind: "user"; id: string; name: string }
-    | { kind: "built_in"; id: string; name: string }
+    | { kind: "standard"; id: string; name: string }
   >(() => {
     const initial = selectedFixtureId
       ? fixtureSummaries.find((f) => f.id === selectedFixtureId)
@@ -78,7 +78,7 @@ export function FixtureBuilder() {
     if (initial) {
       return initial.origin === "user_local"
         ? { kind: "user", id: initial.id, name: initial.name }
-        : { kind: "built_in", id: initial.id, name: initial.name };
+        : { kind: "standard", id: initial.id, name: initial.name };
     }
     return { kind: "new" };
   });
@@ -212,7 +212,7 @@ export function FixtureBuilder() {
       setEditingSource(
         detail.summary.origin === "user_local"
           ? { kind: "user", id: detail.summary.id, name: detail.summary.name }
-          : { kind: "built_in", id: detail.summary.id, name: detail.summary.name },
+          : { kind: "standard", id: detail.summary.id, name: detail.summary.name },
       );
       setSelectedModeIdx(0);
       setSaveSlug(sanitizeSlug(detail.summary.name) || "custom_fixture");
@@ -318,6 +318,11 @@ export function FixtureBuilder() {
     }
     const res = await saveUserFixture(slug, rawJson);
     if (res.ok) {
+      setEditingSource({
+        kind: "user",
+        id: res.detail.summary.id,
+        name: res.detail.summary.name,
+      });
       setStatusMessage(`Saved ${res.detail.summary.id}`);
     } else {
       setStatusMessage("Save rejected: fix schema validation issues");
@@ -517,65 +522,76 @@ export function FixtureBuilder() {
         </div>
 
         <div className="flex flex-col gap-2 max-h-[540px] overflow-y-auto pr-1">
-          {fixtureSummaries.map((item) => {
-            const isSelected = item.id === selectedFixtureId;
-            return (
-              <div
-                key={item.id}
-                className={`rounded-md border p-2.5 transition-colors bg-pitch ${
-                  isSelected
-                    ? "border-ember"
-                    : "border-steel/70 hover:border-fog"
-                }`}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void handleSelectFixture(item.id);
-                    }}
-                    className="text-left flex-1 min-w-0"
-                  >
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <span
-                        className={`font-mono text-[9px] uppercase px-1.5 py-0.5 rounded border ${
-                          item.origin === "age_built_in"
-                            ? "bg-pine/25 border-pine text-mist"
-                            : "bg-cobalt/25 border-cobalt text-mist"
-                        }`}
-                      >
-                        {item.origin === "age_built_in" ? "AGE" : "USER"}
-                      </span>
-                      <span className="font-mono text-[10px] text-fog">
-                        {item.pixel_count > 1
-                          ? `${item.pixel_count} PX`
-                          : "1 CELL"}
-                      </span>
-                    </div>
-                    <div className="font-sans text-sm font-medium text-mist truncate">
-                      {item.name}
-                    </div>
-                    <div className="font-mono text-[11px] text-fog mt-0.5">
-                      {item.modes.map((m) => m.short_name).join(" | ")}
-                    </div>
-                  </button>
-
-                  {item.origin === "user_local" && (
+          {fixtureSummaries.length === 0 ? (
+            <div className="rounded-md border border-dashed border-steel/70 bg-pitch/60 p-4 text-center">
+              <div className="font-sans text-xs font-medium text-mist">
+                No fixture profiles yet
+              </div>
+              <div className="font-sans text-[11px] text-fog mt-1">
+                Create one with the builder or import an OFL JSON file.
+              </div>
+            </div>
+          ) : (
+            fixtureSummaries.map((item) => {
+              const isSelected = item.id === selectedFixtureId;
+              return (
+                <div
+                  key={item.id}
+                  className={`rounded-md border p-2.5 transition-colors bg-pitch ${
+                    isSelected
+                      ? "border-ember"
+                      : "border-steel/70 hover:border-fog"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
                     <button
                       type="button"
-                      aria-label={`Delete ${item.name}`}
                       onClick={() => {
-                        void deleteUserFixture(item.id);
+                        void handleSelectFixture(item.id);
                       }}
-                      className="p-1 text-fog hover:text-signal transition-colors"
+                      className="text-left flex-1 min-w-0"
                     >
-                      <Trash2 className="w-3.5 h-3.5" />
+                      <div className="flex items-center gap-1.5 mb-1">
+                        <span
+                          className={`font-mono text-[9px] uppercase px-1.5 py-0.5 rounded border ${
+                            item.origin === "standard"
+                              ? "bg-pine/25 border-pine text-mist"
+                              : "bg-cobalt/25 border-cobalt text-mist"
+                          }`}
+                        >
+                          {item.origin === "standard" ? "STD" : "USER"}
+                        </span>
+                        <span className="font-mono text-[10px] text-fog">
+                          {item.pixel_count > 1
+                            ? `${item.pixel_count} PX`
+                            : "1 CELL"}
+                        </span>
+                      </div>
+                      <div className="font-sans text-sm font-medium text-mist truncate">
+                        {item.name}
+                      </div>
+                      <div className="font-mono text-[11px] text-fog mt-0.5">
+                        {item.modes.map((m) => m.short_name).join(" | ")}
+                      </div>
                     </button>
-                  )}
+
+                    {item.origin === "user_local" && (
+                      <button
+                        type="button"
+                        aria-label={`Delete ${item.name}`}
+                        onClick={() => {
+                          void deleteUserFixture(item.id);
+                        }}
+                        className="p-1 text-fog hover:text-signal transition-colors"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </div>
       </section>
 
@@ -632,7 +648,7 @@ export function FixtureBuilder() {
               ? "NEW DRAFT — Unsaved custom fixture (configure hardware, then add DMX modes on the right)"
               : editingSource.kind === "user"
                 ? `EDITING USER FIXTURE: ${editingSource.name} (${editingSource.id})`
-                : `BUILT-IN PRESET: ${editingSource.name} (saving creates a User Copy)`}
+                : `STANDARD PROFILE: ${editingSource.name} (saving creates a User Copy)`}
           </span>
         </div>
 

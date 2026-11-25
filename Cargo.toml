@@ -7,10 +7,15 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "2026.11.25"
 edition = "2021"
 authors = ["Another German Engineer"]
 license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [workspace.dependencies]
 arc-swap = "1"

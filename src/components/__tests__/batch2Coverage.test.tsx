@@ -4,6 +4,7 @@ import { FixtureBuilder } from "../FixtureBuilder";
 import { PatchView } from "../PatchView";
 import { useTaktStore } from "../../store/useTaktStore";
 import { buildOflFixtureJson, createDefaultBuilderDraft } from "../../lib/oflBuilder";
+import { seedTestFixturesInStore } from "../../test/testFixtures";
 
 async function resetStore() {
   useTaktStore.setState({
@@ -45,6 +46,7 @@ async function resetStore() {
     rolloverEnabled: false,
     crossProtocolWarning: false,
   });
+  seedTestFixturesInStore();
   await useTaktStore.getState().loadFixtures();
 }
 
@@ -141,7 +143,7 @@ describe("Batch 2 Coverage — FixtureBuilder", () => {
     // Select a fixture from the library list
     const firstSummary = useTaktStore.getState().fixtureSummaries[0];
     if (firstSummary) {
-      fireEvent.click(screen.getByRole("button", { name: new RegExp(firstSummary.name, "i") }));
+      fireEvent.click(screen.getByText(firstSummary.name));
     }
 
     unmount();

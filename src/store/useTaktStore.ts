@@ -1,10 +1,13 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
+import { reportError } from "../lib/errorReporting";
 import {
+  type DecodedAudioAsset,
   decodeAudioBytes,
   decodeAudioFile,
   extractAudioFileName,
   getDecodedAudioAsset,
+  timelineAudioPlayer,
 } from "../lib/audioEngine";
 import {
   decodeBinaryFrame,
@@ -133,6 +136,31 @@ export const DEFAULT_STUDIO_LAYOUT: StudioLayoutState = {
 
 const STUDIO_LAYOUT_STORAGE_KEY = "taktlight.studioLayout";
 const RECENT_PROJECTS_STORAGE_KEY = "taktlight.recentProjects";
+const AUTOSAVE_ENABLED_STORAGE_KEY = "taktlight.autosaveEnabled";
+
+function loadAutosaveEnabledFromStorage(): boolean {
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return true;
+    }
+    const raw = window.localStorage.getItem(AUTOSAVE_ENABLED_STORAGE_KEY);
+    if (raw === null) return true;
+    return raw !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveAutosaveEnabledToStorage(enabled: boolean): void {
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(AUTOSAVE_ENABLED_STORAGE_KEY, String(enabled));
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 function clampStudioLayout(raw: Partial<StudioLayoutState>): StudioLayoutState {
   return {
@@ -330,6 +358,8 @@ export interface EngineSnapshotDto {
   discovered_nodes: TrackedArtNetNode[];
   jitter_stats: JitterStatsDto;
   jitter_samples_us: number[];
+  identified_fixture_id?: string | null;
+  last_network_error?: string | null;
 }
 
 export interface ShowSnapshotDto {
@@ -341,6 +371,7 @@ export interface ShowSnapshotDto {
   rollover_enabled: boolean;
   toast: string | null;
   cross_protocol_warning: boolean;
+  has_autosave_recovery?: boolean;
 }
 
 export interface TelemetrySummary {
@@ -557,6 +588,7 @@ function createInitialState() {
     adapterSelection: { mode: "auto" } as AdapterSelection,
     interfaces: [] as NetworkInterfaceInfo[],
     isOffline: true,
+    lastNetworkError: null as string | null,
     discoveryAvailable: false,
     activeInterface: null as NetworkInterfaceInfo | null,
     discoveredNodes: [] as TrackedArtNetNode[],
@@ -612,6 +644,10 @@ function createInitialState() {
     bankColors: {} as Record<string, string>,
     focusedPatchUniverse: 1,
     outputEnabled: false,
+    identifiedFixtureId: null as string | null,
+    autosaveEnabled: loadAutosaveEnabledFromStorage(),
+    hasAutosaveRecovery: false,
+    projectLoadNonce: 1,
     showRevision: 0,
     savedRevision: 0,
     isDirty: false,
@@ -926,6 +962,7 @@ function synthesizeSimulationBuffer(state: {
   showState: ShowStateDto;
   compiledCells: CompiledCell[];
   fixtureDetailsCache: Record<string, FixtureDetail>;
+  identifiedFixtureId?: string | null;
 }): ArrayBuffer {
   const hasBase =
     state.activeScenes.length > 0 ||
@@ -936,6 +973,45 @@ function synthesizeSimulationBuffer(state: {
     hasBase,
   );
   const combinedLiveLayers = [...state.liveLayers, ...mixerLayers];
+
+  if (state.identifiedFixtureId) {
+    combinedLiveLayers.push(
+      {
+        id: "__locate_dim__",
+        name: "Locate Dimmer",
+        enabled: true,
+        priority: 999999,
+        trigger_order: 999998,
+        alpha: 1,
+        target: state.identifiedFixtureId,
+        order_override: null,
+        trait_spec: {
+          trait_kind: "dimmer",
+          op: "ltp",
+          palette_ref: null,
+          value_start: 1,
+          value_end: 1,
+        },
+      },
+      {
+        id: "__locate_color__",
+        name: "Locate White",
+        enabled: true,
+        priority: 999999,
+        trigger_order: 999999,
+        alpha: 1,
+        target: state.identifiedFixtureId,
+        order_override: null,
+        trait_spec: {
+          trait_kind: "color",
+          op: "ltp",
+          palette_ref: null,
+          hex_start: "#FFFFFF",
+          hex_end: "#FFFFFF",
+        },
+      },
+    );
+  }
 
   const previewSceneDef =
     state.selectedSceneId && state.studioOutputMode !== "live"
@@ -1264,6 +1340,32 @@ function serializeShowXmlLocally(show: ShowStateDto): string {
           .join("\n")}\n  </BankColors>`
       : "";
 
+  const keyBindingEntries = Object.entries(show.key_bindings ?? {})
+    .filter(([target, key]) => target.trim().length > 0 && key.trim().length > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+  const keyBindingsBlock =
+    keyBindingEntries.length > 0
+      ? `\n  <KeyBindings>\n${keyBindingEntries
+          .map(
+            ([target, key]) =>
+              `    <Binding target="${esc(target)}" key="${esc(key)}" />`,
+          )
+          .join("\n")}\n  </KeyBindings>`
+      : "";
+
+  const groupMixerEntries = Object.entries(show.group_mixer_strips ?? {})
+    .filter(([group]) => group.trim().length > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+  const groupMixerBlock =
+    groupMixerEntries.length > 0
+      ? `\n  <GroupMixerStrips>\n${groupMixerEntries
+          .map(
+            ([group, s]) =>
+              `    <Strip group="${esc(group)}" dimmer="${s.dimmer}" hue_shift_deg="${s.hue_shift_deg}" saturation="${s.saturation}" strobe_enabled="${s.strobe_enabled}" strobe_hz="${s.strobe_hz}" mode="${esc(s.mode)}" />`,
+          )
+          .join("\n")}\n  </GroupMixerStrips>`
+      : "";
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <TaktLightShow version="1.0" name="${esc(show.name)}" bpm="${show.bpm}">
   <NetworkOutputs frame_rate_hz="${show.network_outputs.frame_rate_hz}" adapter="${esc(show.network_outputs.adapter)}" offline_fallback="${show.network_outputs.offline_fallback}" artsync="${show.network_outputs.artsync}">
@@ -1286,7 +1388,7 @@ ${sceneLines}
   </Scenes>
   <Timelines>
 ${timelineLines}
-  </Timelines>${bankColorsBlock}
+  </Timelines>${bankColorsBlock}${keyBindingsBlock}${groupMixerBlock}
 </TaktLightShow>
 `;
 }
@@ -1717,6 +1819,29 @@ function parseShowXmlLocally(
     }
   });
 
+  const key_bindings: Record<string, string> = {};
+  root.querySelectorAll("KeyBindings > Binding").forEach((el) => {
+    const target = el.getAttribute("target")?.trim();
+    const key = el.getAttribute("key")?.trim();
+    if (target && key) {
+      key_bindings[target] = key;
+    }
+  });
+
+  const group_mixer_strips: NonNullable<ShowStateDto["group_mixer_strips"]> = {};
+  root.querySelectorAll("GroupMixerStrips > Strip").forEach((el) => {
+    const group = el.getAttribute("group")?.trim();
+    if (!group) return;
+    group_mixer_strips[group] = {
+      dimmer: Number(el.getAttribute("dimmer") ?? "1") || 0,
+      hue_shift_deg: Number(el.getAttribute("hue_shift_deg") ?? "0") || 0,
+      saturation: Number(el.getAttribute("saturation") ?? "1") || 1,
+      strobe_enabled: el.getAttribute("strobe_enabled") === "true",
+      strobe_hz: Number(el.getAttribute("strobe_hz") ?? "6") || 6,
+      mode: el.getAttribute("mode")?.trim() || "normal",
+    };
+  });
+
   return {
     version,
     name,
@@ -1738,6 +1863,8 @@ function parseShowXmlLocally(
     scenes,
     timelines,
     bank_colors,
+    key_bindings,
+    group_mixer_strips,
   };
 }
 
@@ -1806,6 +1933,7 @@ export interface TaktStoreState {
   adapterSelection: AdapterSelection;
   interfaces: NetworkInterfaceInfo[];
   isOffline: boolean;
+  lastNetworkError: string | null;
   discoveryAvailable: boolean;
   activeInterface: NetworkInterfaceInfo | null;
   discoveredNodes: TrackedArtNetNode[];
@@ -1855,6 +1983,10 @@ export interface TaktStoreState {
   showRevision: number;
   savedRevision: number;
   isDirty: boolean;
+  identifiedFixtureId: string | null;
+  autosaveEnabled: boolean;
+  hasAutosaveRecovery: boolean;
+  projectLoadNonce: number;
   closePromptOpen: boolean;
   pendingUnsavedAction: PendingUnsavedAction | null;
   currentProjectPath: string | null;
@@ -1972,6 +2104,16 @@ export interface TaktStoreState {
   missingAudioFiles: MissingAudioFileEntry[];
   missingAudioModalOpen: boolean;
   checkShowAudioFiles: () => Promise<MissingAudioFileEntry[]>;
+  pickNativeAudioFile: (title?: string) => Promise<string | null>;
+  pickNativeAudioFolder: (title?: string) => Promise<string | null>;
+  loadAudioFileFromPath: (
+    filePath: string,
+    sensitivity?: number,
+  ) => Promise<{
+    asset: DecodedAudioAsset;
+    analysis: AudioAnalysisResult;
+    resolvedPath: string;
+  }>;
   relinkMissingAudioWithFile: (
     originalKey: string,
     file: File,
@@ -2097,6 +2239,11 @@ export interface TaktStoreState {
   setCanvasOrderRule: (rule: OrderRuleStr) => void;
   setActiveShaderGizmoBlockId: (blockId: string | null) => void;
   setDraggingSceneId: (sceneId: string | null) => void;
+  setIdentifiedFixture: (fixtureId: string | null) => Promise<void>;
+  setAutosaveEnabled: (enabled: boolean) => Promise<void>;
+  checkAutosaveRecovery: () => Promise<void>;
+  recoverAutosave: () => Promise<void>;
+  discardAutosave: () => Promise<void>;
   dismissToast: () => void;
   resetForTest: () => void;
 }
@@ -2117,6 +2264,108 @@ export type ProjectFileHandle = {
 };
 
 let savedProjectFileHandle: ProjectFileHandle | null = null;
+
+const AUDIO_SEARCH_DIRS_STORAGE_KEY = "taktlight_audio_search_dirs";
+const MAX_AUDIO_SEARCH_DIRS = 12;
+
+function extractParentDir(filePath: string | null | undefined): string | null {
+  if (!filePath) return null;
+  const trimmed = filePath.trim();
+  if (!trimmed) return null;
+  const lastBackslash = trimmed.lastIndexOf("\\");
+  const lastSlash = trimmed.lastIndexOf("/");
+  const sepIdx = Math.max(lastBackslash, lastSlash);
+  if (sepIdx <= 0) return null;
+  if (sepIdx === 2 && trimmed[1] === ":") {
+    return trimmed.slice(0, 3);
+  }
+  return trimmed.slice(0, sepIdx);
+}
+
+function loadAudioSearchDirsFromStorage(): string[] {
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return [];
+    }
+    const raw = window.localStorage.getItem(AUDIO_SEARCH_DIRS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((d): d is string => typeof d === "string" && d.trim().length > 0)
+      .slice(0, MAX_AUDIO_SEARCH_DIRS);
+  } catch {
+    return [];
+  }
+}
+
+function rememberAudioSearchDir(dirPath: string | null | undefined): void {
+  const clean = dirPath?.trim();
+  if (!clean) return;
+  try {
+    if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+      return;
+    }
+    const lower = clean.toLowerCase();
+    const existing = loadAudioSearchDirsFromStorage().filter(
+      (d) => d.toLowerCase() !== lower,
+    );
+    const next = [clean, ...existing].slice(0, MAX_AUDIO_SEARCH_DIRS);
+    window.localStorage.setItem(AUDIO_SEARCH_DIRS_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+async function readAudioBytesFromTauriPath(filePath: string): Promise<{
+  bytes: Uint8Array | number[];
+  resolvedPath: string;
+  fileName: string;
+}> {
+  let bytes: Uint8Array | number[] | null = null;
+  let resolvedPath = filePath;
+  let fileName = extractAudioFileName(filePath);
+  try {
+    const raw = await invoke<ArrayBuffer | Uint8Array | number[]>(
+      "read_audio_file_raw_command",
+      { path: filePath },
+    );
+    if (raw instanceof ArrayBuffer && raw.byteLength > 0) {
+      bytes = new Uint8Array(raw);
+    } else if (raw instanceof Uint8Array && raw.byteLength > 0) {
+      bytes = raw;
+    }
+  } catch {
+    // Fall through to legacy DTO command
+  }
+  if (!bytes) {
+    const dto = await invoke<AudioFileBytesDto>("read_audio_file_bytes_command", {
+      path: filePath,
+    });
+    bytes = dto.bytes;
+    resolvedPath = dto.resolved_path;
+    fileName = dto.file_name;
+  }
+  return { bytes, resolvedPath, fileName };
+}
+
+async function invokeSafe<T>(
+  cmd: string,
+  args: Record<string, unknown> | undefined,
+  context: string,
+  notify?: (message: string) => void,
+): Promise<T | null> {
+  try {
+    return args === undefined
+      ? await invoke<T>(cmd)
+      : await invoke<T>(cmd, args);
+  } catch (err) {
+    reportError(context, err, { notify });
+    return null;
+  }
+}
+
+let lastSnapshotPollFailed = false;
 
 export const useTaktStore = create<TaktStoreState>((set, get) => ({
   ...createInitialState(),
@@ -2155,21 +2404,32 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         const uniId = state.universes[idx]?.id ?? idx + 1;
         nextDmx[uniId] = uData;
       });
-      const nextActiveScenes = state.activeScenes.filter(
-        (inst) =>
-          !(
-            inst.release_t_sec !== null &&
-            decoded.tSec >= inst.release_t_sec &&
-            computeSceneAlphaAt(inst, decoded.tSec) <= 1e-6
-          ),
-      );
+      let activeScenesChanged = false;
+      for (let i = 0; i < state.activeScenes.length; i++) {
+        const inst = state.activeScenes[i];
+        if (
+          inst.release_t_sec !== null &&
+          decoded.tSec >= inst.release_t_sec &&
+          computeSceneAlphaAt(inst, decoded.tSec) <= 1e-6
+        ) {
+          activeScenesChanged = true;
+          break;
+        }
+      }
+      const nextActiveScenes = activeScenesChanged
+        ? state.activeScenes.filter(
+            (inst) =>
+              !(
+                inst.release_t_sec !== null &&
+                decoded.tSec >= inst.release_t_sec &&
+                computeSceneAlphaAt(inst, decoded.tSec) <= 1e-6
+              ),
+          )
+        : state.activeScenes;
       return {
         dmxByUniverse: nextDmx,
         cellPreviewRgbd: decoded.cellPreviewRgbd,
-        activeScenes:
-          nextActiveScenes.length === state.activeScenes.length
-            ? state.activeScenes
-            : nextActiveScenes,
+        activeScenes: nextActiveScenes,
         telemetry: {
           revision: decoded.revision,
           tSec: decoded.tSec,
@@ -2248,11 +2508,19 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         interfaces: snapshot.interfaces,
         adapterSelection: snapshot.adapter_selection,
         isOffline: snapshot.is_offline,
+        lastNetworkError:
+          snapshot.last_network_error !== undefined
+            ? snapshot.last_network_error
+            : state.lastNetworkError,
         outputEnabled: snapshot.output_enabled ?? state.outputEnabled,
         discoveryAvailable: snapshot.discovery_available,
         activeInterface: snapshot.active_interface,
         discoveredNodes: snapshot.discovered_nodes,
         jitterSamplesUs: snapshot.jitter_samples_us,
+        identifiedFixtureId:
+          snapshot.identified_fixture_id !== undefined
+            ? snapshot.identified_fixture_id
+            : state.identifiedFixtureId,
         telemetry: {
           ...state.telemetry,
           meanUs: snapshot.jitter_stats.mean_us,
@@ -2290,6 +2558,38 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         : snapshot.show.bank_colors !== undefined
           ? { ...snapshot.show.bank_colors }
           : state.bankColors;
+      const nextKeyBindings =
+        snapshot.show.key_bindings && Object.keys(snapshot.show.key_bindings).length > 0
+          ? { ...snapshot.show.key_bindings }
+          : options?.replaceBanks
+            ? { ...(snapshot.show.key_bindings ?? {}) }
+            : state.keyBindings;
+      const nextGroupMixerStrips: Record<string, GroupMixerStripState> = (() => {
+        const raw = snapshot.show.group_mixer_strips;
+        if (raw && Object.keys(raw).length > 0) {
+          const mapped: Record<string, GroupMixerStripState> = {};
+          for (const [grp, s] of Object.entries(raw)) {
+            const validMode =
+              s.mode === "full" ||
+              s.mode === "exclusive_full" ||
+              s.mode === "blackout"
+                ? s.mode
+                : "normal";
+            mapped[grp] = {
+              dimmer: s.dimmer,
+              hueShiftDeg: s.hue_shift_deg,
+              saturation: s.saturation,
+              strobeEnabled: s.strobe_enabled,
+              strobeHz: s.strobe_hz,
+              mode: validMode,
+              flashActive: false,
+              exclusiveFlashActive: false,
+            };
+          }
+          return mapped;
+        }
+        return options?.replaceBanks ? {} : state.groupMixerStrips;
+      })();
       const nextRev = snapshot.revision;
       const markClean = Boolean(options?.markClean);
       const nextSavedRev = markClean ? nextRev : state.savedRevision;
@@ -2303,9 +2603,18 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         rolloverEnabled: snapshot.rollover_enabled,
         patchToast: snapshot.toast ?? state.patchToast,
         crossProtocolWarning: snapshot.cross_protocol_warning,
+        hasAutosaveRecovery:
+          snapshot.has_autosave_recovery !== undefined
+            ? snapshot.has_autosave_recovery
+            : state.hasAutosaveRecovery,
+        projectLoadNonce: options?.replaceBanks
+          ? state.projectLoadNonce + 1
+          : state.projectLoadNonce,
         selectedSceneId: nextSelectedSceneId,
         sceneBanks: nextBanks.length > 0 ? nextBanks : ["Bank 1"],
         bankColors: nextBankColors,
+        keyBindings: nextKeyBindings,
+        groupMixerStrips: nextGroupMixerStrips,
         showRevision: nextRev,
         savedRevision: nextSavedRev,
         isDirty: nextRev !== nextSavedRev,
@@ -2713,7 +3022,12 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     });
 
     if (isTauriEnvironment()) {
-      await invoke("set_channel_park", { universe, channel, value: clamped });
+      await invokeSafe(
+        "set_channel_park",
+        { universe, channel, value: clamped },
+        "Failed to park DMX channel",
+        (msg) => set({ patchToast: msg }),
+      );
     } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
@@ -2735,7 +3049,12 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     });
 
     if (isTauriEnvironment()) {
-      await invoke("clear_all_parked_channels", { universe: universe ?? null });
+      await invokeSafe(
+        "clear_all_parked_channels",
+        { universe: universe ?? null },
+        "Failed to clear parked channels",
+        (msg) => set({ patchToast: msg }),
+      );
     } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
@@ -2744,7 +3063,12 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   setBlackout: async (active) => {
     set({ blackout: active });
     if (isTauriEnvironment()) {
-      await invoke("set_blackout", { active });
+      await invokeSafe(
+        "set_blackout",
+        { active },
+        "Failed to toggle blackout",
+        (msg) => set({ patchToast: msg }),
+      );
     } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
@@ -2754,7 +3078,12 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     const clamped = Number.isNaN(value) ? 1.0 : Math.max(0, Math.min(1, value));
     set({ grandMaster: clamped });
     if (isTauriEnvironment()) {
-      await invoke("set_grand_master", { value: clamped });
+      await invokeSafe(
+        "set_grand_master",
+        { value: clamped },
+        "Failed to set grand master",
+        (msg) => set({ patchToast: msg }),
+      );
     } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
@@ -2764,32 +3093,47 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     set({
       adapterSelection: selection,
       isOffline: selection.mode === "offline",
+      ...(selection.mode === "offline" ? { lastNetworkError: null } : {}),
     });
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<EngineSnapshotDto>("set_network_adapter", {
-        selection,
-      });
-      get().applyEngineSnapshot(snapshot);
+      const snapshot = await invokeSafe<EngineSnapshotDto>(
+        "set_network_adapter",
+        { selection },
+        "Failed to switch network adapter",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) {
+        get().applyEngineSnapshot(snapshot);
+      }
     }
   },
 
   setOutputEnabled: async (enabled) => {
     set({ outputEnabled: enabled });
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<EngineSnapshotDto>(
+      const snapshot = await invokeSafe<EngineSnapshotDto>(
         "set_output_enabled_command",
         { enabled },
+        "Failed to toggle network output",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyEngineSnapshot(snapshot);
+      if (snapshot) {
+        get().applyEngineSnapshot(snapshot);
+      }
     }
   },
 
   configureUniverse: async (config) => {
     if (isTauriEnvironment()) {
-      const snap = await invoke<ShowSnapshotDto>("configure_universe_command", {
-        config,
-      });
-      get().applyShowSnapshot(snap);
+      const snap = await invokeSafe<ShowSnapshotDto>(
+        "configure_universe_command",
+        { config },
+        `Failed to configure Universe ${config.id}`,
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) {
+        get().applyShowSnapshot(snap);
+      }
       return;
     }
     const state = get();
@@ -2836,8 +3180,16 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   refreshSnapshot: async () => {
     if (!isTauriEnvironment()) return;
-    const snapshot = await invoke<EngineSnapshotDto>("get_engine_snapshot");
-    get().applyEngineSnapshot(snapshot);
+    try {
+      const snapshot = await invoke<EngineSnapshotDto>("get_engine_snapshot");
+      lastSnapshotPollFailed = false;
+      get().applyEngineSnapshot(snapshot);
+    } catch (err) {
+      if (!lastSnapshotPollFailed) {
+        lastSnapshotPollFailed = true;
+        reportError("Engine status refresh failed", err, { level: "warn" });
+      }
+    }
   },
 
   initEngineConnection: () => {
@@ -2852,7 +3204,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         const ackCb = () => {
           ackScheduled = false;
           if (active) {
-            void invoke("ack_frame");
+            void invoke("ack_frame").catch(() => undefined);
           }
         };
         if (typeof requestAnimationFrame === "function") {
@@ -2877,16 +3229,38 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       void get().loadFixtures();
       void get().loadShowSnapshot();
       void get().loadRecentProjects();
-      void invoke("subscribe_frames", { channel });
+      void invoke<boolean>("set_autosave_enabled_command", {
+        enabled: get().autosaveEnabled,
+      })
+        .catch(() => undefined)
+        .finally(() => {
+          void get().checkAutosaveRecovery();
+        });
+      void invoke("subscribe_frames", { channel }).catch((err) => {
+        reportError("DMX frame stream subscription failed", err, {
+          notify: (msg) => set({ patchToast: msg }),
+        });
+      });
+
+      timelineAudioPlayer.setClockPublisher((payload) => {
+        if (!active) return;
+        void invoke("publish_audio_clock_snapshot_command", {
+          samplesPlayed: payload.samplesPlayed,
+          sampleRate: payload.sampleRate,
+          bufferDurationMs: payload.bufferDurationMs,
+          isPlaying: payload.isPlaying,
+        }).catch(() => undefined);
+      });
 
       const pollTimer = setInterval(() => {
         if (active) {
           void get().refreshSnapshot();
         }
-      }, 250);
+      }, 1000);
 
       return () => {
         active = false;
+        timelineAudioPlayer.setClockPublisher(null);
         clearInterval(pollTimer);
         if (rafId !== null && typeof cancelAnimationFrame === "function") {
           cancelAnimationFrame(rafId);
@@ -2957,9 +3331,16 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   loadFixtures: async () => {
     if (isTauriEnvironment()) {
-      const summaries = await invoke<FixtureSummary[]>("list_fixtures");
-      set({ fixtureSummaries: summaries });
-      await get().ensureFixtureDetailsLoaded(summaries.map((s) => s.id));
+      const summaries = await invokeSafe<FixtureSummary[]>(
+        "list_fixtures",
+        undefined,
+        "Failed to load fixture library",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (summaries) {
+        set({ fixtureSummaries: summaries });
+        await get().ensureFixtureDetailsLoaded(summaries.map((s) => s.id));
+      }
       return;
     }
     const cache = get().fixtureDetailsCache;
@@ -3124,7 +3505,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   deleteUserFixture: async (id) => {
     if (isTauriEnvironment()) {
-      await invoke("delete_user_fixture", { id });
+      const res = await invokeSafe<void>(
+        "delete_user_fixture",
+        { id },
+        "Failed to delete fixture profile",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (res === null) return;
     }
     set((state) => {
       const nextCache = { ...state.fixtureDetailsCache };
@@ -3143,8 +3530,15 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   loadShowSnapshot: async () => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("get_show_snapshot");
-      get().applyShowSnapshot(snapshot, { markClean: true, replaceBanks: true });
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "get_show_snapshot",
+        undefined,
+        "Failed to load show snapshot",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) {
+        get().applyShowSnapshot(snapshot, { markClean: true, replaceBanks: true });
+      }
     }
   },
 
@@ -3158,16 +3552,23 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   ) => {
     const rolloverSplit = get().rolloverEnabled;
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("patch_fixtures_command", {
-        profileId,
-        modeName,
-        namePrefix,
-        count,
-        universe,
-        address,
-        rolloverSplit,
-      });
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "patch_fixtures_command",
+        {
+          profileId,
+          modeName,
+          namePrefix,
+          count,
+          universe,
+          address,
+          rolloverSplit,
+        },
+        "Failed to patch fixture",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) {
+        get().applyShowSnapshot(snapshot);
+      }
       return;
     }
 
@@ -3270,11 +3671,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   moveFixturePatch: async (fixtureId, universe, address) => {
     const rolloverSplit = get().rolloverEnabled;
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "move_fixture_patch_command",
         { fixtureId, universe, address, rolloverSplit },
+        "Failed to move fixture patch",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
 
@@ -3327,10 +3730,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   unpatchFixture: async (fixtureId) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("unpatch_fixture_command", {
-        fixtureId,
-      });
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "unpatch_fixture_command",
+        { fixtureId },
+        "Failed to unpatch fixture",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
 
@@ -3360,11 +3766,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   updateFixtureGridPos: async (fixtureId, gridPos, coalesceKey) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "update_fixture_grid_pos_command",
         { fixtureId, gridPos, coalesceKey: coalesceKey ?? null },
+        "Failed to update fixture position",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
 
@@ -3394,11 +3802,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   updateFixtureCalibration: async (fixtureId, calibration, coalesceKey) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "update_fixture_calibration_command",
         { fixtureId, calibration, coalesceKey: coalesceKey ?? null },
+        "Failed to update fixture calibration",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
 
@@ -3428,21 +3838,25 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   setRolloverEnabled: async (enabled) => {
     set({ rolloverEnabled: enabled });
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "set_rollover_enabled_command",
         { enabled },
+        "Failed to update rollover setting",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
     }
   },
 
   markUniverseReviewed: async (universeId) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "mark_universe_reviewed_command",
         { universeId },
+        "Failed to mark universe reviewed",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     set((state) => {
@@ -3464,8 +3878,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   undoShow: async () => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("undo_command");
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "undo_command",
+        undefined,
+        "Undo failed",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
 
@@ -3498,8 +3917,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   redoShow: async () => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("redo_command");
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "redo_command",
+        undefined,
+        "Redo failed",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
 
@@ -3560,6 +3984,25 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         nextBanks.push(b);
       }
     }
+    const importedGroupStrips: Record<string, GroupMixerStripState> = {};
+    for (const [grp, s] of Object.entries(imported.group_mixer_strips ?? {})) {
+      const validMode =
+        s.mode === "full" ||
+        s.mode === "exclusive_full" ||
+        s.mode === "blackout"
+          ? s.mode
+          : "normal";
+      importedGroupStrips[grp] = {
+        dimmer: s.dimmer,
+        hueShiftDeg: s.hue_shift_deg,
+        saturation: s.saturation,
+        strobeEnabled: s.strobe_enabled,
+        strobeHz: s.strobe_hz,
+        mode: validMode,
+        flashActive: false,
+        exclusiveFlashActive: false,
+      };
+    }
     set({
       showState: imported,
       universes: imported.network_outputs.universes,
@@ -3569,6 +4012,9 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       ),
       sceneBanks: nextBanks.length > 0 ? nextBanks : ["Bank 1"],
       bankColors: { ...(imported.bank_colors ?? {}) },
+      keyBindings: { ...(imported.key_bindings ?? {}) },
+      groupMixerStrips: importedGroupStrips,
+      projectLoadNonce: state.projectLoadNonce + 1,
       patchToast: "Imported .takt.xml show",
       showRevision: nextRev,
       savedRevision: nextRev,
@@ -3590,7 +4036,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       return [];
     }
 
-    const missing: MissingAudioFileEntry[] = [];
+    const unresolvedRefs: typeof refs = [];
     for (const ref of refs) {
       if (getDecodedAudioAsset(ref.key)) {
         continue;
@@ -3598,35 +4044,124 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
       if (isTauriEnvironment()) {
         try {
-          const dto = await invoke<AudioFileBytesDto>(
-            "read_audio_file_bytes_command",
-            { path: ref.key },
-          );
-          const { analysis } = await decodeAudioBytes(
-            dto.bytes,
-            ref.key,
-            dto.file_name,
-          );
+          const { bytes, resolvedPath, fileName } =
+            await readAudioBytesFromTauriPath(ref.key);
+          rememberAudioSearchDir(extractParentDir(resolvedPath));
+          const { analysis } = await decodeAudioBytes(bytes, ref.key, fileName);
           get().setClipAudioAnalysis(ref.key, analysis, ref.timelineIds[0]);
           continue;
         } catch {
-          // File not found or unreadable on disk -> prompt user to relink
+          // File not found at saved literal path -> try project folder and remembered folders below
         }
       }
 
-      missing.push({
-        originalKey: ref.key,
-        baseName: ref.baseName,
-        timelineIds: ref.timelineIds,
-        resolved: false,
-      });
+      unresolvedRefs.push(ref);
     }
+
+    // Automatic fallback search in the project's folder and previously used audio folders
+    let remainingRefs = unresolvedRefs;
+    if (isTauriEnvironment() && remainingRefs.length > 0) {
+      const candidateDirs: string[] = [];
+      const seenLower = new Set<string>();
+      const pushDir = (dir: string | null | undefined) => {
+        const clean = dir?.trim();
+        if (!clean) return;
+        const lower = clean.toLowerCase();
+        if (seenLower.has(lower)) return;
+        seenLower.add(lower);
+        candidateDirs.push(clean);
+      };
+
+      pushDir(extractParentDir(get().currentProjectPath));
+      for (const dir of loadAudioSearchDirsFromStorage()) {
+        pushDir(dir);
+      }
+
+      const resolvedKeys = new Set<string>();
+      for (const dir of candidateDirs) {
+        const stillMissing = remainingRefs.filter((r) => !resolvedKeys.has(r.key));
+        if (stillMissing.length === 0) break;
+        try {
+          const matches = await invoke<ResolvedAudioMatchDto[]>(
+            "resolve_audio_in_folder_command",
+            {
+              folderPath: dir,
+              fileNames: stillMissing.map((r) => r.key),
+            },
+          );
+          for (const m of matches) {
+            const ref = stillMissing.find((r) => r.key === m.requested);
+            if (!ref || resolvedKeys.has(ref.key)) continue;
+            try {
+              const { bytes, fileName } = await readAudioBytesFromTauriPath(
+                m.resolved_path,
+              );
+              const { analysis } = await decodeAudioBytes(bytes, ref.key, fileName);
+              get().setClipAudioAnalysis(ref.key, analysis, ref.timelineIds[0]);
+              resolvedKeys.add(ref.key);
+            } catch {
+              // Unreadable candidate; continue trying other folders
+            }
+          }
+        } catch {
+          // Folder no longer exists or unreadable; skip
+        }
+      }
+      remainingRefs = remainingRefs.filter((r) => !resolvedKeys.has(r.key));
+    }
+
+    const missing: MissingAudioFileEntry[] = remainingRefs.map((ref) => ({
+      originalKey: ref.key,
+      baseName: ref.baseName,
+      timelineIds: ref.timelineIds,
+      resolved: false,
+    }));
 
     set({
       missingAudioFiles: missing,
       missingAudioModalOpen: missing.length > 0,
     });
     return missing;
+  },
+
+  pickNativeAudioFile: async (title) => {
+    if (!isTauriEnvironment()) return null;
+    try {
+      const picked = await invoke<string | null>("pick_audio_file_command", {
+        title: title ?? null,
+      });
+      if (picked) {
+        rememberAudioSearchDir(extractParentDir(picked));
+      }
+      return picked ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  pickNativeAudioFolder: async (title) => {
+    if (!isTauriEnvironment()) return null;
+    try {
+      const picked = await invoke<string | null>("pick_audio_folder_command", {
+        title: title ?? null,
+      });
+      return picked ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  loadAudioFileFromPath: async (filePath, sensitivity = 0.65) => {
+    const { bytes, resolvedPath, fileName } =
+      await readAudioBytesFromTauriPath(filePath);
+    rememberAudioSearchDir(extractParentDir(resolvedPath));
+    const { asset, analysis } = await decodeAudioBytes(
+      bytes,
+      resolvedPath,
+      fileName,
+      sensitivity,
+    );
+    return { asset, analysis, resolvedPath };
   },
 
   relinkMissingAudioWithFile: async (originalKey, file) => {
@@ -3684,19 +4219,14 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       };
     }
     try {
-      const dto = await invoke<AudioFileBytesDto>(
-        "read_audio_file_bytes_command",
-        { path: filePath },
-      );
+      const { bytes, resolvedPath, fileName } =
+        await readAudioBytesFromTauriPath(filePath);
+      rememberAudioSearchDir(extractParentDir(resolvedPath));
       const entry = get().missingAudioFiles.find(
         (f) => f.originalKey === originalKey,
       );
-      const newKey = dto.resolved_path;
-      const { analysis } = await decodeAudioBytes(
-        dto.bytes,
-        newKey,
-        dto.file_name,
-      );
+      const newKey = resolvedPath;
+      const { analysis } = await decodeAudioBytes(bytes, newKey, fileName);
       get().setClipAudioAnalysis(newKey, analysis, entry?.timelineIds[0]);
 
       if (newKey !== originalKey) {
@@ -3732,11 +4262,11 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       set((state) => ({
         missingAudioFiles: state.missingAudioFiles.map((f) =>
           f.originalKey === originalKey
-            ? { ...f, resolved: true, resolvedPath: dto.resolved_path }
+            ? { ...f, resolved: true, resolvedPath }
             : f,
         ),
       }));
-      return { ok: true, message: `Relinked ${dto.file_name}.` };
+      return { ok: true, message: `Relinked ${fileName}.` };
     } catch (err) {
       return {
         ok: false,
@@ -3794,6 +4324,9 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         );
         if (res.ok) matched += 1;
       }
+      if (matched > 0) {
+        rememberAudioSearchDir(folderPath);
+      }
       return {
         matched,
         message:
@@ -3818,11 +4351,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   upsertColorPalette: async (palette) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "upsert_color_palette_command",
         { palette },
+        "Failed to save color palette",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -3846,11 +4381,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   deleteColorPalette: async (id) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "delete_color_palette_command",
         { id },
+        "Failed to delete color palette",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -3873,11 +4410,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   upsertDimmerPalette: async (palette) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "upsert_dimmer_palette_command",
         { palette },
+        "Failed to save dimmer palette",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -3901,11 +4440,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   deleteDimmerPalette: async (id) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "delete_dimmer_palette_command",
         { id },
+        "Failed to delete dimmer palette",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -3941,10 +4482,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       return;
     }
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("upsert_group_command", {
-        group,
-      });
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "upsert_group_command",
+        { group },
+        "Failed to save fixture group",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -3968,10 +4512,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   deleteGroup: async (id) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("delete_group_command", {
-        id,
-      });
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "delete_group_command",
+        { id },
+        "Failed to delete fixture group",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -3995,10 +4542,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   setLiveLayers: async (layers) => {
     set({ liveLayers: layers });
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>("set_live_layers_command", {
-        layers,
-      });
-      get().applyEngineSnapshot(snap);
+      const snap = await invokeSafe<EngineSnapshotDto>(
+        "set_live_layers_command",
+        { layers },
+        "Failed to update live control layers",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) get().applyEngineSnapshot(snap);
     } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
@@ -4006,11 +4556,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   upsertFxBlock: async (block) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "upsert_fx_block_command",
         { block },
+        "Failed to save FX block",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -4034,11 +4586,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   deleteFxBlock: async (id) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "delete_fx_block_command",
         { id },
+        "Failed to delete FX block",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -4061,10 +4615,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   upsertScene: async (scene) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("upsert_scene_command", {
-        scene,
-      });
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "upsert_scene_command",
+        { scene },
+        "Failed to save scene",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -4089,10 +4646,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   deleteScene: async (id) => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>("delete_scene_command", {
-        id,
-      });
-      get().applyShowSnapshot(snapshot);
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
+        "delete_scene_command",
+        { id },
+        "Failed to delete scene",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
     const state = get();
@@ -4125,13 +4685,17 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
     const stateBefore = get();
     const targetScene = stateBefore.showState.scenes.find((s) => s.id === sceneId);
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>("trigger_scene_command", {
-        sceneId,
-        tSec: tSec ?? null,
-      });
-      get().applyEngineSnapshot(snap);
-      if (targetScene?.timeline_ref) {
-        await get().setTimelineTransport(targetScene.timeline_ref, true, 0, tSec);
+      const snap = await invokeSafe<EngineSnapshotDto>(
+        "trigger_scene_command",
+        { sceneId, tSec: tSec ?? null },
+        "Failed to trigger scene",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) {
+        get().applyEngineSnapshot(snap);
+        if (targetScene?.timeline_ref) {
+          await get().setTimelineTransport(targetScene.timeline_ref, true, 0, tSec);
+        }
       }
       return;
     }
@@ -4213,13 +4777,17 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   releaseScene: async (sceneId, tSec) => {
     const targetScene = get().showState.scenes.find((s) => s.id === sceneId);
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>("release_scene_command", {
-        sceneId,
-        tSec: tSec ?? null,
-      });
-      get().applyEngineSnapshot(snap);
-      if (targetScene?.timeline_ref && get().activeTimelineId === targetScene.timeline_ref) {
-        await get().setTimelineTransport(targetScene.timeline_ref, false, undefined, tSec);
+      const snap = await invokeSafe<EngineSnapshotDto>(
+        "release_scene_command",
+        { sceneId, tSec: tSec ?? null },
+        "Failed to release scene",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) {
+        get().applyEngineSnapshot(snap);
+        if (targetScene?.timeline_ref && get().activeTimelineId === targetScene.timeline_ref) {
+          await get().setTimelineTransport(targetScene.timeline_ref, false, undefined, tSec);
+        }
       }
       return;
     }
@@ -4251,13 +4819,17 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   releaseAllScenes: async (tSec) => {
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>(
+      const snap = await invokeSafe<EngineSnapshotDto>(
         "release_all_scenes_command",
         { tSec: tSec ?? null },
+        "Failed to release scenes",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyEngineSnapshot(snap);
-      if (get().timelinePlaying) {
-        await get().setTimelineTransport(get().activeTimelineId, false, undefined, tSec);
+      if (snap) {
+        get().applyEngineSnapshot(snap);
+        if (get().timelinePlaying) {
+          await get().setTimelineTransport(get().activeTimelineId, false, undefined, tSec);
+        }
       }
       return;
     }
@@ -4286,11 +4858,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       ? 120
       : Math.max(20, Math.min(300, bpm));
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>("set_live_bpm_command", {
-        bpm: clampedBpm,
-        tSec: tSec ?? null,
-      });
-      get().applyEngineSnapshot(snap);
+      const snap = await invokeSafe<EngineSnapshotDto>(
+        "set_live_bpm_command",
+        { bpm: clampedBpm, tSec: tSec ?? null },
+        "Failed to set live BPM",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) get().applyEngineSnapshot(snap);
       return;
     }
     const state = get();
@@ -4309,10 +4883,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   tapTempo: async (tSec) => {
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>("tap_tempo_command", {
-        tSec: tSec ?? null,
-      });
-      get().applyEngineSnapshot(snap);
+      const snap = await invokeSafe<EngineSnapshotDto>(
+        "tap_tempo_command",
+        { tSec: tSec ?? null },
+        "Tap tempo failed",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) get().applyEngineSnapshot(snap);
       return;
     }
     const state = get();
@@ -4338,10 +4915,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   resolveSplitFixtures: async () => {
     if (isTauriEnvironment()) {
-      const snapshot = await invoke<ShowSnapshotDto>(
+      const snapshot = await invokeSafe<ShowSnapshotDto>(
         "resolve_split_fixtures_command",
+        undefined,
+        "Failed to resolve split fixtures",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyShowSnapshot(snapshot);
+      if (snapshot) get().applyShowSnapshot(snapshot);
       return;
     }
 
@@ -4419,11 +4999,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
           isDirty: true,
         };
       });
-      const snap = await invoke<ShowSnapshotDto>("upsert_timeline_command", {
-        timeline,
-        coalesceKey: coalesceKey ?? null,
-      });
-      get().applyShowSnapshot(snap);
+      const snap = await invokeSafe<ShowSnapshotDto>(
+        "upsert_timeline_command",
+        { timeline, coalesceKey: coalesceKey ?? null },
+        "Failed to update timeline",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) get().applyShowSnapshot(snap);
       return;
     }
     const state = get();
@@ -4452,10 +5034,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
 
   deleteTimeline: async (id) => {
     if (isTauriEnvironment()) {
-      const snap = await invoke<ShowSnapshotDto>("delete_timeline_command", {
-        id,
-      });
-      get().applyShowSnapshot(snap);
+      const snap = await invokeSafe<ShowSnapshotDto>(
+        "delete_timeline_command",
+        { id },
+        "Failed to delete timeline",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) get().applyShowSnapshot(snap);
       return;
     }
     const state = get();
@@ -4479,7 +5064,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   setTimelineTransport: async (timelineId, playing, playheadSec, tSec) => {
     const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>(
+      const snap = await invokeSafe<EngineSnapshotDto>(
         "set_timeline_transport_command",
         {
           timelineId,
@@ -4487,9 +5072,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
           playheadSec: playheadSec ?? null,
           tSec: tSec ?? null,
         },
+        "Failed to update timeline transport",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyEngineSnapshot(snap);
-      set({ timelinePlayheadAnchorMs: nowMs });
+      if (snap) {
+        get().applyEngineSnapshot(snap);
+        set({ timelinePlayheadAnchorMs: nowMs });
+      }
       return;
     }
     const state = get();
@@ -4528,11 +5117,13 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       ? 0
       : Math.max(-500, Math.min(500, offsetMs));
     if (isTauriEnvironment()) {
-      const snap = await invoke<EngineSnapshotDto>(
+      const snap = await invokeSafe<EngineSnapshotDto>(
         "set_latency_offset_ms_command",
         { offsetMs: clamped },
+        "Failed to set latency offset",
+        (msg) => set({ patchToast: msg }),
       );
-      get().applyEngineSnapshot(snap);
+      if (snap) get().applyEngineSnapshot(snap);
       return;
     }
     set({ latencyOffsetMs: clamped });
@@ -4854,11 +5445,15 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         bankDefaultFades: nextFades,
         bankColors: nextColors,
       });
-      const snap = await invoke<ShowSnapshotDto>("rename_scene_bank_command", {
-        oldName: from,
-        newName: to,
-      });
-      get().applyShowSnapshot(snap);
+      const snap = await invokeSafe<ShowSnapshotDto>(
+        "rename_scene_bank_command",
+        { oldName: from, newName: to },
+        "Failed to rename scene bank",
+        (msg) => set({ patchToast: msg }),
+      );
+      if (snap) {
+        get().applyShowSnapshot(snap);
+      }
       set((s) => ({
         sceneBanks: Array.from(
           new Set(
@@ -5345,9 +5940,41 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
         }
       }
       nextStrips[groupId] = { ...prev, ...patch };
-      return { groupMixerStrips: nextStrips };
+      const persistedStrip = {
+        dimmer: nextStrips[groupId].dimmer,
+        hue_shift_deg: nextStrips[groupId].hueShiftDeg,
+        saturation: nextStrips[groupId].saturation,
+        strobe_enabled: nextStrips[groupId].strobeEnabled,
+        strobe_hz: nextStrips[groupId].strobeHz,
+        mode: nextStrips[groupId].mode,
+      };
+      return {
+        groupMixerStrips: nextStrips,
+        showState: {
+          ...state.showState,
+          group_mixer_strips: {
+            ...(state.showState.group_mixer_strips ?? {}),
+            [groupId]: persistedStrip,
+          },
+        },
+      };
     });
-    if (!isTauriEnvironment()) {
+    if (isTauriEnvironment()) {
+      const strip = get().groupMixerStrips[groupId];
+      if (strip) {
+        void invoke("set_group_mixer_strip_command", {
+          groupId,
+          strip: {
+            dimmer: strip.dimmer,
+            hue_shift_deg: strip.hueShiftDeg,
+            saturation: strip.saturation,
+            strobe_enabled: strip.strobeEnabled,
+            strobe_hz: strip.strobeHz,
+            mode: strip.mode,
+          },
+        }).catch(() => undefined);
+      }
+    } else {
       get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
     }
   },
@@ -5487,11 +6114,98 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
   setSelectedMappingTarget: (targetId) =>
     set({ selectedMappingTarget: targetId }),
 
-  bindKeyToTarget: (targetId, key) =>
+  bindKeyToTarget: (targetId, key) => {
     set((state) => ({
       keyBindings: { ...state.keyBindings, [targetId]: key },
+      showState: {
+        ...state.showState,
+        key_bindings: {
+          ...(state.showState.key_bindings ?? {}),
+          [targetId]: key,
+        },
+      },
       selectedMappingTarget: null,
-    })),
+    }));
+    if (isTauriEnvironment()) {
+      void invoke("set_key_binding_command", {
+        targetId,
+        key,
+      }).catch(() => undefined);
+    }
+  },
+
+  setIdentifiedFixture: async (fixtureId) => {
+    const next = fixtureId?.trim() ? fixtureId.trim() : null;
+    set({ identifiedFixtureId: next });
+    if (isTauriEnvironment()) {
+      try {
+        const snapshot = await invoke<EngineSnapshotDto>(
+          "set_identified_fixture_command",
+          { fixtureId: next },
+        );
+        get().applyEngineSnapshot(snapshot);
+      } catch {
+        // Ignore if unavailable
+      }
+      return;
+    }
+    get().applyBinaryFrame(synthesizeSimulationBuffer(get()));
+  },
+
+  setAutosaveEnabled: async (enabled) => {
+    saveAutosaveEnabledToStorage(enabled);
+    set((state) => ({
+      autosaveEnabled: enabled,
+      hasAutosaveRecovery: enabled ? state.hasAutosaveRecovery : false,
+    }));
+    if (isTauriEnvironment()) {
+      try {
+        await invoke<boolean>("set_autosave_enabled_command", { enabled });
+      } catch {
+        // Ignore if unavailable
+      }
+    }
+  },
+
+  checkAutosaveRecovery: async () => {
+    if (!isTauriEnvironment() || !get().autosaveEnabled) {
+      set({ hasAutosaveRecovery: false });
+      return;
+    }
+    try {
+      const available = await invoke<boolean>("check_autosave_recovery_command");
+      set({ hasAutosaveRecovery: Boolean(available) });
+    } catch {
+      // Ignore if unavailable
+    }
+  },
+
+  recoverAutosave: async () => {
+    if (!isTauriEnvironment()) {
+      set({ hasAutosaveRecovery: false });
+      return;
+    }
+    try {
+      const snapshot = await invoke<ShowSnapshotDto>("recover_autosave_command");
+      get().applyShowSnapshot(snapshot, { replaceBanks: true });
+      set({ hasAutosaveRecovery: false });
+      void get().checkShowAudioFiles();
+    } catch (err) {
+      set({
+        patchToast: `Autosave recovery failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  },
+
+  discardAutosave: async () => {
+    set({ hasAutosaveRecovery: false });
+    if (!isTauriEnvironment()) return;
+    try {
+      await invoke("discard_autosave_command");
+    } catch {
+      // Ignore if unavailable
+    }
+  },
 
   bindMidiToTarget: (targetId, midiLabel) =>
     set((state) => ({
@@ -5617,6 +6331,7 @@ export const useTaktStore = create<TaktStoreState>((set, get) => ({
       if (typeof window !== "undefined" && typeof window.localStorage !== "undefined") {
         window.localStorage.removeItem(STUDIO_LAYOUT_STORAGE_KEY);
         window.localStorage.removeItem(RECENT_PROJECTS_STORAGE_KEY);
+        window.localStorage.removeItem(AUDIO_SEARCH_DIRS_STORAGE_KEY);
       }
     } catch {
       // Ignore storage errors

@@ -43,7 +43,7 @@ function makeFixture(
 ): FixtureInstance {
   return {
     id,
-    profile: "age/rlcv3_8_segment_tube.json",
+    profile: "user/test_tube_8seg.json",
     mode: "34ch Pixel Mode",
     name,
     universe,

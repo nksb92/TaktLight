@@ -590,7 +590,7 @@ export function StudioWorkspace() {
             style={{
               height: `${Math.min(72, Math.max(32, studioLayout.bottomDockPct + 5))}%`,
             }}
-            className="min-h-[240px] shrink-0 overflow-y-auto"
+            className="min-h-[240px] shrink-0 overflow-hidden"
           >
             <TimelineEditor
               hideUndoRedo
@@ -634,7 +634,11 @@ export function StudioWorkspace() {
                 })
               }
             />
-            <div className="flex-1 h-full min-h-0 min-w-0 overflow-y-auto">
+            <div
+              className={`flex-1 h-full min-h-0 min-w-0 ${
+                isTimelineScene ? "overflow-hidden" : "overflow-y-auto"
+              }`}
+            >
               {isTimelineScene ? (
                 <div data-testid="daslight-timeline-dock" className="h-full min-h-0">
                   <TimelineEditor

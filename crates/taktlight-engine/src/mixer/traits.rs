@@ -515,6 +515,11 @@ mod tests {
             cell_start,
             cell_count,
             channels: Vec::new(),
+            has_hardware_shutter: false,
+            fixture_has_master_intensity: false,
+            has_fixture_white: false,
+            cell_has_dedicated_intensity: vec![false; cell_count as usize],
+            cell_has_white: vec![false; cell_count as usize],
         }
     }
 

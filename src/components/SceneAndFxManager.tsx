@@ -337,6 +337,35 @@ function buildElementFromForm(params: {
   }
 }
 
+function SceneLiveCellPreview() {
+  const compiledCells = useTaktStore((s) => s.compiledCells);
+  const cellPreviewRgbd = useTaktStore((s) => s.cellPreviewRgbd);
+  return (
+    <section
+      data-testid="scene-live-cell-preview"
+      className="bg-slate border border-steel rounded-panel p-3 flex flex-wrap gap-1.5"
+    >
+      {compiledCells.map((cell, idx) => {
+        const base = idx * 4;
+        const r = cellPreviewRgbd[base] ?? 0;
+        const g = cellPreviewRgbd[base + 1] ?? 0;
+        const b = cellPreviewRgbd[base + 2] ?? 0;
+        const d = cellPreviewRgbd[base + 3] ?? 0;
+        const scale = d / 255;
+        return (
+          <div
+            key={`${cell.fixture_id}-${cell.cell_index}`}
+            className="w-8 h-8 rounded border border-steel"
+            style={{
+              backgroundColor: `rgb(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)})`,
+            }}
+          />
+        );
+      })}
+    </section>
+  );
+}
+
 export function SceneAndFxManager({
   hideUndoRedo = false,
   daslightUpper = false,
@@ -353,7 +382,6 @@ export function SceneAndFxManager({
   const activeScenes = useTaktStore((s) => s.activeScenes);
   const liveBpm = useTaktStore((s) => s.liveBpm);
   const compiledCells = useTaktStore((s) => s.compiledCells);
-  const cellPreviewRgbd = useTaktStore((s) => s.cellPreviewRgbd);
   const canUndo = useTaktStore((s) => s.canUndo);
   const canRedo = useTaktStore((s) => s.canRedo);
   const selectedSceneId = useTaktStore((s) => s.selectedSceneId);
@@ -5316,30 +5344,7 @@ export function SceneAndFxManager({
       )}
 
       {/* Standalone Cell Preview (when not in StudioWorkspace) */}
-      {!daslightUpper && (
-        <section
-          data-testid="scene-live-cell-preview"
-          className="bg-slate border border-steel rounded-panel p-3 flex flex-wrap gap-1.5"
-        >
-          {compiledCells.map((cell, idx) => {
-            const base = idx * 4;
-            const r = cellPreviewRgbd[base] ?? 0;
-            const g = cellPreviewRgbd[base + 1] ?? 0;
-            const b = cellPreviewRgbd[base + 2] ?? 0;
-            const d = cellPreviewRgbd[base + 3] ?? 0;
-            const scale = d / 255;
-            return (
-              <div
-                key={`${cell.fixture_id}-${cell.cell_index}`}
-                className="w-8 h-8 rounded border border-steel"
-                style={{
-                  backgroundColor: `rgb(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)})`,
-                }}
-              />
-            );
-          })}
-        </section>
-      )}
+      {!daslightUpper && <SceneLiveCellPreview />}
       <ColorPaletteBuilderModal
         open={paletteBuilderOpen}
         initialPaletteId={fxPaletteRef}

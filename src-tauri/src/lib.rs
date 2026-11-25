@@ -1,18 +1,21 @@
+mod logging;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::ipc::{Channel, InvokeResponseBody, Response as IpcResponse};
 use tauri::{Manager, RunEvent, State};
 use tokio::sync::watch;
 
 use taktlight_engine::audio::{
     analyze_streaming_chunks, analyze_wav_bytes_streaming, compute_sha256_hex,
     generate_synthetic_drum_track_chunks, AudioAnalysisCache, AudioAnalysisResult,
+    AudioCallbackSnapshot, InterpolatedAudioClock,
 };
 use taktlight_engine::engine::runner::{
     spawn_engine_loop, EngineConfig, EngineRunnerHandle, EngineTelemetrySnapshot,
@@ -34,10 +37,10 @@ use taktlight_engine::show::patch::{
     auto_patch_batch, find_placement, validate_patch_no_collisions, FixtureCalibration,
 };
 use taktlight_engine::show::spatial::GridPos;
-use taktlight_engine::show::undo::{ShowCommand, UndoHistory};
+use taktlight_engine::show::undo::{AutosaveManager, ShowCommand, UndoHistory};
 use taktlight_engine::show::xml::{
     deserialize_show_xml, serialize_show_xml, ColorPaletteDef, DimmerPaletteDef, DurationUnit,
-    FixtureGroupDef, FxBlockDef, SceneDef, ShowState, TimelineDef,
+    FixtureGroupDef, FxBlockDef, GroupMixerStripDef, SceneDef, ShowState, TimelineDef,
 };
 use taktlight_engine::state::plan::{CompiledCell, RenderPlan, UniverseConfig};
 use taktlight_engine::state::runtime::RuntimeControl;
@@ -72,6 +75,8 @@ pub struct EngineSnapshotDto {
     pub discovered_nodes: Vec<TrackedArtNetNode>,
     pub jitter_stats: JitterStats,
     pub jitter_samples_us: Vec<f32>,
+    pub identified_fixture_id: Option<String>,
+    pub last_network_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,7 +97,10 @@ pub struct ShowSnapshotDto {
     pub rollover_enabled: bool,
     pub toast: Option<String>,
     pub cross_protocol_warning: bool,
+    pub has_autosave_recovery: bool,
 }
+
+const NIC_CACHE_TTL: Duration = Duration::from_secs(5);
 
 pub struct AppState {
     pub plan: Arc<ArcSwap<RenderPlan>>,
@@ -107,10 +115,16 @@ pub struct AppState {
     pub fixture_library: RwLock<FixtureLibrary>,
     pub show_state: RwLock<ShowState>,
     pub undo_history: Mutex<UndoHistory>,
+    pub autosave_manager: Mutex<AutosaveManager>,
+    pub autosave_enabled: AtomicBool,
+    pub has_pending_recovery: AtomicBool,
+    pub fallback_autosave_path: Mutex<Option<PathBuf>>,
     pub rollover_enabled: AtomicBool,
     pub output_enabled: AtomicBool,
     pub app_epoch: Instant,
+    pub audio_clock: Arc<InterpolatedAudioClock>,
     pub audio_cache: Mutex<AudioAnalysisCache>,
+    pub cached_interfaces: RwLock<(Instant, Vec<NetworkInterfaceInfo>)>,
     pub current_project_path: Mutex<Option<PathBuf>>,
     pub recent_projects: Mutex<Vec<String>>,
     pub recent_projects_file: Mutex<Option<PathBuf>>,
@@ -119,17 +133,24 @@ pub struct AppState {
 
 const MAX_RECENT_PROJECTS: usize = 10;
 
-fn resolve_default_recent_projects_file() -> Option<PathBuf> {
+fn resolve_app_data_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
     {
-        return Some(dir.join("TaktLight").join("recent_projects.txt"));
+        return Some(dir.join("TaktLight"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        return Some(profile.join("AppData").join("Roaming").join("TaktLight"));
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return Some(home.join(".config").join("TaktLight").join("recent_projects.txt"));
+        return Some(home.join(".config").join("TaktLight"));
     }
     None
+}
+
+fn resolve_default_recent_projects_file() -> Option<PathBuf> {
+    resolve_app_data_dir().map(|dir| dir.join("recent_projects.txt"))
 }
 
 fn load_recent_projects_from_file(path: &std::path::Path) -> Vec<String> {
@@ -151,18 +172,32 @@ fn load_recent_projects_from_file(path: &std::path::Path) -> Vec<String> {
 
 fn save_recent_projects_to_file(path: &std::path::Path, items: &[String]) {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            logging::log_warn(&format!(
+                "Failed to create recent projects dir '{}': {err}",
+                parent.display()
+            ));
+            return;
+        }
     }
     let body = items.join("\n");
-    let _ = std::fs::write(path, body);
+    if let Err(err) = std::fs::write(path, body) {
+        logging::log_warn(&format!(
+            "Failed to save recent projects '{}': {err}",
+            path.display()
+        ));
+    }
 }
 
 fn resolve_default_fixtures_dir() -> Option<PathBuf> {
-    let candidates = [PathBuf::from("fixtures"), PathBuf::from("../fixtures")];
-    for candidate in candidates {
-        if candidate.exists() {
-            return Some(candidate);
+    if let Some(override_dir) = std::env::var_os("TAKTLIGHT_FIXTURES_DIR") {
+        let path = PathBuf::from(override_dir);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
         }
+    }
+    if let Some(app_data) = resolve_app_data_dir() {
+        return Some(app_data.join("fixtures"));
     }
     std::env::current_dir().ok().map(|d| d.join("fixtures"))
 }
@@ -181,6 +216,9 @@ impl AppState {
         start_engine_thread: bool,
         fixtures_dir: Option<PathBuf>,
     ) -> Self {
+        if let Some(ref dir) = fixtures_dir {
+            let _ = std::fs::create_dir_all(dir.join("user"));
+        }
         let fixture_library = RwLock::new(FixtureLibrary::load(fixtures_dir.as_deref()));
         let show_state = RwLock::new(ShowState::default());
         let undo_history = Mutex::new(UndoHistory::default());
@@ -200,10 +238,16 @@ impl AppState {
             ..Default::default()
         }));
         let adapter_selection = Arc::new(RwLock::new(AdapterSelection::Auto));
+        let app_epoch = Instant::now();
+        let audio_clock = Arc::new(InterpolatedAudioClock::new());
+        let initial_interfaces = enumerate_ipv4_interfaces();
 
         let engine_handle = if start_engine_thread {
+            let mut engine_cfg = EngineConfig::default();
+            engine_cfg.audio_clock = Some(Arc::clone(&audio_clock));
+            engine_cfg.app_epoch = Some(app_epoch);
             Some(spawn_engine_loop(
-                EngineConfig::default(),
+                engine_cfg,
                 Arc::clone(&plan),
                 Arc::clone(&runtime),
                 frame_tx,
@@ -220,6 +264,10 @@ impl AppState {
         } else {
             None
         };
+        let fallback_autosave_path = recent_projects_file
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|dir| dir.join("untitled.takt.xml"));
         let initial_recent = recent_projects_file
             .as_deref()
             .map(load_recent_projects_from_file)
@@ -238,10 +286,16 @@ impl AppState {
             fixture_library,
             show_state,
             undo_history,
+            autosave_manager: Mutex::new(AutosaveManager::new(app_epoch)),
+            autosave_enabled: AtomicBool::new(true),
+            has_pending_recovery: AtomicBool::new(false),
+            fallback_autosave_path: Mutex::new(fallback_autosave_path),
             rollover_enabled: AtomicBool::new(true),
             output_enabled: AtomicBool::new(false),
-            app_epoch: Instant::now(),
+            app_epoch,
+            audio_clock,
             audio_cache: Mutex::new(AudioAnalysisCache::new()),
+            cached_interfaces: RwLock::new((app_epoch, initial_interfaces)),
             current_project_path: Mutex::new(None),
             recent_projects: Mutex::new(initial_recent),
             recent_projects_file: Mutex::new(recent_projects_file),
@@ -396,17 +450,116 @@ impl AppState {
             rt.timeline_playhead_sec = 0.0;
             rt.parked_channels.clear();
             rt.beat_clock.bpm = 120.0;
+            rt.identified_fixture_id = None;
         });
+        self.audio_clock.publish(None);
+        self.autosave_manager.lock().reset_clean(Instant::now());
+        self.has_pending_recovery.store(false, Ordering::Release);
         self.seed_default_studio_show();
         self.build_show_snapshot(Some("Started new project".to_string()), false)
+    }
+
+    pub fn active_autosave_target(&self) -> Option<PathBuf> {
+        self.current_project_path
+            .lock()
+            .clone()
+            .or_else(|| self.fallback_autosave_path.lock().clone())
+    }
+
+    pub fn set_autosave_enabled(&self, enabled: bool) -> bool {
+        self.autosave_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.has_pending_recovery.store(false, Ordering::Release);
+            if let Some(target) = self.active_autosave_target() {
+                let _ = std::fs::remove_file(AutosaveManager::autosave_path(&target));
+            }
+            self.autosave_manager.lock().reset_clean(Instant::now());
+        }
+        enabled
+    }
+
+    pub fn check_startup_autosave_recovery(&self) -> bool {
+        if !self.autosave_enabled.load(Ordering::Acquire) {
+            self.has_pending_recovery.store(false, Ordering::Release);
+            return false;
+        }
+        let found = self
+            .active_autosave_target()
+            .as_deref()
+            .is_some_and(AutosaveManager::has_newer_autosave);
+        self.has_pending_recovery.store(found, Ordering::Release);
+        found
+    }
+
+    pub fn has_autosave_recovery(&self) -> bool {
+        self.has_pending_recovery.load(Ordering::Acquire)
+    }
+
+    pub fn on_project_saved(&self, path: &std::path::Path) {
+        self.autosave_manager.lock().reset_clean(Instant::now());
+        self.has_pending_recovery.store(false, Ordering::Release);
+        let sidecar = AutosaveManager::autosave_path(path);
+        let _ = std::fs::remove_file(sidecar);
+        if let Some(fallback) = self.fallback_autosave_path.lock().clone() {
+            let _ = std::fs::remove_file(AutosaveManager::autosave_path(&fallback));
+        }
+    }
+
+    pub fn recover_autosave(&self) -> Result<ShowSnapshotDto, String> {
+        let target = self
+            .active_autosave_target()
+            .ok_or_else(|| "No autosave target configured".to_string())?;
+        let auto_path = AutosaveManager::autosave_path(&target);
+        let xml = std::fs::read_to_string(&auto_path)
+            .map_err(|e| format!("Failed to read autosave '{}': {e}", auto_path.display()))?;
+        let mut snapshot = self.import_show_xml(&xml)?;
+        let _ = std::fs::remove_file(&auto_path);
+        self.autosave_manager.lock().reset_clean(Instant::now());
+        self.has_pending_recovery.store(false, Ordering::Release);
+        snapshot.toast = Some("Recovered unsaved changes from autosave".to_string());
+        snapshot.has_autosave_recovery = false;
+        Ok(snapshot)
+    }
+
+    pub fn discard_autosave(&self) -> Result<(), String> {
+        if let Some(target) = self.active_autosave_target() {
+            let auto_path = AutosaveManager::autosave_path(&target);
+            if auto_path.exists() {
+                std::fs::remove_file(&auto_path)
+                    .map_err(|e| format!("Failed to discard autosave: {e}"))?;
+            }
+        }
+        self.autosave_manager.lock().reset_clean(Instant::now());
+        self.has_pending_recovery.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn cached_ipv4_interfaces(&self, force_refresh: bool) -> Vec<NetworkInterfaceInfo> {
+        let now = Instant::now();
+        if !force_refresh {
+            let guard = self.cached_interfaces.read();
+            if now.duration_since(guard.0) < NIC_CACHE_TTL {
+                return guard.1.clone();
+            }
+        }
+        let fresh = enumerate_ipv4_interfaces();
+        let mut guard = self.cached_interfaces.write();
+        *guard = (now, fresh.clone());
+        fresh
     }
 
     pub fn open_project_path(&self, path: &std::path::Path) -> Result<ShowSnapshotDto, String> {
         let xml = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read project file '{}': {e}", path.display()))?;
-        let snapshot = self.import_show_xml(&xml)?;
+        let mut snapshot = self.import_show_xml(&xml)?;
         *self.current_project_path.lock() = Some(path.to_path_buf());
+        self.autosave_manager.lock().reset_clean(Instant::now());
         self.record_recent_project(path);
+        let has_recovery = self.autosave_enabled.load(Ordering::Acquire)
+            && AutosaveManager::has_newer_autosave(path);
+        self.has_pending_recovery
+            .store(has_recovery, Ordering::Release);
+        snapshot.has_autosave_recovery = has_recovery;
         Ok(snapshot)
     }
 
@@ -459,7 +612,7 @@ impl AppState {
                 .unwrap_or(rt.timeline_playhead_sec),
             latency_offset_ms: rt.latency_offset_ms,
             universes: plan.universes.clone(),
-            interfaces: enumerate_ipv4_interfaces(),
+            interfaces: self.cached_ipv4_interfaces(false),
             adapter_selection: selection,
             is_offline: tel.is_offline,
             output_enabled: self.output_enabled.load(Ordering::Acquire),
@@ -468,6 +621,8 @@ impl AppState {
             discovered_nodes: tel.discovered_nodes.clone(),
             jitter_stats: tel.jitter_stats,
             jitter_samples_us: tel.jitter_samples_us.clone(),
+            identified_fixture_id: rt.identified_fixture_id.clone(),
+            last_network_error: tel.last_network_error.clone(),
         }
     }
 
@@ -528,6 +683,7 @@ impl AppState {
             rollover_enabled: self.rollover_enabled.load(Ordering::Acquire),
             toast,
             cross_protocol_warning,
+            has_autosave_recovery: self.has_autosave_recovery(),
         }
     }
 
@@ -547,8 +703,28 @@ impl AppState {
         self.plan.store(Arc::new(compiled));
         drop(lib);
         drop(history);
+
+        let mut final_toast = toast;
+        if self.autosave_enabled.load(Ordering::Acquire) {
+            let now = Instant::now();
+            let mut autosave = self.autosave_manager.lock();
+            autosave.record_dirty_revision();
+            if autosave.should_autosave(now) {
+                if let Some(target_path) = self.active_autosave_target() {
+                    if let Err(err) = autosave.write_autosave(&target_path, &show, now) {
+                        logging::log_error(&format!(
+                            "Autosave failed for '{}': {err}",
+                            target_path.display()
+                        ));
+                        if final_toast.is_none() {
+                            final_toast = Some(format!("Autosave warning: {err}"));
+                        }
+                    }
+                }
+            }
+        }
         drop(show);
-        Ok(self.build_show_snapshot(toast, cross_protocol_warning))
+        Ok(self.build_show_snapshot(final_toast, cross_protocol_warning))
     }
 
     pub fn patch_fixtures(
@@ -1089,6 +1265,73 @@ impl AppState {
         self.build_show_snapshot(None, false)
     }
 
+    pub fn set_key_binding(&self, target_id: &str, key: Option<String>) -> ShowSnapshotDto {
+        let target = target_id.trim();
+        if !target.is_empty() {
+            let mut show = self.show_state.write();
+            match key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                Some(clean) => {
+                    show.key_bindings
+                        .insert(target.to_string(), clean.to_string());
+                }
+                None => {
+                    show.key_bindings.remove(target);
+                }
+            }
+        }
+        self.build_show_snapshot(None, false)
+    }
+
+    pub fn set_group_mixer_strip(
+        &self,
+        group_id: &str,
+        strip: Option<GroupMixerStripDef>,
+    ) -> ShowSnapshotDto {
+        let target = group_id.trim();
+        if !target.is_empty() {
+            let mut show = self.show_state.write();
+            match strip {
+                Some(def) => {
+                    show.group_mixer_strips.insert(target.to_string(), def);
+                }
+                None => {
+                    show.group_mixer_strips.remove(target);
+                }
+            }
+        }
+        self.build_show_snapshot(None, false)
+    }
+
+    pub fn set_identified_fixture(&self, fixture_id: Option<String>) -> EngineSnapshotDto {
+        self.update_runtime(|rt| rt.set_identified_fixture(fixture_id));
+        self.snapshot()
+    }
+
+    pub fn publish_audio_clock_snapshot(
+        &self,
+        samples_played: Option<u64>,
+        sample_rate: Option<u32>,
+        buffer_duration_ms: Option<f64>,
+        is_playing: bool,
+    ) {
+        if let (Some(samples), Some(sr)) = (samples_played, sample_rate) {
+            if sr > 0 {
+                let now_ns = self.app_epoch.elapsed().as_nanos() as u64;
+                let buf_ns = (buffer_duration_ms.unwrap_or(25.0).clamp(2.0, 250.0) * 1_000_000.0)
+                    .round() as u64;
+                self.audio_clock.publish(Some(AudioCallbackSnapshot {
+                    samples_played: samples,
+                    sample_rate: sr,
+                    callback_instant_ns: now_ns,
+                    buffer_duration_ns: buf_ns,
+                    is_playing,
+                }));
+                return;
+            }
+        }
+        self.audio_clock.publish(None);
+    }
+
     pub fn set_live_bpm(&self, bpm: f32, t_sec: Option<f64>) -> EngineSnapshotDto {
         let t_now = t_sec.unwrap_or_else(|| self.app_epoch.elapsed().as_secs_f64());
         self.update_runtime(|rt| rt.set_live_bpm(bpm, t_now));
@@ -1273,6 +1516,7 @@ fn set_network_adapter(
     if let Some(handle) = state.engine_handle.lock().as_ref() {
         handle.set_adapter(selection)?;
     }
+    let _ = state.cached_ipv4_interfaces(true);
     Ok(state.snapshot())
 }
 
@@ -1587,6 +1831,7 @@ async fn save_project_file_command(
     std::fs::write(&target_path, xml)
         .map_err(|e| format!("Failed to write project file '{}': {e}", target_path.display()))?;
     *state.current_project_path.lock() = Some(target_path.clone());
+    state.on_project_saved(&target_path);
     state.record_recent_project(&target_path);
     Ok(true)
 }
@@ -1622,6 +1867,7 @@ async fn save_project_as_command(
     std::fs::write(&target_path, xml)
         .map_err(|e| format!("Failed to write project file '{}': {e}", target_path.display()))?;
     *state.current_project_path.lock() = Some(target_path.clone());
+    state.on_project_saved(&target_path);
     state.record_recent_project(&target_path);
     Ok(true)
 }
@@ -1849,6 +2095,54 @@ fn collect_files_recursive(dir: &std::path::Path, depth: usize, out: &mut Vec<Pa
     }
 }
 
+fn normalize_display_path(p: &std::path::Path) -> String {
+    let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let raw = canonical.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        stripped.to_string()
+    } else {
+        raw.into_owned()
+    }
+}
+
+#[tauri::command]
+async fn pick_audio_file_command(title: Option<String>) -> Result<Option<String>, String> {
+    let dialog_title = title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "Select Audio File".to_string());
+    let picked = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title(&dialog_title)
+            .add_filter(
+                "Audio Files",
+                &["mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"],
+            )
+            .pick_file()
+    })
+    .await
+    .map_err(|e| format!("Failed to open audio file dialog: {e}"))?;
+
+    Ok(picked.map(|p| normalize_display_path(&p)))
+}
+
+#[tauri::command]
+async fn pick_audio_folder_command(title: Option<String>) -> Result<Option<String>, String> {
+    let dialog_title = title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "Select Music Folder".to_string());
+    let picked = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title(&dialog_title)
+            .pick_folder()
+    })
+    .await
+    .map_err(|e| format!("Failed to open folder dialog: {e}"))?;
+
+    Ok(picked.map(|p| normalize_display_path(&p)))
+}
+
 #[tauri::command]
 fn read_audio_file_bytes_command(path: String) -> Result<AudioFileBytesDto, String> {
     let p = PathBuf::from(path.trim());
@@ -1856,11 +2150,7 @@ fn read_audio_file_bytes_command(path: String) -> Result<AudioFileBytesDto, Stri
         return Err(format!("Audio file not found: {}", p.display()));
     }
     let bytes = std::fs::read(&p).map_err(|e| format!("Failed to read audio file: {e}"))?;
-    let resolved_path = p
-        .canonicalize()
-        .unwrap_or_else(|_| p.clone())
-        .to_string_lossy()
-        .to_string();
+    let resolved_path = normalize_display_path(&p);
     let file_name = p
         .file_name()
         .and_then(|n| n.to_str())
@@ -1903,11 +2193,7 @@ fn resolve_audio_in_folder_command(
             .unwrap_or(&requested)
             .to_ascii_lowercase();
         if let Some(found) = by_lower_name.get(&base) {
-            let resolved_path = found
-                .canonicalize()
-                .unwrap_or_else(|_| found.clone())
-                .to_string_lossy()
-                .to_string();
+            let resolved_path = normalize_display_path(found);
             let file_name = found
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1924,6 +2210,83 @@ fn resolve_audio_in_folder_command(
 }
 
 #[tauri::command]
+fn read_audio_file_raw_command(path: String) -> Result<IpcResponse, String> {
+    let p = PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(format!("Audio file not found: {}", p.display()));
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("Failed to read audio file: {e}"))?;
+    Ok(IpcResponse::new(bytes))
+}
+
+#[tauri::command]
+fn set_identified_fixture_command(
+    state: State<'_, AppState>,
+    fixture_id: Option<String>,
+) -> EngineSnapshotDto {
+    state.set_identified_fixture(fixture_id)
+}
+
+#[tauri::command]
+fn publish_audio_clock_snapshot_command(
+    state: State<'_, AppState>,
+    samples_played: Option<u64>,
+    sample_rate: Option<u32>,
+    buffer_duration_ms: Option<f64>,
+    is_playing: bool,
+) {
+    state.publish_audio_clock_snapshot(samples_played, sample_rate, buffer_duration_ms, is_playing);
+}
+
+#[tauri::command]
+fn set_autosave_enabled_command(state: State<'_, AppState>, enabled: bool) -> bool {
+    state.set_autosave_enabled(enabled)
+}
+
+#[tauri::command]
+fn check_autosave_recovery_command(state: State<'_, AppState>) -> bool {
+    state.check_startup_autosave_recovery()
+}
+
+#[tauri::command]
+fn recover_autosave_command(state: State<'_, AppState>) -> Result<ShowSnapshotDto, String> {
+    state.recover_autosave()
+}
+
+#[tauri::command]
+fn discard_autosave_command(state: State<'_, AppState>) -> Result<(), String> {
+    state.discard_autosave()
+}
+
+#[tauri::command]
+fn set_key_binding_command(
+    state: State<'_, AppState>,
+    target_id: String,
+    key: Option<String>,
+) -> ShowSnapshotDto {
+    state.set_key_binding(&target_id, key)
+}
+
+#[tauri::command]
+fn set_group_mixer_strip_command(
+    state: State<'_, AppState>,
+    group_id: String,
+    strip: Option<GroupMixerStripDef>,
+) -> ShowSnapshotDto {
+    state.set_group_mixer_strip(&group_id, strip)
+}
+
+#[tauri::command]
+fn log_frontend_error(level: String, message: String) {
+    let normalized = match level.to_ascii_uppercase().as_str() {
+        "INFO" => "INFO",
+        "WARN" | "WARNING" => "WARN",
+        _ => "ERROR",
+    };
+    logging::write_log(normalized, &format!("[UI] {message}"));
+}
+
+#[tauri::command]
 fn close_splashscreen(app: tauri::AppHandle) {
     if let Some(splash) = app.get_webview_window("splashscreen") {
         let _ = splash.close();
@@ -1936,20 +2299,30 @@ fn close_splashscreen(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Some(app_data) = resolve_app_data_dir() {
+        logging::init_logging(app_data.join("logs"));
+    }
     let app_state = AppState::new(true);
     app_state.seed_default_studio_show();
 
     let app = tauri::Builder::default()
         .manage(app_state)
         .setup(|app| {
-            if let Ok(config_dir) = app.path().app_config_dir() {
-                let recent_file = config_dir.join("recent_projects.txt");
-                if let Some(state) = app.try_state::<AppState>() {
-                    let loaded = load_recent_projects_from_file(&recent_file);
-                    if !loaded.is_empty() {
-                        *state.recent_projects.lock() = loaded;
+            // Only fall back to Tauri's app_config_dir when resolve_app_data_dir() could not resolve one,
+            // keeping fixtures/, recent_projects.txt, and untitled autosaves unified in one folder.
+            if let Some(state) = app.try_state::<AppState>() {
+                let needs_fallback = state.recent_projects_file.lock().is_none();
+                if needs_fallback {
+                    if let Ok(config_dir) = app.path().app_config_dir() {
+                        let recent_file = config_dir.join("recent_projects.txt");
+                        let loaded = load_recent_projects_from_file(&recent_file);
+                        if !loaded.is_empty() {
+                            *state.recent_projects.lock() = loaded;
+                        }
+                        *state.recent_projects_file.lock() = Some(recent_file);
+                        *state.fallback_autosave_path.lock() =
+                            Some(config_dir.join("untitled.takt.xml"));
                     }
-                    *state.recent_projects_file.lock() = Some(recent_file);
                 }
             }
             let handle = app.handle().clone();
@@ -2022,8 +2395,20 @@ pub fn run() {
             set_latency_offset_ms_command,
             analyze_audio_command,
             resolve_split_fixtures_command,
+            pick_audio_file_command,
+            pick_audio_folder_command,
             read_audio_file_bytes_command,
+            read_audio_file_raw_command,
             resolve_audio_in_folder_command,
+            set_identified_fixture_command,
+            publish_audio_clock_snapshot_command,
+            set_autosave_enabled_command,
+            check_autosave_recovery_command,
+            recover_autosave_command,
+            discard_autosave_command,
+            set_key_binding_command,
+            set_group_mixer_strip_command,
+            log_frontend_error,
             close_splashscreen,
         ])
         .build(tauri::generate_context!())
@@ -2077,6 +2462,87 @@ mod tests {
         assert!(state.snapshot().parked_channels.is_empty());
     }
 
+    const TEST_TUBE_8SEG_JSON: &str = r#"{
+  "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+  "name": "Test 8-Segment RGBW Tube",
+  "shortName": "Test-8Px",
+  "categories": ["Pixel Bar", "Color Changer"],
+  "meta": {
+    "authors": ["Test Suite"],
+    "createDate": "2026-11-17",
+    "lastModifyDate": "2026-11-18"
+  },
+  "matrix": {
+    "pixelCount": [8, 1, 1],
+    "pixelGroups": { "All": "all" }
+  },
+  "availableChannels": {
+    "Master Dimmer": { "defaultValue": 0, "capability": { "type": "Intensity" } },
+    "Strobe": {
+      "defaultValue": 0,
+      "capabilities": [
+        { "dmxRange": [0, 7], "type": "ShutterStrobe", "shutterEffect": "Closed" },
+        { "dmxRange": [8, 15], "type": "ShutterStrobe", "shutterEffect": "Open" },
+        { "dmxRange": [16, 200], "type": "ShutterStrobe", "shutterEffect": "Strobe", "speedStart": "1Hz", "speedEnd": "20Hz" },
+        { "dmxRange": [201, 255], "type": "ShutterStrobe", "shutterEffect": "Strobe", "randomTiming": true, "speedStart": "1Hz", "speedEnd": "20Hz" }
+      ]
+    },
+    "Red": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+    "Green": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+    "Blue": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } },
+    "White": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "White" } }
+  },
+  "templateChannels": {
+    "Red $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+    "Green $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+    "Blue $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } },
+    "White $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "White" } }
+  },
+  "modes": [
+    {
+      "name": "34ch Pixel Mode",
+      "shortName": "34ch",
+      "channels": [
+        "Master Dimmer",
+        "Strobe",
+        {
+          "insert": "matrixChannels",
+          "repeatFor": "eachPixelABC",
+          "channelOrder": "perPixel",
+          "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey", "White $pixelKey"]
+        }
+      ]
+    },
+    {
+      "name": "6ch Basic Mode",
+      "shortName": "6ch",
+      "channels": ["Master Dimmer", "Strobe", "Red", "Green", "Blue", "White"]
+    }
+  ]
+}"#;
+
+    fn new_test_state_with_tube() -> AppState {
+        let state = AppState::new(false);
+        state
+            .save_fixture("test_tube_8seg", TEST_TUBE_8SEG_JSON)
+            .expect("register test 8-segment tube fixture");
+        state
+    }
+
+    #[test]
+    fn resolve_default_fixtures_dir_uses_writable_app_data_location() {
+        let dir = resolve_default_fixtures_dir().expect("resolved fixtures dir");
+        assert!(dir.is_absolute(), "fixtures dir must be absolute: {dir:?}");
+        assert_eq!(dir.file_name().and_then(|s| s.to_str()), Some("fixtures"));
+
+        let recent = resolve_default_recent_projects_file().expect("resolved recent projects file");
+        assert_eq!(
+            dir.parent(),
+            recent.parent(),
+            "fixtures and recent projects must share the same TaktLight app-data root"
+        );
+    }
+
     #[test]
     fn app_state_lists_validates_saves_and_deletes_ofl_fixtures() {
         let temp_dir = std::env::temp_dir().join(format!(
@@ -2086,16 +2552,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         let state = AppState::new_with_fixtures_dir(false, Some(temp_dir.clone()));
+        assert!(temp_dir.join("user").exists());
         let summaries = state.fixture_library.read().list_summaries();
-        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "standard/rlcv3.json");
 
-        let rlcv3 = state
-            .fixture_library
-            .read()
-            .get_entry("age/rlcv3_8_segment_tube.json")
-            .cloned()
-            .unwrap();
-        let validation = AppState::validate_fixture(&rlcv3.raw_json);
+        let validation = AppState::validate_fixture(TEST_TUBE_8SEG_JSON);
         assert!(validation.valid);
         assert_eq!(validation.pixel_count, 8);
         assert_eq!(validation.expanded_modes[0].channel_count, 34);
@@ -2105,24 +2567,24 @@ mod tests {
         assert!(!bad_validation.issues.is_empty());
 
         let saved = state
-            .save_fixture("my_custom_tube", &rlcv3.raw_json)
+            .save_fixture("my_custom_tube", TEST_TUBE_8SEG_JSON)
             .expect("valid user fixture saved");
         assert_eq!(saved.summary.id, "user/my_custom_tube.json");
 
-        assert_eq!(state.fixture_library.read().list_summaries().len(), 3);
+        assert_eq!(state.fixture_library.read().list_summaries().len(), 2);
         state
             .fixture_library
             .write()
             .delete_user_fixture("user/my_custom_tube.json")
             .unwrap();
-        assert_eq!(state.fixture_library.read().list_summaries().len(), 2);
+        assert_eq!(state.fixture_library.read().list_summaries().len(), 1);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn app_state_patches_moves_undoes_and_recompiles_render_plan() {
-        let state = AppState::new(false);
+        let state = new_test_state_with_tube();
         state.show_state.write().network_outputs.universes[1] = UniverseConfig::new(
             2,
             taktlight_engine::state::plan::ProtocolKind::Sacn {
@@ -2133,7 +2595,7 @@ mod tests {
         );
         let snap = state
             .patch_fixtures(
-                "age/rlcv3_8_segment_tube.json",
+                "user/test_tube_8seg.json",
                 "34ch Pixel Mode",
                 "Tube Left",
                 1,
@@ -2167,10 +2629,10 @@ mod tests {
         use taktlight_engine::mixer::traits::{MergeOp, SmartLayerTrait};
         use taktlight_engine::show::spatial::OrderRule;
 
-        let state = AppState::new(false);
+        let state = new_test_state_with_tube();
         state
             .patch_fixtures(
-                "age/rlcv3_8_segment_tube.json",
+                "user/test_tube_8seg.json",
                 "34ch Pixel Mode",
                 "Tube 1",
                 1,
@@ -2282,10 +2744,10 @@ mod tests {
         use taktlight_engine::show::spatial::OrderRule;
         use taktlight_engine::show::xml::FxElementDef;
 
-        let state = AppState::new(false);
+        let state = new_test_state_with_tube();
         state
             .patch_fixtures(
-                "age/rlcv3_8_segment_tube.json",
+                "user/test_tube_8seg.json",
                 "34ch Pixel Mode",
                 "Tube FX",
                 1,
@@ -2485,6 +2947,7 @@ mod tests {
         let ok = read_audio_file_bytes_command(track_path.to_string_lossy().to_string()).unwrap();
         assert_eq!(ok.file_name, "Intro.WAV");
         assert_eq!(ok.bytes, b"RIFFtestbytes");
+        assert!(!ok.resolved_path.starts_with(r"\\?\"));
         assert!(read_audio_file_bytes_command(
             dir.join("does_not_exist.wav").to_string_lossy().to_string()
         )
@@ -2502,16 +2965,17 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].requested, "C:\\Old\\intro.wav");
         assert_eq!(matches[0].file_name, "Intro.WAV");
+        assert!(!matches[0].resolved_path.starts_with(r"\\?\"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn app_state_xml_export_import_roundtrip_and_malformed_rejection() {
-        let state = AppState::new(false);
+        let state = new_test_state_with_tube();
         state
             .patch_fixtures(
-                "age/rlcv3_8_segment_tube.json",
+                "user/test_tube_8seg.json",
                 "34ch Pixel Mode",
                 "Tube XML",
                 1,
@@ -2523,7 +2987,7 @@ mod tests {
         let xml = serialize_show_xml(&state.show_state.read()).expect("export XML");
         assert!(xml.contains("Tube XML"));
 
-        let fresh = AppState::new(false);
+        let fresh = new_test_state_with_tube();
         let imported = fresh.import_show_xml(&xml).expect("import exported XML");
         assert_eq!(imported.show.patch.len(), 1);
         assert_eq!(imported.show.patch[0].name, "Tube XML");
@@ -2537,13 +3001,13 @@ mod tests {
     fn app_state_resolves_splits_configures_universes_manages_bank_colors_and_deletions() {
         use taktlight_engine::state::plan::{ProtocolKind, SacnOutputMode};
 
-        let state = AppState::new(false);
+        let state = new_test_state_with_tube();
         state.seed_default_studio_show();
 
         // Patch a split fixture straddling U1.505 -> U2 and resolve splits
         state
             .patch_fixtures(
-                "age/rlcv3_8_segment_tube.json",
+                "user/test_tube_8seg.json",
                 "34ch Pixel Mode",
                 "SplitTube",
                 1,
@@ -2647,12 +3111,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let state = AppState::new(false);
+        let state = new_test_state_with_tube();
         *state.recent_projects_file.lock() = Some(dir.join("recent.txt"));
         state.seed_default_studio_show();
         state
             .patch_fixtures(
-                "age/rlcv3_8_segment_tube.json",
+                "user/test_tube_8seg.json",
                 "34ch Pixel Mode",
                 "LifecycleTube",
                 1,
@@ -2687,6 +3151,98 @@ mod tests {
         assert_eq!(reset_snap.show.scenes.len(), 1);
         assert!(!reset_snap.can_undo);
         assert!(state.current_project_path.lock().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_audio_clock_locate_and_bindings_persist_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "taktlight_enhancements_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = AppState::new(false);
+        state.seed_default_studio_show();
+        let show_path = dir.join("live.takt.xml");
+        let initial_xml = serialize_show_xml(&state.show_state.read()).unwrap();
+        std::fs::write(&show_path, &initial_xml).unwrap();
+        *state.current_project_path.lock() = Some(show_path.clone());
+
+        // Key bindings & group mixer strips round-trip through XML
+        state.set_key_binding("sc_new_1", Some("F1".into()));
+        state.set_group_mixer_strip(
+            "all",
+            Some(GroupMixerStripDef {
+                dimmer: 0.75,
+                hue_shift_deg: 30.0,
+                saturation: 1.2,
+                strobe_enabled: false,
+                strobe_hz: 8.0,
+                mode: "normal".into(),
+            }),
+        );
+        let xml = serialize_show_xml(&state.show_state.read()).unwrap();
+        let roundtrip = deserialize_show_xml(&xml).unwrap();
+        assert_eq!(roundtrip.key_bindings.get("sc_new_1").map(String::as_str), Some("F1"));
+        assert!((roundtrip.group_mixer_strips["all"].dimmer - 0.75).abs() < 1e-5);
+
+        // Autosave triggers silently after 20 dirty revisions (must NOT show recovery banner mid-session!)
+        let mut last_snap = None;
+        for i in 0..20 {
+            last_snap = Some(
+                state
+                    .upsert_dimmer_palette(DimmerPaletteDef {
+                        id: format!("dim_auto_{i}"),
+                        name: format!("Auto {i}"),
+                        value_start: 0.5,
+                        value_end: 0.5,
+                    })
+                    .unwrap(),
+            );
+        }
+        assert!(
+            !last_snap.unwrap().has_autosave_recovery,
+            "mid-session autosave must not trigger recovery banner while actively editing"
+        );
+        // On reopen / restart, recovery IS detected and restores unsaved changes
+        let reopened = state.open_project_path(&show_path).unwrap();
+        assert!(reopened.has_autosave_recovery);
+        assert!(state.has_autosave_recovery());
+        let recovered = state.recover_autosave().unwrap();
+        assert!(!recovered.has_autosave_recovery);
+        assert!(recovered
+            .show
+            .dimmer_palettes
+            .iter()
+            .any(|p| p.id == "dim_auto_19"));
+
+        // Disabling autosave prevents writing sidecars
+        assert!(!state.set_autosave_enabled(false));
+        for i in 0..25 {
+            let _ = state.upsert_dimmer_palette(DimmerPaletteDef {
+                id: format!("dim_off_{i}"),
+                name: format!("Off {i}"),
+                value_start: 0.4,
+                value_end: 0.4,
+            });
+        }
+        assert!(!AutosaveManager::autosave_path(&show_path).exists());
+        assert!(state.set_autosave_enabled(true));
+
+        // Locate / Identify sets runtime field and surfaces in EngineSnapshotDto
+        let loc_snap = state.set_identified_fixture(Some("fx_001".into()));
+        assert_eq!(loc_snap.identified_fixture_id.as_deref(), Some("fx_001"));
+        let clear_snap = state.set_identified_fixture(None);
+        assert!(clear_snap.identified_fixture_id.is_none());
+
+        // Audio clock publishes and clears snapshots
+        state.publish_audio_clock_snapshot(Some(48_000), Some(48_000), Some(20.0), true);
+        assert!(state.audio_clock.latest_snapshot().is_some());
+        state.publish_audio_clock_snapshot(None, None, None, false);
+        assert!(state.audio_clock.latest_snapshot().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

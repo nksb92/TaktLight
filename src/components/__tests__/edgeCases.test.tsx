@@ -3,6 +3,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { buildOflFixtureJson, createDefaultBuilderDraft } from "../../lib/oflBuilder";
 import { useTaktStore } from "../../store/useTaktStore";
+import {
+  seedTestFixturesInStore,
+  TEST_TUBE_8SEG_ID,
+  TEST_TUBE_16SEG_ID,
+} from "../../test/testFixtures";
 
 describe("TaktLight Edge-Case Coverage (Areas 1–5)", () => {
   beforeEach(() => {
@@ -11,13 +16,14 @@ describe("TaktLight Edge-Case Coverage (Areas 1–5)", () => {
         MouseEvent;
     }
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("Area 1: stacks multiple FX elements on one scene, isolates shared blocks via Make Unique, and survives dangling refs", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Edge",
         1,
@@ -182,7 +188,7 @@ describe("TaktLight Edge-Case Coverage (Areas 1–5)", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv4_16_segment_tube.json",
+        TEST_TUBE_16SEG_ID,
         "66ch Pixel Mode",
         "Split RLCV4",
         1,
@@ -288,7 +294,7 @@ describe("TaktLight Edge-Case Coverage (Areas 1–5)", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube XML",
         1,

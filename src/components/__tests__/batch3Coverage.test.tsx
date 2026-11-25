@@ -4,6 +4,7 @@ import { FixtureGrid2D } from "../FixtureGrid2D";
 import { PalettesAndControls } from "../PalettesAndControls";
 import { useTaktStore } from "../../store/useTaktStore";
 import { createTestBridge } from "../../lib/testBridge";
+import { seedTestFixturesInStore } from "../../test/testFixtures";
 
 function ptr(
   target: Element,
@@ -45,6 +46,7 @@ async function setupStudioFixtures() {
     activeShaderGizmoBlockId: null,
     liveLayers: [],
   });
+  seedTestFixturesInStore();
   await useTaktStore.getState().loadFixtures();
   const summaries = useTaktStore.getState().fixtureSummaries;
   const tube = summaries[0]!;

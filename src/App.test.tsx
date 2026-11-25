@@ -6,10 +6,12 @@ import {
   createDefaultBuilderDraft,
 } from "./lib/oflBuilder";
 import { useTaktStore } from "./store/useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "./test/testFixtures";
 
 describe("TaktLight Slice 1 Studio UI", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("lands on Patch by default and renders Monitor status bar, 512 DMX channels, and jitter histogram panel", () => {
@@ -74,13 +76,13 @@ describe("TaktLight Slice 1 Studio UI", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("switches to Fixture Builder, inspects RLCV3, builds a custom fixture, and flags invalid JSON paths", async () => {
+  it("switches to Fixture Builder, shows standard RLCV3 profile, builds a custom fixture, and flags invalid JSON paths", async () => {
+    useTaktStore.getState().resetForTest();
     render(<App />);
 
     fireEvent.click(screen.getByRole("button", { name: /^Fixtures$/i }));
     expect(screen.getByText("Local OFL Fixture Library")).toBeInTheDocument();
-    expect(screen.getByText("RLCV3 8-Segment RGBW Tube")).toBeInTheDocument();
-    expect(screen.getByText("RLCV4 16-Segment RGBW Tube")).toBeInTheDocument();
+    expect(screen.getByText("RLCV3")).toBeInTheDocument();
 
     // Start new custom fixture draft (starts with 0 modes), add a mode, edit name, and save to user library
     fireEvent.click(screen.getByRole("button", { name: /New Builder Draft/i }));
@@ -124,6 +126,7 @@ describe("TaktLight Slice 1 Studio UI", () => {
 describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("supports dual-universe patching, rollover split toast + Undo/Redo, calibration, and .takt.xml export", async () => {
@@ -207,14 +210,14 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
     fireEvent.click(screen.getByRole("button", { name: /Export .takt.xml/i }));
     const xmlPreview = await screen.findByTestId("show-xml-preview");
     expect(xmlPreview).toHaveTextContent('<TaktLightShow version="1.0"');
-    expect(xmlPreview).toHaveTextContent('profile="age/rlcv3_8_segment_tube.json"');
+    expect(xmlPreview).toHaveTextContent(`profile="${TEST_TUBE_8SEG_ID}"`);
   }, 60000);
 
   it("renders 2D Fixture Grid, updates GridPos, and previews 1D OrderRule & TargetRef mapping", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube A",
         1,
@@ -264,13 +267,14 @@ describe("TaktLight Slice 3 Patch View & 2D Grid UI", () => {
 describe("TaktLight Slice 4 Palettes & Smart Controls UI", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("creates referenceable palettes with Undo/Redo, stacks live layers, and quantizes RGBW DMX output", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Stage",
         1,
@@ -389,13 +393,14 @@ describe("TaktLight Slice 4 Palettes & Smart Controls UI", () => {
 describe("TaktLight Slice 5 Scenes & FX Engine UI", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("manages FX blocks, scenes with Undo/Redo, bank exclusivity, tap tempo, and live DMX output", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Stage",
         1,
@@ -513,13 +518,14 @@ describe("TaktLight Slice 5 Scenes & FX Engine UI", () => {
 describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("opens Timeline Super-Scene in bottom-right dock, expands full-width, drops real WAV music with exact duration & waveform, analyzes music clip, and outputs live DMX", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Stage",
         1,
@@ -672,6 +678,7 @@ describe("TaktLight Slice 6 Multi-Track Timeline & Transient Snap UI", () => {
 describe("TaktLight Slice 7 UI Consolidation & Centered Bottom Navigation", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("moves workspace tabs to centered bottom dock without redundant Timeline tab and hosts consolidated Studio workspace", () => {
@@ -704,13 +711,14 @@ describe("TaktLight Slice 7 UI Consolidation & Centered Bottom Navigation", () =
 describe("TaktLight Daslight 5 Scene-First UX, Bank Management & 2D Multi-Select", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("supports Bank management, 3-mode Scene Inspector (COLOR / COLOR ANIM / EFFECT), 2D multi-fixture grouping, and Timeline Scene layering", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Stage",
         2,
@@ -988,6 +996,7 @@ describe("TaktLight NLE Video-Editor Timeline", () => {
         MouseEvent;
     }
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("supports NLE clip drag-move, left/right trimming, fades, split at playhead, duplicate, kick auto-fill, and zoom", async () => {
@@ -1114,6 +1123,7 @@ describe("TaktLight NLE Video-Editor Timeline", () => {
 describe("TaktLight Usage Notes Regressions (Items 1-18)", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("renders unsaved-changes close modal when closing an unsaved project (Item 1)", () => {
@@ -1148,7 +1158,7 @@ describe("TaktLight Usage Notes Regressions (Items 1-18)", () => {
   it("supports typed numeric input + reset on sliders, Scene Duration Beats/Sec, and preserves Master/Segment dimmers when entering FX (Items 12, 13, 15, 17, 18)", async () => {
     await useTaktStore
       .getState()
-      .patchFixtures("age/rlcv3_8_segment_tube.json", "34ch Pixel Mode", "Tube", 1, 1, 1);
+      .patchFixtures(TEST_TUBE_8SEG_ID, "34ch Pixel Mode", "Tube", 1, 1, 1);
 
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Studio \/ 2D Grid/i }));

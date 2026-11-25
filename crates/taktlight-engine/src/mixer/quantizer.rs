@@ -126,7 +126,7 @@ pub fn quantize_value_u16(
     }
 }
 
-fn resolve_slot_oklab(slot: &ResolvedWheelSlot) -> Option<[f32; 3]> {
+pub fn resolve_slot_oklab(slot: &ResolvedWheelSlot) -> Option<[f32; 3]> {
     for hex in &slot.colors_hex {
         if let Some(lab) = parse_hex_to_oklab(hex) {
             return Some(lab);
@@ -144,38 +144,57 @@ pub fn select_color_wheel_dmx(
     ch_idx: usize,
     state: &mut QuantizerState,
 ) -> u8 {
+    select_color_wheel_dmx_precomputed(target_linear_rgb, slots, &[], fixture_idx, ch_idx, state)
+}
+
+pub fn select_color_wheel_dmx_precomputed(
+    target_linear_rgb: [f32; 3],
+    slots: &[ResolvedWheelSlot],
+    precomputed_oklabs: &[Option<[f32; 3]>],
+    fixture_idx: usize,
+    ch_idx: usize,
+    state: &mut QuantizerState,
+) -> u8 {
     let target_oklab = linear_rgb_to_oklab(target_linear_rgb);
+    let cached_idx_opt = state.wheel_slot_cache.get(&(fixture_idx, ch_idx)).copied();
+    let use_precomputed = precomputed_oklabs.len() == slots.len();
 
-    let mut resolved: Vec<(usize, f32)> = slots
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, slot)| {
-            resolve_slot_oklab(slot).map(|lab| (idx, oklab_distance(target_oklab, lab)))
-        })
-        .collect();
+    let mut best: Option<(usize, f32)> = None;
+    let mut cached_dist: Option<f32> = None;
 
-    if resolved.is_empty() {
+    for (idx, slot) in slots.iter().enumerate() {
+        let lab_opt = if use_precomputed {
+            precomputed_oklabs[idx]
+        } else {
+            resolve_slot_oklab(slot)
+        };
+        if let Some(lab) = lab_opt {
+            let dist = oklab_distance(target_oklab, lab);
+            if Some(idx) == cached_idx_opt {
+                cached_dist = Some(dist);
+            }
+            if best.map_or(true, |(_, bd)| dist < bd) {
+                best = Some((idx, dist));
+            }
+        }
+    }
+
+    let Some((best_idx, best_dist)) = best else {
         return slots
             .first()
             .map(|s| ((s.dmx_range[0] as u16 + s.dmx_range[1] as u16) / 2) as u8)
             .unwrap_or(0);
-    }
+    };
 
-    resolved.sort_by(|a, b| a.1.total_cmp(&b.1));
-    let (best_idx, best_dist) = resolved[0];
-
-    let chosen_idx = if let Some(&cached_idx) = state.wheel_slot_cache.get(&(fixture_idx, ch_idx)) {
-        if let Some(&(_, cur_dist)) = resolved.iter().find(|&&(idx, _)| idx == cached_idx) {
+    let chosen_idx = match (cached_idx_opt, cached_dist) {
+        (Some(cached_idx), Some(cur_dist)) => {
             if best_dist + WHEEL_HYSTERESIS_OKLAB < cur_dist {
                 best_idx
             } else {
                 cached_idx
             }
-        } else {
-            best_idx
         }
-    } else {
-        best_idx
+        _ => best_idx,
     };
 
     state
@@ -330,54 +349,78 @@ where
     F: FnMut(&CompiledChannelSlot, u8),
 {
     let cal = fixture.calibration;
-    let has_hardware_shutter = fixture
-        .channels
-        .iter()
-        .any(|c| matches!(c.role, ChannelRole::ShutterStrobe { .. }));
+    let use_precomputed = fixture.cell_has_dedicated_intensity.len() == (fixture.cell_count as usize)
+        && fixture.cell_has_white.len() == (fixture.cell_count as usize);
+
+    let has_hardware_shutter = if use_precomputed {
+        fixture.has_hardware_shutter
+    } else {
+        fixture
+            .channels
+            .iter()
+            .any(|c| matches!(c.role, ChannelRole::ShutterStrobe { .. }))
+    };
     let (strobe_gate, strobe_clamped) = if has_hardware_shutter {
         (1.0, false)
     } else {
         software_strobe_gate(fx_state.shutter, t_sec, fixture_idx)
     };
 
-    let fixture_has_master_intensity = fixture
-        .channels
-        .iter()
-        .any(|c| c.target == ChannelTarget::Fixture && c.role == ChannelRole::Intensity);
+    let fixture_has_master_intensity = if use_precomputed {
+        fixture.fixture_has_master_intensity
+    } else {
+        fixture
+            .channels
+            .iter()
+            .any(|c| c.target == ChannelTarget::Fixture && c.role == ChannelRole::Intensity)
+    };
 
     let cell_slice_start = fixture.cell_start.min(cell_states.len());
     let cell_slice_end = (fixture.cell_start + fixture.cell_count as usize).min(cell_states.len());
     let local_cells = &cell_states[cell_slice_start..cell_slice_end];
 
-    let has_fixture_white = fixture.channels.iter().any(|c| {
-        matches!(
-            c.role,
-            ChannelRole::ColorIntensity {
-                color: OflColor::White | OflColor::WarmWhite | OflColor::ColdWhite
-            }
-        )
-    });
+    let has_fixture_white = if use_precomputed {
+        fixture.has_fixture_white
+    } else {
+        fixture.channels.iter().any(|c| {
+            matches!(
+                c.role,
+                ChannelRole::ColorIntensity {
+                    color: OflColor::White | OflColor::WarmWhite | OflColor::ColdWhite
+                }
+            )
+        })
+    };
 
-    let mut cell_has_dedicated_intensity = vec![false; local_cells.len()];
-    let mut cell_has_white = vec![false; local_cells.len()];
-    for ch in &fixture.channels {
-        if let ChannelTarget::Cell { cell_index, .. } = ch.target {
-            let idx = cell_index as usize;
-            if idx < local_cells.len() {
-                if ch.role == ChannelRole::Intensity {
-                    cell_has_dedicated_intensity[idx] = true;
-                }
-                if matches!(
-                    ch.role,
-                    ChannelRole::ColorIntensity {
-                        color: OflColor::White | OflColor::WarmWhite | OflColor::ColdWhite
-                    }
-                ) {
-                    cell_has_white[idx] = true;
-                }
-            }
+    let cell_has_intensity_at = |idx: usize| -> bool {
+        if use_precomputed {
+            fixture
+                .cell_has_dedicated_intensity
+                .get(idx)
+                .copied()
+                .unwrap_or(false)
+        } else {
+            fixture.channels.iter().any(|c| {
+                matches!(c.target, ChannelTarget::Cell { cell_index, .. } if (cell_index as usize) == idx)
+                    && c.role == ChannelRole::Intensity
+            })
         }
-    }
+    };
+    let cell_has_white_at = |idx: usize| -> bool {
+        if use_precomputed {
+            fixture.cell_has_white.get(idx).copied().unwrap_or(false)
+        } else {
+            fixture.channels.iter().any(|c| {
+                matches!(c.target, ChannelTarget::Cell { cell_index, .. } if (cell_index as usize) == idx)
+                    && matches!(
+                        c.role,
+                        ChannelRole::ColorIntensity {
+                            color: OflColor::White | OflColor::WarmWhite | OflColor::ColdWhite
+                        }
+                    )
+            })
+        }
+    };
 
     for (ch_idx, ch) in fixture.channels.iter().enumerate() {
         match &ch.role {
@@ -401,8 +444,14 @@ where
                         local_cells.first().map(|c| c.color).unwrap_or([0.0, 0.0, 0.0])
                     }
                 };
-                let dmx =
-                    select_color_wheel_dmx(target_rgb, slots, fixture_idx, ch_idx, quantizer_state);
+                let dmx = select_color_wheel_dmx_precomputed(
+                    target_rgb,
+                    slots,
+                    &ch.wheel_slot_oklabs,
+                    fixture_idx,
+                    ch_idx,
+                    quantizer_state,
+                );
                 write_channel(ch, dmx);
             }
             ChannelRole::Intensity => match ch.target {
@@ -429,17 +478,16 @@ where
                     ChannelTarget::Cell { cell_index, .. } => {
                         let idx = cell_index as usize;
                         let st = local_cells.get(idx).cloned().unwrap_or_default();
-                        let dedicated = cell_has_dedicated_intensity.get(idx).copied().unwrap_or(false)
+                        let dedicated = cell_has_intensity_at(idx)
                             || (fixture.cell_count == 1 && fixture_has_master_intensity);
-                        let white = cell_has_white.get(idx).copied().unwrap_or(false)
+                        let white = cell_has_white_at(idx)
                             || (fixture.cell_count == 1 && has_fixture_white);
                         (st.dimmer, st.color, dedicated, white)
                     }
                     ChannelTarget::Fixture => {
                         let st = local_cells.first().cloned().unwrap_or_default();
-                        let dedicated = fixture_has_master_intensity
-                            || cell_has_dedicated_intensity.first().copied().unwrap_or(false);
-                        let white = has_fixture_white || cell_has_white.first().copied().unwrap_or(false);
+                        let dedicated = fixture_has_master_intensity || cell_has_intensity_at(0);
+                        let white = has_fixture_white || cell_has_white_at(0);
                         (st.dimmer, st.color, dedicated, white)
                     }
                 };
@@ -502,13 +550,14 @@ mod tests {
             target,
             role,
             fine_channel_offset: None,
+            wheel_slot_oklabs: Vec::new(),
         }
     }
 
     #[test]
     fn virtual_dimmer_vs_dedicated_intensity_and_single_vs_multicell_master_routing() {
         // 1) Multi-cell fixture with Master Dimmer ONLY -> Virtual Dimmer scales cell colors
-        let multi_fixture = CompiledFixture {
+        let mut multi_fixture = CompiledFixture {
             id: "fx_multi".into(),
             name: "Multi Tube".into(),
             profile: "test".into(),
@@ -547,7 +596,13 @@ mod tests {
                     },
                 ),
             ],
+            has_hardware_shutter: false,
+            fixture_has_master_intensity: false,
+            has_fixture_white: false,
+            cell_has_dedicated_intensity: Vec::new(),
+            cell_has_white: Vec::new(),
         };
+        multi_fixture.compute_precomputed_flags();
         let mut q = QuantizerState::default();
         let mut multi_dmx = [0u8; 3];
         quantize_fixture_to_dmx(
@@ -584,7 +639,7 @@ mod tests {
         assert_eq!(multi_dmx[2], 255);
 
         // 2) Single-cell fixture with Master Dimmer -> Master gets cell[0].dimmer * master_dimmer, Red stays unscaled
-        let single_fixture = CompiledFixture {
+        let mut single_fixture = CompiledFixture {
             id: "fx_single".into(),
             name: "Single Par".into(),
             profile: "test".into(),
@@ -612,7 +667,13 @@ mod tests {
                     },
                 ),
             ],
+            has_hardware_shutter: false,
+            fixture_has_master_intensity: false,
+            has_fixture_white: false,
+            cell_has_dedicated_intensity: Vec::new(),
+            cell_has_white: Vec::new(),
         };
+        single_fixture.compute_precomputed_flags();
         let mut single_dmx = [0u8; 2];
         quantize_fixture_to_dmx(
             0,
@@ -799,7 +860,7 @@ mod tests {
     #[test]
     fn sixteen_bit_channels_split_coarse_and_fine_bytes_accurately() {
         let mut q = QuantizerState::default();
-        let fixture = CompiledFixture {
+        let mut fixture = CompiledFixture {
             id: "fx_16".into(),
             name: "16bit Dimmer".into(),
             profile: "test".into(),
@@ -826,6 +887,7 @@ mod tests {
                     },
                     role: ChannelRole::Intensity,
                     fine_channel_offset: Some(1),
+                    wheel_slot_oklabs: Vec::new(),
                 },
                 CompiledChannelSlot {
                     universe_id: 1,
@@ -843,9 +905,16 @@ mod tests {
                         resolution_byte_index: 1,
                     },
                     fine_channel_offset: None,
+                    wheel_slot_oklabs: Vec::new(),
                 },
             ],
+            has_hardware_shutter: false,
+            fixture_has_master_intensity: false,
+            has_fixture_white: false,
+            cell_has_dedicated_intensity: Vec::new(),
+            cell_has_white: Vec::new(),
         };
+        fixture.compute_precomputed_flags();
 
         let mut dmx = [0u8; 2];
         quantize_fixture_to_dmx(

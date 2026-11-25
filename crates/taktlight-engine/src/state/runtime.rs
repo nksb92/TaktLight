@@ -40,6 +40,8 @@ pub struct RuntimeControl {
     pub timeline_start_anchor_t_sec: f64,
     #[serde(default)]
     pub latency_offset_ms: f64,
+    #[serde(default)]
+    pub identified_fixture_id: Option<String>,
 }
 
 impl Default for RuntimeControl {
@@ -58,6 +60,7 @@ impl Default for RuntimeControl {
             timeline_playhead_sec: 0.0,
             timeline_start_anchor_t_sec: 0.0,
             latency_offset_ms: 0.0,
+            identified_fixture_id: None,
         }
     }
 }
@@ -242,6 +245,12 @@ impl RuntimeControl {
         if !offset_ms.is_nan() {
             self.latency_offset_ms = offset_ms.clamp(-500.0, 500.0);
         }
+    }
+
+    pub fn set_identified_fixture(&mut self, fixture_id: Option<String>) {
+        self.identified_fixture_id = fixture_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
     }
 
     pub fn effective_timeline_playhead_sec(&self, clock_t_sec: f64) -> Option<f64> {

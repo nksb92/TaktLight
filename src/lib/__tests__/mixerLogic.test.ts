@@ -273,7 +273,7 @@ describe("mixerLogic", () => {
           id: "par_rgb",
           name: "Par",
           short_name: "Par",
-          origin: "age_built_in" as const,
+          origin: "user_local" as const,
           categories: ["Color"],
           pixel_count: 1,
           modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cell_count: 1 }],
@@ -354,7 +354,7 @@ describe("mixerLogic", () => {
           id: "par_rgb",
           name: "Par",
           short_name: "Par",
-          origin: "age_built_in" as const,
+          origin: "user_local" as const,
           categories: ["Color"],
           pixel_count: 1,
           modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cell_count: 1 }],
@@ -461,7 +461,7 @@ describe("mixerLogic", () => {
     ];
     const cache = {
       bar4: {
-        summary: { id: "bar4", name: "Bar4", short_name: "Bar4", origin: "age_built_in" as const, categories: ["PixelBar"], pixel_count: 4, modes: [{ name: "13ch", short_name: "13ch", channel_count: 13, cell_count: 4 }] },
+        summary: { id: "bar4", name: "Bar4", short_name: "Bar4", origin: "user_local" as const, categories: ["PixelBar"], pixel_count: 4, modes: [{ name: "13ch", short_name: "13ch", channel_count: 13, cell_count: 4 }] },
         raw_json: "",
         expanded_modes: [{ name: "13ch", short_name: "13ch", channel_count: 13, cells, channels }],
       },
@@ -583,7 +583,7 @@ describe("mixerLogic", () => {
     ];
     const cache = {
       par1: {
-        summary: { id: "par1", name: "Par1", short_name: "Par1", origin: "age_built_in" as const, categories: ["Color Changer"], pixel_count: 1, modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cell_count: 1 }] },
+        summary: { id: "par1", name: "Par1", short_name: "Par1", origin: "user_local" as const, categories: ["Color Changer"], pixel_count: 1, modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cell_count: 1 }] },
         raw_json: "",
         expanded_modes: [{ name: "4ch", short_name: "4ch", channel_count: 4, cells, channels }],
       },

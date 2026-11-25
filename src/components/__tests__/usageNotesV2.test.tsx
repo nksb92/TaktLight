@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { DEFAULT_STUDIO_LAYOUT, useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "../../test/testFixtures";
 
 describe("Usage Notes V2 — Full Feature & UX Verification", () => {
   beforeEach(() => {
@@ -10,6 +11,7 @@ describe("Usage Notes V2 — Full Feature & UX Verification", () => {
         MouseEvent;
     }
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("1 & 3: File menu (New/Open/Last/Save/Save As/Close), View > Reset Layout, and dirty-state unsaved guard", async () => {
@@ -30,7 +32,7 @@ describe("Usage Notes V2 — Full Feature & UX Verification", () => {
       await useTaktStore
         .getState()
         .patchFixtures(
-          "age/rlcv3_8_segment_tube.json",
+          TEST_TUBE_8SEG_ID,
           "34ch Pixel Mode",
           "GuardTube",
           1,
@@ -98,7 +100,7 @@ describe("Usage Notes V2 — Full Feature & UX Verification", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "CalTube",
         1,
@@ -144,7 +146,7 @@ describe("Usage Notes V2 — Full Feature & UX Verification", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "TargetTube",
         1,
@@ -168,7 +170,7 @@ describe("Usage Notes V2 — Full Feature & UX Verification", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "GizmoTube",
         1,
@@ -347,7 +349,7 @@ describe("Usage Notes V2 — Full Feature & UX Verification", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "CellTube",
         1,

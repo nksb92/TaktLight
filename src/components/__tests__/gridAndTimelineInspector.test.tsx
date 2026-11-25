@@ -2,17 +2,19 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "../../test/testFixtures";
 
 describe("2D Grid, Timeline Inspector & TopStatusBar Normal Usage", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("toggles 2D shader gizmo, accepts negative GridPos, and resets rotation/scale", async () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Grid",
         1,
@@ -115,7 +117,7 @@ describe("2D Grid, Timeline Inspector & TopStatusBar Normal Usage", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Keys",
         1,

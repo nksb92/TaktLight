@@ -717,7 +717,7 @@ mod tests {
     fn sample_fixture(id: &str, address: u16) -> FixtureInstance {
         FixtureInstance {
             id: id.to_string(),
-            profile: "age/rlcv3_8_segment_tube.json".to_string(),
+            profile: "user/test_tube_8seg.json".to_string(),
             mode: "34ch Pixel Mode".to_string(),
             name: "Tube".to_string(),
             universe: 1,

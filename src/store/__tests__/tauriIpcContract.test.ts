@@ -93,6 +93,10 @@ describe("Tauri IPC Contract — useTaktStore ↔ src-tauri/src/lib.rs", () => {
             ];
           case "read_audio_file_bytes_command":
             throw new Error("missing audio");
+          case "pick_audio_file_command":
+            return "C:\\Music\\song.mp3";
+          case "pick_audio_folder_command":
+            return "C:\\Music";
           case "new_project_command":
             return baseSnapshot;
           case "open_project_path_command":
@@ -128,7 +132,7 @@ describe("Tauri IPC Contract — useTaktStore ↔ src-tauri/src/lib.rs", () => {
     await store.releaseAllScenes();
     await store.setTimelineTransport("tl_1", true, 1.5);
     await store.setLatencyOffsetMs(10);
-    await store.patchFixtures("age/rlcv3_8_segment_tube.json", "34ch Pixel Mode", "Tube", 1, 1, 1);
+    await store.patchFixtures("user/test_tube_8seg.json", "34ch Pixel Mode", "Tube", 1, 1, 1);
     await store.renameSceneBank("Bank 1", "Verse");
     await store.resolveSplitFixtures();
     await store.undoShow();
@@ -141,6 +145,12 @@ describe("Tauri IPC Contract — useTaktStore ↔ src-tauri/src/lib.rs", () => {
     await store.openRecentProject("C:\\Shows\\demo.takt.xml");
     await store.saveProjectAsFile();
     await store.newProject();
+    expect(await store.pickNativeAudioFile("Select Music")).toBe(
+      "C:\\Music\\song.mp3",
+    );
+    expect(await store.pickNativeAudioFolder("Select Folder")).toBe(
+      "C:\\Music",
+    );
 
     const findCall = (name: string) => calls.find((c) => c.cmd === name);
     const findLastCall = (name: string) =>
@@ -167,7 +177,7 @@ describe("Tauri IPC Contract — useTaktStore ↔ src-tauri/src/lib.rs", () => {
     });
     expect(findCall("set_latency_offset_ms_command")?.args).toEqual({ offsetMs: 10 });
     expect(findCall("patch_fixtures_command")?.args).toMatchObject({
-      profileId: "age/rlcv3_8_segment_tube.json",
+      profileId: "user/test_tube_8seg.json",
       modeName: "34ch Pixel Mode",
       namePrefix: "Tube",
       count: 1,
@@ -192,5 +202,11 @@ describe("Tauri IPC Contract — useTaktStore ↔ src-tauri/src/lib.rs", () => {
       suggestedName: expect.stringMatching(/\.takt\.xml$/),
     });
     expect(findCall("new_project_command")).toBeDefined();
+    expect(findCall("pick_audio_file_command")?.args).toEqual({
+      title: "Select Music",
+    });
+    expect(findCall("pick_audio_folder_command")?.args).toEqual({
+      title: "Select Folder",
+    });
   });
 });

@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearAudioAssetRegistry } from "../../lib/audioEngine";
 import { useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "../../test/testFixtures";
 import { ColorPaletteBuilderModal } from "../ColorPaletteBuilderModal";
 import { DmxMonitor } from "../DmxMonitor";
 import { buildHistogramBins, JitterHistogram } from "../JitterHistogram";
@@ -13,6 +14,7 @@ describe("Batch 1 Component Coverage (>= 95%)", () => {
   beforeEach(() => {
     clearAudioAssetRegistry();
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   afterEach(() => {
@@ -343,7 +345,7 @@ describe("Batch 1 Component Coverage (>= 95%)", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube SW",
         1,

@@ -554,7 +554,7 @@ mod tests {
     ) -> FixtureInstance {
         FixtureInstance {
             id: id.to_string(),
-            profile: "age/rlcv3_8_segment_tube.json".to_string(),
+            profile: "user/test_tube_8seg.json".to_string(),
             mode: "34ch Pixel Mode".to_string(),
             name: name.to_string(),
             universe,
@@ -775,7 +775,7 @@ mod tests {
         let batch = vec![
             (
                 "fx_1".into(),
-                "age/rlcv3_8_segment_tube.json".into(),
+                "user/test_tube_8seg.json".into(),
                 "34ch Pixel Mode".into(),
                 "Tube 1".into(),
                 34,
@@ -784,7 +784,7 @@ mod tests {
             ),
             (
                 "fx_2".into(),
-                "age/rlcv3_8_segment_tube.json".into(),
+                "user/test_tube_8seg.json".into(),
                 "34ch Pixel Mode".into(),
                 "Tube 2".into(),
                 34,

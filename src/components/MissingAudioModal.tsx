@@ -17,6 +17,8 @@ export function MissingAudioModal() {
   const relinkMissingAudioFromFolderPath = useTaktStore(
     (s) => s.relinkMissingAudioFromFolderPath,
   );
+  const pickNativeAudioFolder = useTaktStore((s) => s.pickNativeAudioFolder);
+  const pickNativeAudioFile = useTaktStore((s) => s.pickNativeAudioFile);
   const dismissMissingAudioModal = useTaktStore(
     (s) => s.dismissMissingAudioModal,
   );
@@ -55,6 +57,45 @@ export function MissingAudioModal() {
     }
   };
 
+  const handleNativeSelectFolder = async () => {
+    setBusy(true);
+    setStatusMessage(null);
+    try {
+      const picked = await pickNativeAudioFolder("Select Music Folder");
+      if (!picked) return;
+      setFolderPathInput(picked);
+      const res = await relinkMissingAudioFromFolderPath(picked);
+      setStatusMessage(
+        res.matched > 0
+          ? `${res.message} Save the project to keep the updated path.`
+          : res.message,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleNativeSelectFile = async (
+    originalKey: string,
+    baseName: string,
+  ) => {
+    setBusy(true);
+    setStatusMessage(null);
+    try {
+      const picked = await pickNativeAudioFile(`Select ${baseName}`);
+      if (!picked) return;
+      setIndividualPaths((prev) => ({ ...prev, [originalKey]: picked }));
+      const res = await relinkMissingAudioWithPath(originalKey, picked);
+      setStatusMessage(
+        res.ok
+          ? `${res.message} Save the project to keep the updated path.`
+          : res.message,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleScanFolderPath = async () => {
     const trimmed = folderPathInput.trim();
     if (!trimmed) return;
@@ -62,7 +103,11 @@ export function MissingAudioModal() {
     setStatusMessage(null);
     try {
       const res = await relinkMissingAudioFromFolderPath(trimmed);
-      setStatusMessage(res.message);
+      setStatusMessage(
+        res.matched > 0
+          ? `${res.message} Save the project to keep the updated path.`
+          : res.message,
+      );
     } finally {
       setBusy(false);
     }
@@ -132,28 +177,36 @@ export function MissingAudioModal() {
               Relink by Folder
             </span>
             <div>
-              <input
-                ref={folderInputRef}
-                type="file"
-                multiple
-                aria-label="Browse Audio Folder"
-                data-testid="relink-folder-file-input"
-                // @ts-expect-error webkitdirectory is supported in Chromium/WebView2
-                webkitdirectory=""
-                onChange={(e) => {
-                  void handleFolderPickerChange(e);
-                }}
-                className="hidden"
-              />
+              {!inTauri && (
+                <input
+                  ref={folderInputRef}
+                  type="file"
+                  multiple
+                  aria-label="Browse Audio Folder"
+                  data-testid="relink-folder-file-input"
+                  // @ts-expect-error webkitdirectory is supported in Chromium/WebView2
+                  webkitdirectory=""
+                  onChange={(e) => {
+                    void handleFolderPickerChange(e);
+                  }}
+                  className="hidden"
+                />
+              )}
               <button
                 type="button"
                 disabled={busy}
                 data-testid="relink-browse-folder-btn"
-                onClick={() => folderInputRef.current?.click()}
+                onClick={() => {
+                  if (inTauri) {
+                    void handleNativeSelectFolder();
+                  } else {
+                    folderInputRef.current?.click();
+                  }
+                }}
                 className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-ember hover:bg-burnt disabled:opacity-50 text-frost font-mono text-xs font-semibold transition-colors"
               >
                 <FolderOpen className="w-3.5 h-3.5" />
-                <span>Browse Folder…</span>
+                <span>Select Folder…</span>
               </button>
             </div>
           </div>
@@ -212,21 +265,38 @@ export function MissingAudioModal() {
                   </div>
                 </div>
 
-                <label className="shrink-0 cursor-pointer">
-                  <input
-                    type="file"
-                    accept="audio/*"
-                    aria-label={`Browse file for ${entry.baseName}`}
-                    data-testid={`relink-file-input-${entry.baseName}`}
-                    onChange={(e) => {
-                      void handleIndividualFileChange(entry.originalKey, e);
+                {inTauri ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    data-testid={`relink-native-file-btn-${entry.baseName}`}
+                    onClick={() => {
+                      void handleNativeSelectFile(
+                        entry.originalKey,
+                        entry.baseName,
+                      );
                     }}
-                    className="hidden"
-                  />
-                  <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-ink border border-steel hover:border-ember font-mono text-[11px] text-mist transition-colors">
-                    Browse File…
-                  </span>
-                </label>
+                    className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded bg-ink border border-steel hover:border-ember disabled:opacity-50 font-mono text-[11px] text-mist transition-colors"
+                  >
+                    Select File…
+                  </button>
+                ) : (
+                  <label className="shrink-0 cursor-pointer">
+                    <input
+                      type="file"
+                      accept="audio/*"
+                      aria-label={`Browse file for ${entry.baseName}`}
+                      data-testid={`relink-file-input-${entry.baseName}`}
+                      onChange={(e) => {
+                        void handleIndividualFileChange(entry.originalKey, e);
+                      }}
+                      className="hidden"
+                    />
+                    <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-ink border border-steel hover:border-ember font-mono text-[11px] text-mist transition-colors">
+                      Select File…
+                    </span>
+                  </label>
+                )}
               </div>
 
               {inTauri && !entry.resolved && (

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SceneAndFxManager } from "../SceneAndFxManager";
 import { useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore } from "../../test/testFixtures";
 
 async function seedSceneFxState() {
   const s = useTaktStore.getState();
@@ -147,6 +148,7 @@ async function seedSceneFxState() {
     canUndo: true,
     canRedo: true,
   });
+  seedTestFixturesInStore();
   await useTaktStore.getState().loadFixtures();
   const prof = useTaktStore.getState().fixtureSummaries[0];
   if (prof && useTaktStore.getState().showState.patch.length === 0) {

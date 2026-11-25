@@ -59,6 +59,15 @@ export interface FixtureGroupDef {
   targets: string[];
 }
 
+export interface GroupMixerStripDto {
+  dimmer: number;
+  hue_shift_deg: number;
+  saturation: number;
+  strobe_enabled: boolean;
+  strobe_hz: number;
+  mode: string;
+}
+
 export interface ShowStateDto {
   version: string;
   name: string;
@@ -80,6 +89,8 @@ export interface ShowStateDto {
   scenes: SceneDef[];
   timelines: TimelineDef[];
   bank_colors?: Record<string, string>;
+  key_bindings?: Record<string, string>;
+  group_mixer_strips?: Record<string, GroupMixerStripDto>;
 }
 
 export interface UniverseSegment {

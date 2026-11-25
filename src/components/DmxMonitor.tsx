@@ -1,4 +1,5 @@
 import { Activity, ChevronLeft, ChevronRight, Lock, Unlock, X } from "lucide-react";
+import { memo, useMemo } from "react";
 import { resolveUniverseDisplayConfig } from "../lib/patchLogic";
 import {
   DisplayFormat,
@@ -11,6 +12,82 @@ import { NumericSlider } from "./NumericSlider";
 
 const CHANNEL_INDICES = Array.from({ length: 512 }, (_, idx) => idx + 1);
 const QUICK_PRESETS = [0, 64, 128, 192, 255];
+
+interface ChannelOwnerInfo {
+  fixtureId: string;
+  fixtureName: string;
+  channelName: string;
+}
+
+interface DmxCellProps {
+  ch: number;
+  val: number;
+  isParked: boolean;
+  isSelected: boolean;
+  displayFormat: DisplayFormat;
+  ownerTooltip: string | undefined;
+  isPatched: boolean;
+  onSelect: (ch: number) => void;
+}
+
+const DmxCell = memo(function DmxCell({
+  ch,
+  val,
+  isParked,
+  isSelected,
+  displayFormat,
+  ownerTooltip,
+  isPatched,
+  onSelect,
+}: DmxCellProps) {
+  const fillPct = (val / 255) * 100;
+
+  return (
+    <button
+      type="button"
+      data-testid={`dmx-cell-${ch}`}
+      aria-label={`Channel ${String(ch).padStart(3, "0")}`}
+      title={ownerTooltip}
+      onClick={() => onSelect(ch)}
+      className={`relative flex flex-col justify-between bg-pitch rounded-[4px] px-1 pt-1 pb-1.5 min-h-[40px] border text-left transition-colors overflow-hidden ${
+        isParked
+          ? "border-signal"
+          : isSelected
+            ? "border-ember ring-1 ring-ember"
+            : isPatched
+              ? "border-cobalt/70 hover:border-fog"
+              : "border-steel/60 hover:border-fog"
+      }`}
+    >
+      <div className="flex items-center justify-between w-full">
+        <span className="font-mono text-[9px] leading-none text-fog">
+          {String(ch).padStart(3, "0")}
+        </span>
+        {isParked ? (
+          <span className="w-1.5 h-1.5 rounded-full bg-signal" />
+        ) : isPatched ? (
+          <span className="w-1 h-1 rounded-full bg-cobalt/80" />
+        ) : null}
+      </div>
+
+      <span
+        className={`font-mono text-[11px] leading-tight font-medium mt-0.5 ${
+          isParked ? "text-frost" : val > 0 ? "text-mist" : "text-fog/70"
+        }`}
+      >
+        {formatDmxValue(val, displayFormat)}
+      </span>
+
+      {/* Intensity Bar */}
+      <div className="w-full h-1 bg-ink rounded-full overflow-hidden mt-0.5">
+        <div
+          className={isParked ? "h-full bg-signal" : "h-full bg-ember"}
+          style={{ width: `${fillPct}%` }}
+        />
+      </div>
+    </button>
+  );
+});
 
 function formatDmxValue(value: number, format: DisplayFormat): string {
   if (format === "HEX") {
@@ -46,6 +123,8 @@ export function DmxMonitor() {
   const displayFormat = useTaktStore((s) => s.displayFormat);
   const selectedChannel = useTaktStore((s) => s.selectedChannel);
   const histogramOpen = useTaktStore((s) => s.histogramOpen);
+  const patch = useTaktStore((s) => s.showState.patch);
+  const fixtureDetailsCache = useTaktStore((s) => s.fixtureDetailsCache);
 
   const setSelectedUniverse = useTaktStore((s) => s.setSelectedUniverse);
   const setDisplayFormat = useTaktStore((s) => s.setDisplayFormat);
@@ -54,7 +133,31 @@ export function DmxMonitor() {
   const clearAllParked = useTaktStore((s) => s.clearAllParked);
   const toggleHistogram = useTaktStore((s) => s.toggleHistogram);
 
+  const channelOwnership = useMemo(() => {
+    const map = new Map<number, ChannelOwnerInfo>();
+    for (const fx of patch) {
+      const detail = fixtureDetailsCache[fx.profile];
+      const mode = detail?.expanded_modes.find((m) => m.name === fx.mode);
+      const chCount = mode?.channels.length ?? fx.channel_count;
+      for (let off = 0; off < chCount; off += 1) {
+        const linear = fx.address + off;
+        const uni = linear <= 512 ? fx.universe : fx.universe + 1;
+        const addr = linear <= 512 ? linear : linear - 512;
+        if (uni !== selectedUniverseId || addr < 1 || addr > 512) continue;
+        const chName = mode?.channels[off]?.name ?? `Ch ${off + 1}`;
+        map.set(addr, {
+          fixtureId: fx.id,
+          fixtureName: fx.name,
+          channelName: chName,
+        });
+      }
+    }
+    return map;
+  }, [fixtureDetailsCache, patch, selectedUniverseId]);
+
   const dmx = dmxByUniverse[selectedUniverseId] ?? new Uint8Array(512);
+  const selectedOwner =
+    selectedChannel !== null ? channelOwnership.get(selectedChannel) : undefined;
   const { config: currentUniConfig, isPreview: isPreviewUniverse } =
     resolveUniverseDisplayConfig(universes, selectedUniverseId);
   const currentUniBadge = protocolBadge(currentUniConfig);
@@ -233,52 +336,23 @@ export function DmxMonitor() {
               const isParked =
                 parkedChannels[parkKey(selectedUniverseId, ch)] !== undefined;
               const isSelected = selectedChannel === ch;
-              const fillPct = (val / 255) * 100;
+              const owner = channelOwnership.get(ch);
+              const ownerTooltip = owner
+                ? `U${selectedUniverseId}.${String(ch).padStart(3, "0")} — ${owner.fixtureName}: ${owner.channelName}`
+                : undefined;
 
               return (
-                <button
+                <DmxCell
                   key={ch}
-                  type="button"
-                  data-testid={`dmx-cell-${ch}`}
-                  aria-label={`Channel ${String(ch).padStart(3, "0")}`}
-                  onClick={() => selectChannel(ch)}
-                  className={`relative flex flex-col justify-between bg-pitch rounded-[4px] px-1 pt-1 pb-1.5 min-h-[40px] border text-left transition-colors overflow-hidden ${
-                    isParked
-                      ? "border-signal"
-                      : isSelected
-                        ? "border-ember ring-1 ring-ember"
-                        : "border-steel/60 hover:border-fog"
-                  }`}
-                >
-                  <div className="flex items-center justify-between w-full">
-                    <span className="font-mono text-[9px] leading-none text-fog">
-                      {String(ch).padStart(3, "0")}
-                    </span>
-                    {isParked && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-signal" />
-                    )}
-                  </div>
-
-                  <span
-                    className={`font-mono text-[11px] leading-tight font-medium mt-0.5 ${
-                      isParked
-                        ? "text-frost"
-                        : val > 0
-                          ? "text-mist"
-                          : "text-fog/70"
-                    }`}
-                  >
-                    {formatDmxValue(val, displayFormat)}
-                  </span>
-
-                  {/* Intensity Bar */}
-                  <div className="w-full h-1 bg-ink rounded-full overflow-hidden mt-0.5">
-                    <div
-                      className={isParked ? "h-full bg-signal" : "h-full bg-ember"}
-                      style={{ width: `${fillPct}%` }}
-                    />
-                  </div>
-                </button>
+                  ch={ch}
+                  val={val}
+                  isParked={isParked}
+                  isSelected={isSelected}
+                  displayFormat={displayFormat}
+                  ownerTooltip={ownerTooltip}
+                  isPatched={Boolean(owner)}
+                  onSelect={selectChannel}
+                />
               );
             })}
           </div>
@@ -313,6 +387,22 @@ export function DmxMonitor() {
             </p>
           ) : (
             <div className="flex flex-col gap-3">
+              {selectedOwner && (
+                <div
+                  data-testid="dmx-channel-owner-badge"
+                  className="bg-pitch border border-cobalt/60 rounded-md px-3 py-1.5 font-mono text-[11px]"
+                >
+                  <div className="text-[10px] uppercase text-fog">
+                    PATCHED FIXTURE
+                  </div>
+                  <div className="text-frost font-medium truncate">
+                    {selectedOwner.fixtureName}
+                  </div>
+                  <div className="text-mist text-[10px] truncate">
+                    {selectedOwner.channelName}
+                  </div>
+                </div>
+              )}
               <div className="flex items-center justify-between bg-pitch border border-steel rounded-md px-3 py-2">
                 <div>
                   <div className="font-mono text-[10px] uppercase text-fog">

@@ -96,9 +96,11 @@ export function tryDecodeWavBytes(
   const bytesPerSample =
     audioFormat === 1 && bitsPerSample === 16
       ? 2
-      : audioFormat === 3 && bitsPerSample === 32
-        ? 4
-        : 0;
+      : audioFormat === 1 && bitsPerSample === 24
+        ? 3
+        : audioFormat === 3 && bitsPerSample === 32
+          ? 4
+          : 0;
   if (bytesPerSample === 0) return null;
 
   const frameBytes = channels * bytesPerSample;
@@ -110,8 +112,13 @@ export function tryDecodeWavBytes(
     let sum = 0;
     for (let c = 0; c < channels; c++) {
       const sOff = base + c * bytesPerSample;
-      if (audioFormat === 1) {
+      if (audioFormat === 1 && bitsPerSample === 16) {
         sum += view.getInt16(sOff, true) / 32768.0;
+      } else if (audioFormat === 1 && bitsPerSample === 24) {
+        const b0 = bytes[sOff];
+        const b1 = bytes[sOff + 1] << 8;
+        const b2 = (bytes[sOff + 2] << 24) >> 8;
+        sum += (b0 | b1 | b2) / 8388608.0;
       } else {
         sum += view.getFloat32(sOff, true);
       }
@@ -468,14 +475,38 @@ export function reanalyzeAudioClip(
   );
 }
 
+export interface AudioClockSyncPayload {
+  samplesPlayed: number | null;
+  sampleRate: number | null;
+  bufferDurationMs: number | null;
+  isPlaying: boolean;
+}
+
+type AudioClockPublisher = (payload: AudioClockSyncPayload) => void;
+
 /**
  * Syncs Web Audio API playback of all music clips on a timeline with transport
- * play/pause/seek state.
+ * play/pause/seek state and publishes hardware audio clock snapshots so the
+ * Rust 44 Hz engine stays phase-locked to audio output without drift.
  */
 class WebAudioTimelinePlayer {
   private activeSources: AudioBufferSourceNode[] = [];
+  private clockTimer: ReturnType<typeof setInterval> | null = null;
+  private clockPublisher: AudioClockPublisher | null = null;
+
+  setClockPublisher(publisher: AudioClockPublisher | null): void {
+    this.clockPublisher = publisher;
+  }
+
+  private clearClockTimer(): void {
+    if (this.clockTimer !== null) {
+      clearInterval(this.clockTimer);
+      this.clockTimer = null;
+    }
+  }
 
   stop(): void {
+    this.clearClockTimer();
     for (const src of this.activeSources) {
       try {
         src.stop();
@@ -485,6 +516,12 @@ class WebAudioTimelinePlayer {
       }
     }
     this.activeSources = [];
+    this.clockPublisher?.({
+      samplesPlayed: null,
+      sampleRate: null,
+      bufferDurationMs: null,
+      isPlaying: false,
+    });
   }
 
   startFrom(playheadSec: number, tracks: ReadonlyArray<TrackDef>): void {
@@ -496,6 +533,7 @@ class WebAudioTimelinePlayer {
     }
 
     const now = ctx.currentTime;
+    let scheduledAny = false;
     for (const track of tracks) {
       for (const clip of track.clips) {
         if (!clip.audio_file) continue;
@@ -526,7 +564,33 @@ class WebAudioTimelinePlayer {
           }
         }
         this.activeSources.push(src);
+        scheduledAny = true;
       }
+    }
+
+    if (scheduledAny && this.clockPublisher) {
+      const sampleRate = Math.max(8000, Math.round(ctx.sampleRate || 48000));
+      const baseLatencyMs =
+        typeof (ctx as AudioContext & { baseLatency?: number }).baseLatency === "number"
+          ? Math.max(10, ((ctx as AudioContext & { baseLatency?: number }).baseLatency ?? 0.02) * 1000)
+          : 25;
+      const emitSnapshot = () => {
+        const ts =
+          typeof ctx.getOutputTimestamp === "function" ? ctx.getOutputTimestamp() : null;
+        const audioTime =
+          ts && typeof ts.contextTime === "number" && ts.contextTime > 0
+            ? ts.contextTime
+            : ctx.currentTime;
+        const timelineSec = Math.max(0, playheadSec + (audioTime - now));
+        this.clockPublisher?.({
+          samplesPlayed: Math.round(timelineSec * sampleRate),
+          sampleRate,
+          bufferDurationMs: baseLatencyMs + 45,
+          isPlaying: ctx.state === "running",
+        });
+      };
+      emitSnapshot();
+      this.clockTimer = setInterval(emitSnapshot, 40);
     }
   }
 }

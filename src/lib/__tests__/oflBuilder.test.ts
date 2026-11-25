@@ -64,11 +64,13 @@ describe("oflBuilder", () => {
     ).toBe(true);
   });
 
-  it("provides shipped RLCV3 and RLCV4 profiles offline", () => {
+  it("ships with the standard RLCV3 fixture profile", () => {
     const shipped = getDefaultShippedFixtures();
-    expect(shipped).toHaveLength(2);
-    expect(shipped[0].summary.pixel_count).toBe(8);
-    expect(shipped[1].summary.pixel_count).toBe(16);
+    expect(shipped).toHaveLength(1);
+    expect(shipped[0].summary.id).toBe("standard/rlcv3.json");
+    expect(shipped[0].summary.name).toBe("RLCV3");
+    expect(shipped[0].summary.origin).toBe("standard");
+    expect(shipped[0].summary.pixel_count).toBe(24);
   });
 
   it("supports custom RGB orders, white/WW+CW modes, white position, and round-trips via parseOflJsonToDraft", () => {

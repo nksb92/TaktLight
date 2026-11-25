@@ -1,15 +1,17 @@
 import {
   Crosshair,
   Magnet,
+  Maximize2,
   Plus,
   Redo2,
   RotateCcw,
   RotateCw,
+  Sun,
   Undo2,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { type PointerEvent, type WheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type PointerEvent, type WheelEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   computeTargetGizmoBounds,
   DEFAULT_COLOR_PALETTES,
@@ -90,7 +92,6 @@ export function FixtureGrid2D({
 }) {
   const showState = useTaktStore((s) => s.showState);
   const compiledCells = useTaktStore((s) => s.compiledCells);
-  const cellPreviewRgbd = useTaktStore((s) => s.cellPreviewRgbd);
   const fixtureDetailsCache = useTaktStore((s) => s.fixtureDetailsCache);
   const selectedFixtureInstanceId = useTaktStore(
     (s) => s.selectedFixtureInstanceId,
@@ -106,6 +107,9 @@ export function FixtureGrid2D({
   const activeScenes = useTaktStore((s) => s.activeScenes);
   const canUndo = useTaktStore((s) => s.canUndo);
   const canRedo = useTaktStore((s) => s.canRedo);
+  const identifiedFixtureId = useTaktStore((s) => s.identifiedFixtureId);
+  const setIdentifiedFixture = useTaktStore((s) => s.setIdentifiedFixture);
+  const projectLoadNonce = useTaktStore((s) => s.projectLoadNonce);
 
   const toggleSelectFixtureInstance = useTaktStore(
     (s) => s.toggleSelectFixtureInstance,
@@ -143,6 +147,113 @@ export function FixtureGrid2D({
   const [dragRenderTick, setDragRenderTick] = useState<number>(0);
   const dragOverridesRef = useRef<Record<string, GridPos>>({});
   const rafIdRef = useRef<number | null>(null);
+  const lastAutoFittedNonceRef = useRef<number | null>(null);
+
+  const fitAllFixtures = useCallback(
+    (options?: { onlyIfOutOfView?: boolean }) => {
+      const patch = showState.patch;
+      if (patch.length === 0 && compiledCells.length === 0) {
+        setZoom(1.0);
+        setPan({ x: 0, y: 0 });
+        return;
+      }
+
+      let minX = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      let minY = Number.POSITIVE_INFINITY;
+      let maxY = Number.NEGATIVE_INFINITY;
+
+      const includePoint = (x: number, y: number) => {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      };
+
+      for (const cell of compiledCells) {
+        includePoint(cell.canvas_xy[0], cell.canvas_xy[1]);
+      }
+      for (const fx of patch) {
+        const gp = dragOverridesRef.current[fx.id] ?? fx.grid_pos;
+        const rad = (gp.rotation * Math.PI) / 180;
+        const cosR = Math.cos(rad);
+        const sinR = Math.sin(rad);
+        const hx = Math.max(0.04, Math.abs(gp.scale_x) * 0.5);
+        const hy = Math.max(0.04, Math.abs(gp.scale_y) * 0.5);
+        for (const sx of [-hx, hx]) {
+          for (const sy of [-hy, hy]) {
+            includePoint(
+              gp.x + sx * cosR - sy * sinR,
+              gp.y + sx * sinR + sy * cosR,
+            );
+          }
+        }
+      }
+
+      if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+        setZoom(1.0);
+        setPan({ x: 0, y: 0 });
+        return;
+      }
+
+      const baseUnit = Math.min(CANVAS_WIDTH, CANVAS_HEIGHT) * VIEW_FIT;
+      if (options?.onlyIfOutOfView) {
+        const marginPx = 24;
+        const sxMin = (minX - 0.5) * baseUnit + CANVAS_WIDTH * 0.5;
+        const sxMax = (maxX - 0.5) * baseUnit + CANVAS_WIDTH * 0.5;
+        const syMin = (minY - 0.5) * baseUnit + CANVAS_HEIGHT * 0.5;
+        const syMax = (maxY - 0.5) * baseUnit + CANVAS_HEIGHT * 0.5;
+        const fitsInDefaultView =
+          sxMin >= marginPx &&
+          sxMax <= CANVAS_WIDTH - marginPx &&
+          syMin >= marginPx &&
+          syMax <= CANVAS_HEIGHT - marginPx;
+        if (fitsInDefaultView) {
+          setZoom(1.0);
+          setPan({ x: 0, y: 0 });
+          return;
+        }
+      }
+
+      const pad = 0.06;
+      minX -= pad;
+      maxX += pad;
+      minY -= pad;
+      maxY += pad;
+
+      const cx = (minX + maxX) * 0.5;
+      const cy = (minY + maxY) * 0.5;
+      const spanX = Math.max(0.2, maxX - minX);
+      const spanY = Math.max(0.2, maxY - minY);
+
+      const zoomX = (CANVAS_WIDTH * 0.9) / (spanX * baseUnit);
+      const zoomY = (CANVAS_HEIGHT * 0.9) / (spanY * baseUnit);
+      const nextZoom = Math.max(
+        0.15,
+        Math.min(2.5, Number(Math.min(zoomX, zoomY).toFixed(2))),
+      );
+
+      setZoom(nextZoom);
+      setPan({
+        x: Number((cx - 0.5).toFixed(3)),
+        y: Number((cy - 0.5).toFixed(3)),
+      });
+    },
+    [compiledCells, showState.patch],
+  );
+
+  // Automatically frame all fixtures on startup and whenever a new project is loaded
+  useEffect(() => {
+    if (showState.patch.length === 0 && compiledCells.length === 0) {
+      return;
+    }
+    if (lastAutoFittedNonceRef.current === projectLoadNonce) {
+      return;
+    }
+    lastAutoFittedNonceRef.current = projectLoadNonce;
+    fitAllFixtures({ onlyIfOutOfView: true });
+  }, [compiledCells.length, fitAllFixtures, projectLoadNonce, showState.patch.length]);
   const [marqueeRect, setMarqueeRect] = useState<{
     x0: number;
     y0: number;
@@ -410,12 +521,105 @@ export function FixtureGrid2D({
     return rankByIdx;
   }, [compiledCells, orderRule]);
 
-  useEffect(() => {
+  // Precompute static cell geometry & selection metadata whenever layout/selection changes
+  // so 44 Hz live RGBD updates never recompute coordinates or trigger React re-renders.
+  const cachedCellLayout = useMemo(() => {
+    const w = CANVAS_WIDTH;
+    const h = CANVAS_HEIGHT;
+    const unit = Math.min(w, h) * zoom * VIEW_FIT;
+    const toPx = (nx: number, ny: number): [number, number] => [
+      w * 0.5 + (nx - 0.5 - pan.x) * unit,
+      h * 0.5 + (ny - 0.5 - pan.y) * unit,
+    ];
+    const selectedCellSet = new Set(selectedCellIndices);
+    const overrides = dragOverridesRef.current;
+    const fxPatchById = new Map(showState.patch.map((f) => [f.id, f]));
+    const defaultCellSize = Math.round(16 * Math.min(1.5, Math.max(0.75, zoom)));
+    const fixtureScreenCoords = new Map<string, Array<[number, number]>>();
+    const cellScreenCoords: Array<[number, number]> = compiledCells.map((cell) => {
+      const baseFx = fxPatchById.get(cell.fixture_id);
+      const ov = overrides[cell.fixture_id];
+      let cellX = cell.canvas_xy[0];
+      let cellY = cell.canvas_xy[1];
+      if (baseFx && ov) {
+        if (ov.rotation !== baseFx.grid_pos.rotation) {
+          const dx = cellX - baseFx.grid_pos.x;
+          const dy = cellY - baseFx.grid_pos.y;
+          const dRad = ((ov.rotation - baseFx.grid_pos.rotation) * Math.PI) / 180;
+          const cosD = Math.cos(dRad);
+          const sinD = Math.sin(dRad);
+          cellX = ov.x + (dx * cosD - dy * sinD);
+          cellY = ov.y + (dx * sinD + dy * cosD);
+        } else {
+          cellX += ov.x - baseFx.grid_pos.x;
+          cellY += ov.y - baseFx.grid_pos.y;
+        }
+      }
+      const pt = toPx(cellX, cellY);
+      const list = fixtureScreenCoords.get(cell.fixture_id);
+      if (list) list.push(pt);
+      else fixtureScreenCoords.set(cell.fixture_id, [pt]);
+      return pt;
+    });
+
+    const fixtureCellSizeById = new Map<string, number>();
+    for (const [fxId, pts] of fixtureScreenCoords.entries()) {
+      if (pts.length < 2) {
+        fixtureCellSizeById.set(fxId, defaultCellSize);
+        continue;
+      }
+      let minDist = Infinity;
+      for (let i = 1; i < pts.length; i++) {
+        const dist = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+        if (dist > 0.5 && dist < minDist) minDist = dist;
+      }
+      const adaptive = Number.isFinite(minDist)
+        ? Math.max(9, Math.min(defaultCellSize, Math.floor(minDist - 3)))
+        : defaultCellSize;
+      fixtureCellSizeById.set(fxId, adaptive);
+    }
+
+    return compiledCells.map((cell, idx) => {
+      const [cx, cy] = cellScreenCoords[idx];
+      const cellSize = fixtureCellSizeById.get(cell.fixture_id) ?? defaultCellSize;
+      const cellKey = `${cell.fixture_id}:${cell.cell_index}`;
+      return {
+        cx,
+        cy,
+        cellSize,
+        half: cellSize * 0.5,
+        isColorCapable: fixtureHasColorById.get(cell.fixture_id) ?? true,
+        isSelected:
+          selectedFixture?.id === cell.fixture_id ||
+          selectedFixtureSet.has(cell.fixture_id),
+        isPatternSelected: selectedCellSet.has(idx),
+        isGroupHighlighted: activeGroupCellKeys.has(cellKey),
+        isSceneTargeted: sceneAffected.isSubset && sceneAffected.cellKeys.has(cellKey),
+        badgeText: cellSize >= 14 ? String(cellBadgeNumbers[idx] ?? idx + 1) : "",
+      };
+    });
+  }, [
+    activeGroupCellKeys,
+    cellBadgeNumbers,
+    compiledCells,
+    dragRenderTick,
+    fixtureHasColorById,
+    pan,
+    sceneAffected,
+    selectedCellIndices,
+    selectedFixture,
+    selectedFixtureSet,
+    showState.patch,
+    zoom,
+  ]);
+
+  const drawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const cellPreviewRgbd = useTaktStore.getState().cellPreviewRgbd;
     const w = canvas.width;
     const h = canvas.height;
 
@@ -439,24 +643,22 @@ export function FixtureGrid2D({
 
     ctx.strokeStyle = "#162030";
     ctx.lineWidth = 1;
+    ctx.beginPath();
     for (let i = startIx; i <= endIx; i++) {
       const pX = toScreenPx(i * gridStep, 0, w, h).sx;
       if (pX >= 0 && pX <= w) {
-        ctx.beginPath();
         ctx.moveTo(pX, 0);
         ctx.lineTo(pX, h);
-        ctx.stroke();
       }
     }
     for (let i = startIy; i <= endIy; i++) {
       const pY = toScreenPx(0, i * gridStep, w, h).sy;
       if (pY >= 0 && pY <= h) {
-        ctx.beginPath();
         ctx.moveTo(0, pY);
         ctx.lineTo(w, pY);
-        ctx.stroke();
       }
     }
+    ctx.stroke();
 
     // [0..1] Stage Boundary Box
     const stageTL = toScreenPx(0, 0, w, h);
@@ -481,9 +683,7 @@ export function FixtureGrid2D({
     ctx.stroke();
     ctx.setLineDash([]);
 
-    const selectedCellSet = new Set(selectedCellIndices);
     const overrides = dragOverridesRef.current;
-    const fxPatchById = new Map(showState.patch.map((f) => [f.id, f]));
 
     // Live semi-transparent animated 2D shader preview directly inside the gizmo rectangle (behind fixtures)
     if (shaderGizmoActive && activeShaderBlock) {
@@ -491,8 +691,8 @@ export function FixtureGrid2D({
         (el) => el.kind === "spatial_shader_2d",
       );
       if (shaderEl && shaderEl.kind === "spatial_shader_2d") {
-        const minNx = gizmoState.centerX - gizmoState.boxHalfX;
-        const minNy = gizmoState.centerY - gizmoState.boxHalfY;
+        const minNxG = gizmoState.centerX - gizmoState.boxHalfX;
+        const minNyG = gizmoState.centerY - gizmoState.boxHalfY;
         const boxSpanX = gizmoState.boxHalfX * 2;
         const boxSpanY = gizmoState.boxHalfY * 2;
         const gridRes = 18;
@@ -529,10 +729,10 @@ export function FixtureGrid2D({
         ctx.globalAlpha = 0.34;
         for (let gy = 0; gy < gridRes; gy++) {
           for (let gx = 0; gx < gridRes; gx++) {
-            const nx0 = minNx + (gx / gridRes) * boxSpanX;
-            const ny0 = minNy + (gy / gridRes) * boxSpanY;
-            const nx1 = minNx + ((gx + 1) / gridRes) * boxSpanX;
-            const ny1 = minNy + ((gy + 1) / gridRes) * boxSpanY;
+            const nx0 = minNxG + (gx / gridRes) * boxSpanX;
+            const ny0 = minNyG + (gy / gridRes) * boxSpanY;
+            const nx1 = minNxG + ((gx + 1) / gridRes) * boxSpanX;
+            const ny1 = minNyG + ((gy + 1) / gridRes) * boxSpanY;
             const sampleNx = (nx0 + nx1) * 0.5;
             const sampleNy = (ny0 + ny1) * 0.5;
             const s = evaluateSpatialShader2DPhase({
@@ -573,54 +773,11 @@ export function FixtureGrid2D({
       }
     }
 
-    // Compute per-fixture adaptive cell size so multi-segment tubes never appear cramped
-    const defaultCellSize = Math.round(16 * Math.min(1.5, Math.max(0.75, zoom)));
-    const fixtureScreenCoords = new Map<string, Array<[number, number]>>();
-    const cellScreenCoords: Array<[number, number]> = compiledCells.map((cell) => {
-      const baseFx = fxPatchById.get(cell.fixture_id);
-      const ov = overrides[cell.fixture_id];
-      let cellX = cell.canvas_xy[0];
-      let cellY = cell.canvas_xy[1];
-      if (baseFx && ov) {
-        if (ov.rotation !== baseFx.grid_pos.rotation) {
-          const dx = cellX - baseFx.grid_pos.x;
-          const dy = cellY - baseFx.grid_pos.y;
-          const dRad = ((ov.rotation - baseFx.grid_pos.rotation) * Math.PI) / 180;
-          const cosD = Math.cos(dRad);
-          const sinD = Math.sin(dRad);
-          cellX = ov.x + (dx * cosD - dy * sinD);
-          cellY = ov.y + (dx * sinD + dy * cosD);
-        } else {
-          cellX += ov.x - baseFx.grid_pos.x;
-          cellY += ov.y - baseFx.grid_pos.y;
-        }
-      }
-      const { sx, sy } = toScreenPx(cellX, cellY, w, h);
-      const list = fixtureScreenCoords.get(cell.fixture_id);
-      if (list) list.push([sx, sy]);
-      else fixtureScreenCoords.set(cell.fixture_id, [[sx, sy]]);
-      return [sx, sy];
-    });
-    const fixtureCellSizeById = new Map<string, number>();
-    for (const [fxId, pts] of fixtureScreenCoords.entries()) {
-      if (pts.length < 2) {
-        fixtureCellSizeById.set(fxId, defaultCellSize);
-        continue;
-      }
-      let minDist = Infinity;
-      for (let i = 1; i < pts.length; i++) {
-        const dist = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
-        if (dist > 0.5 && dist < minDist) minDist = dist;
-      }
-      const adaptive = Number.isFinite(minDist)
-        ? Math.max(9, Math.min(defaultCellSize, Math.floor(minDist - 3)))
-        : defaultCellSize;
-      fixtureCellSizeById.set(fxId, adaptive);
-    }
-
-    // Draw lighting cells as crisp Daslight-style numbered squares
-    compiledCells.forEach((cell, idx) => {
-      const [cx, cy] = cellScreenCoords[idx];
+    // Draw lighting cells as crisp Daslight-style numbered squares using precomputed layout
+    ctx.font = "9px monospace";
+    ctx.textAlign = "center";
+    for (let idx = 0; idx < cachedCellLayout.length; idx++) {
+      const c = cachedCellLayout[idx];
       const base = idx * 4;
       const r = cellPreviewRgbd[base] ?? 0;
       const g = cellPreviewRgbd[base + 1] ?? 0;
@@ -629,74 +786,59 @@ export function FixtureGrid2D({
 
       const scale = d / 255;
       const hasColor = r + g + b > 0;
-      const isColorCapable = fixtureHasColorById.get(cell.fixture_id) ?? true;
       const litR = hasColor
         ? Math.round(r * scale)
-        : !isColorCapable
+        : !c.isColorCapable
           ? Math.round(210 * scale)
           : 0;
       const litG = hasColor
         ? Math.round(g * scale)
-        : !isColorCapable
+        : !c.isColorCapable
           ? Math.round(218 * scale)
           : 0;
       const litB = hasColor
         ? Math.round(b * scale)
-        : !isColorCapable
+        : !c.isColorCapable
           ? Math.round(228 * scale)
           : 0;
       const hasOutput = hasColor
         ? litR + litG + litB > 0
-        : !isColorCapable && d > 0;
-      const isSelected =
-        selectedFixture?.id === cell.fixture_id ||
-        selectedFixtureSet.has(cell.fixture_id);
-      const isPatternSelected = selectedCellSet.has(idx);
-      const isGroupHighlighted = activeGroupCellKeys.has(
-        `${cell.fixture_id}:${cell.cell_index}`,
-      );
-      const isSceneTargeted =
-        sceneAffected.isSubset &&
-        sceneAffected.cellKeys.has(`${cell.fixture_id}:${cell.cell_index}`);
-      const cellSize = fixtureCellSizeById.get(cell.fixture_id) ?? defaultCellSize;
-      const half = cellSize / 2;
+        : !c.isColorCapable && d > 0;
 
-      if (isGroupHighlighted || isSceneTargeted) {
+      if (c.isGroupHighlighted || c.isSceneTargeted) {
         ctx.lineWidth = 2;
-        ctx.strokeStyle = isGroupHighlighted ? "#8833AA" : "#10B981";
+        ctx.strokeStyle = c.isGroupHighlighted ? "#8833AA" : "#10B981";
         ctx.strokeRect(
-          cx - half - 3,
-          cy - half - 3,
-          cellSize + 6,
-          cellSize + 6,
+          c.cx - c.half - 3,
+          c.cy - c.half - 3,
+          c.cellSize + 6,
+          c.cellSize + 6,
         );
       }
 
       ctx.fillStyle = hasOutput
         ? `rgb(${litR}, ${litG}, ${litB})`
         : "#0D1117";
-      ctx.fillRect(cx - half, cy - half, cellSize, cellSize);
+      ctx.fillRect(c.cx - c.half, c.cy - c.half, c.cellSize, c.cellSize);
 
-      ctx.lineWidth = isPatternSelected ? 2 : isSelected ? 1.5 : 1;
-      ctx.strokeStyle = isPatternSelected
+      ctx.lineWidth = c.isPatternSelected ? 2 : c.isSelected ? 1.5 : 1;
+      ctx.strokeStyle = c.isPatternSelected
         ? "#F2F6FB"
-        : isSelected
+        : c.isSelected
           ? "#FF5500"
           : "#8898A8";
-      ctx.strokeRect(cx - half, cy - half, cellSize, cellSize);
+      ctx.strokeRect(c.cx - c.half, c.cy - c.half, c.cellSize, c.cellSize);
 
-      if (cellSize >= 14) {
-        const badgeNum = cellBadgeNumbers[idx] ?? idx + 1;
+      if (c.badgeText) {
         const luminance = 0.299 * litR + 0.587 * litG + 0.114 * litB;
-        ctx.font = "9px monospace";
         ctx.fillStyle = hasOutput && luminance > 140 ? "#0A0F18" : "#F2F6FB";
-        ctx.textAlign = "center";
-        ctx.fillText(String(badgeNum), cx, cy + 3);
-        ctx.textAlign = "left";
+        ctx.fillText(c.badgeText, c.cx, c.cy + 3);
       }
-    });
+    }
+    ctx.textAlign = "left";
 
     // Draw fixture anchors & selection rings
+    ctx.font = "11px monospace";
     for (const fx of showState.patch) {
       const effPos = overrides[fx.id] ?? fx.grid_pos;
       const { sx: fxX, sy: fxY } = toScreenPx(effPos.x, effPos.y, w, h);
@@ -734,7 +876,6 @@ export function FixtureGrid2D({
         ctx.fill();
       }
 
-      ctx.font = "11px monospace";
       ctx.fillStyle = isPrimary || isMulti ? "#FF6B2B" : "#94A3B8";
       ctx.fillText(fx.name, Math.min(w - 90, fxX + 10), Math.max(14, fxY - 8));
     }
@@ -805,16 +946,11 @@ export function FixtureGrid2D({
       ctx.fill();
     }
   }, [
-    activeGroupCellKeys,
     activeShaderBlock,
-    cellBadgeNumbers,
-    cellPreviewRgbd,
-    compiledCells,
-    fixtureHasColorById,
+    cachedCellLayout,
     gizmoState,
     marqueeRect,
-    sceneAffected,
-    selectedCellIndices,
+    pan,
     selectedFixture,
     selectedFixtureSet,
     shaderGizmoActive,
@@ -823,9 +959,39 @@ export function FixtureGrid2D({
     showState.patch,
     snapStep,
     zoom,
-    pan,
-    dragRenderTick,
   ]);
+
+  const drawCanvasRef = useRef(drawCanvas);
+  drawCanvasRef.current = drawCanvas;
+
+  // Repaint whenever layout, selection, or static state changes
+  useEffect(() => {
+    drawCanvas();
+  }, [drawCanvas]);
+
+  // Imperative 44 Hz live frame subscription: draws directly on canvas via rAF with 0 React re-renders
+  useEffect(() => {
+    let liveRafId: number | null = null;
+    const unsubscribe = useTaktStore.subscribe((state, prev) => {
+      if (state.cellPreviewRgbd === prev.cellPreviewRgbd) return;
+      if (typeof requestAnimationFrame === "function") {
+        if (liveRafId === null) {
+          liveRafId = requestAnimationFrame(() => {
+            liveRafId = null;
+            drawCanvasRef.current();
+          });
+        }
+      } else {
+        drawCanvasRef.current();
+      }
+    });
+    return () => {
+      unsubscribe();
+      if (liveRafId !== null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(liveRafId);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -1365,7 +1531,7 @@ export function FixtureGrid2D({
     if (!e.ctrlKey && !e.metaKey && Math.abs(e.deltaY) < 1) return;
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.1 : 0.9;
-    setZoom((z) => Math.max(0.3, Math.min(4.0, Number((z * factor).toFixed(2)))));
+    setZoom((z) => Math.max(0.15, Math.min(4.0, Number((z * factor).toFixed(2)))));
   };
 
   const updateGridField = (patch: Partial<GridPos>) => {
@@ -1436,7 +1602,7 @@ export function FixtureGrid2D({
                 type="button"
                 data-testid="grid-zoom-out"
                 onClick={() =>
-                  setZoom((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))))
+                  setZoom((z) => Math.max(0.15, Number((z - 0.25).toFixed(2))))
                 }
                 title="Zoom Out"
                 className="p-0.5 text-mist hover:text-ember"
@@ -1447,7 +1613,7 @@ export function FixtureGrid2D({
                 ariaLabel="2D Grid Zoom Slider"
                 value={zoom}
                 defaultValue={1.0}
-                min={0.5}
+                min={0.15}
                 max={2.5}
                 step={0.05}
                 displayMultiplier={100}
@@ -1484,9 +1650,49 @@ export function FixtureGrid2D({
                 <ZoomIn className="w-3 h-3" />
               </button>
             </div>
+            <HelpTooltip text="Fit all patched fixtures into the 2D viewer.">
+              <button
+                type="button"
+                data-testid="grid-fit-all-btn"
+                onClick={() => fitAllFixtures()}
+                title="Fit All Fixtures"
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-steel bg-ink font-mono text-[10px] text-mist hover:border-ember hover:text-frost transition-colors"
+              >
+                <Maximize2 className="w-3 h-3 text-ember" />
+                <span>Fit All</span>
+              </button>
+            </HelpTooltip>
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
+            {(selectedFixture || identifiedFixtureId) && (
+              <HelpTooltip text="Locate / Identify: forces the selected fixture to 100% open white for physical verification.">
+                <button
+                  type="button"
+                  data-testid="grid-locate-fixture-btn"
+                  aria-pressed={Boolean(
+                    selectedFixture &&
+                      identifiedFixtureId === selectedFixture.id,
+                  )}
+                  onClick={() => {
+                    const targetId = selectedFixture?.id ?? null;
+                    if (identifiedFixtureId && (!targetId || identifiedFixtureId === targetId)) {
+                      void setIdentifiedFixture(null);
+                    } else if (targetId) {
+                      void setIdentifiedFixture(targetId);
+                    }
+                  }}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded border font-mono text-[10px] transition-colors ${
+                    identifiedFixtureId
+                      ? "bg-frost border-frost text-void font-semibold"
+                      : "bg-ink border-steel text-mist hover:border-frost"
+                  }`}
+                >
+                  <Sun className="w-3 h-3" />
+                  <span>{identifiedFixtureId ? "Locating" : "Locate"}</span>
+                </button>
+              </HelpTooltip>
+            )}
             {/* Selection Mode: Whole Fixtures vs Individual Cells */}
             <HelpTooltip text="Fixtures mode selects & moves whole fixtures; Cells mode clicks or marquees individual segments for partial-fixture groups.">
               <div className="flex items-center gap-0.5 bg-ink border border-steel rounded p-0.5 font-mono text-[10px]">

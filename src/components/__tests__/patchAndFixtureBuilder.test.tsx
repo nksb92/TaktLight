@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { PatchView } from "../PatchView";
 import { useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore } from "../../test/testFixtures";
 
 describe("PatchView & FixtureBuilder Normal Usage", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("bulk-patches fixtures, rejects colliding addresses, unpatches with Undo, and switches universe protocol", async () => {

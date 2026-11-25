@@ -1,7 +1,6 @@
-import rlcv3Profile from "../../fixtures/age/rlcv3_8_segment_tube.json";
-import rlcv4Profile from "../../fixtures/age/rlcv4_16_segment_tube.json";
+import rlcv3Profile from "../../fixtures/user/rlcv3.json";
 
-export type FixtureOrigin = "age_built_in" | "user_local";
+export type FixtureOrigin = "standard" | "user_local";
 
 export interface SchemaValidationIssue {
   instance_path: string;
@@ -1278,15 +1277,6 @@ function buildDetailFromJson(
 
 export function getDefaultShippedFixtures(): FixtureDetail[] {
   return [
-    buildDetailFromJson(
-      "age/rlcv3_8_segment_tube.json",
-      "age_built_in",
-      rlcv3Profile,
-    ),
-    buildDetailFromJson(
-      "age/rlcv4_16_segment_tube.json",
-      "age_built_in",
-      rlcv4Profile,
-    ),
+    buildDetailFromJson("standard/rlcv3.json", "standard", rlcv3Profile),
   ];
 }

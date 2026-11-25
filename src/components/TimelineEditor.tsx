@@ -21,16 +21,19 @@ import {
 } from "lucide-react";
 import {
   type DragEvent,
+  memo,
   type PointerEvent as ReactPointerEvent,
-  type WheelEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import {
+  type DecodedAudioAsset,
   decodeAudioFile,
+  extractAudioFileName,
   getDecodedAudioAsset,
   timelineAudioPlayer,
 } from "../lib/audioEngine";
@@ -63,7 +66,7 @@ import {
   type SnapTarget,
   snapTimeSecToTargets,
 } from "../lib/timelineLogic";
-import { useTaktStore } from "../store/useTaktStore";
+import { isTauriEnvironment, useTaktStore } from "../store/useTaktStore";
 import { HelpTooltip } from "./HelpTooltip";
 import { classifySceneMode } from "./SceneAndFxManager";
 
@@ -88,11 +91,20 @@ interface ClipDragState {
   naturalCycleSec?: number;
 }
 
-function ClipWaveformCanvas({
+function quantizeWaveformBackingWidth(clipWidthPx: number, dpr: number): number {
+  const safeWidth = Number.isFinite(clipWidthPx) ? clipWidthPx : 64;
+  const desired = Math.max(64, Math.round(safeWidth * dpr));
+  // Power-of-2 buckets (256..8192) let the GPU scale smoothly during zooming
+  // without wiping/reallocating the canvas texture on every single zoom step.
+  const pow2 = 1 << Math.ceil(Math.log2(desired));
+  return Math.min(8192, Math.max(256, pow2));
+}
+
+const ClipWaveformCanvas = memo(function ClipWaveformCanvas({
   audioFile,
   analysis,
   clipDurationSec,
-  clipWidthPx,
+  backingWidthPx,
   showTransients,
   showKicks = true,
   showSnares = true,
@@ -101,7 +113,7 @@ function ClipWaveformCanvas({
   audioFile: string;
   analysis?: AudioAnalysisResult;
   clipDurationSec: number;
-  clipWidthPx: number;
+  backingWidthPx: number;
   showTransients: boolean;
   showKicks?: boolean;
   showSnares?: boolean;
@@ -109,7 +121,7 @@ function ClipWaveformCanvas({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     let ctx: CanvasRenderingContext2D | null = null;
@@ -124,11 +136,8 @@ function ClipWaveformCanvas({
       typeof window !== "undefined"
         ? Math.min(2, window.devicePixelRatio || 1)
         : 1;
-    const cssW = Math.max(32, Math.round(clipWidthPx));
     const cssH = 48;
-    const maxBackingW = 8192;
-    const scaleX = Math.min(dpr, maxBackingW / cssW);
-    const backingW = Math.max(32, Math.round(cssW * scaleX));
+    const backingW = Math.max(32, Math.min(8192, Math.round(backingWidthPx)));
     const backingH = Math.round(cssH * dpr);
 
     if (canvas.width !== backingW) canvas.width = backingW;
@@ -148,18 +157,17 @@ function ClipWaveformCanvas({
     const monoPcm = asset?.monoPcm;
 
     if (monoPcm && monoPcm.length > 0 && asset.sampleRate > 0) {
-      // Sample directly from decoded PCM at exact backing-pixel resolution (razor-sharp at any zoom!)
+      // Sample directly from decoded PCM at quantized backing-pixel resolution (batched path fills)
       const visibleSamples = Math.min(
         monoPcm.length,
         Math.max(1, Math.round(clipDurationSec * asset.sampleRate)),
       );
       const samplesPerCol = visibleSamples / backingW;
 
-      // Outer peak envelope (min..max)
-      ctx.fillStyle = "rgba(56, 189, 248, 0.48)";
-      // Inner RMS energy body
       const rmsBars: Array<[number, number, number]> = [];
 
+      ctx.fillStyle = "rgba(56, 189, 248, 0.48)";
+      ctx.beginPath();
       for (let x = 0; x < backingW; x++) {
         const sStart = Math.floor(x * samplesPerCol);
         const sEnd = Math.min(
@@ -182,17 +190,20 @@ function ClipWaveformCanvas({
         const yTop = Math.floor(midY - Math.max(0, max) * halfH);
         const yBot = Math.ceil(midY - Math.min(0, min) * halfH);
         const h = Math.max(1, yBot - yTop);
-        ctx.fillRect(x, yTop, 1, h);
+        ctx.rect(x, yTop, 1, h);
 
         const rms = Math.sqrt(sumSq / count);
         const rmsH = Math.max(1, Math.round(rms * halfH * 2));
         rmsBars.push([x, Math.round(midY - rmsH / 2), rmsH]);
       }
+      ctx.fill();
 
       ctx.fillStyle = "rgba(125, 211, 252, 0.85)";
+      ctx.beginPath();
       for (const [x, y, h] of rmsBars) {
-        ctx.fillRect(x, y, 1, h);
+        ctx.rect(x, y, 1, h);
       }
+      ctx.fill();
     } else if (analysis && analysis.waveform_peaks.length > 0) {
       const peaks = analysis.waveform_peaks;
       const assetDur = Math.max(0.05, analysis.duration_sec || clipDurationSec);
@@ -200,6 +211,7 @@ function ClipWaveformCanvas({
       const visibleCount = Math.max(1, Math.floor(peaks.length * visibleFrac));
 
       ctx.fillStyle = "rgba(56, 189, 248, 0.65)";
+      ctx.beginPath();
       for (let x = 0; x < backingW; x++) {
         const pIdx = Math.min(
           visibleCount - 1,
@@ -209,45 +221,49 @@ function ClipWaveformCanvas({
         if (!pk) continue;
         const yTop = Math.floor(midY - Math.max(0, pk.max) * halfH);
         const yBot = Math.ceil(midY - Math.min(0, pk.min) * halfH);
-        ctx.fillRect(x, yTop, 1, Math.max(1, yBot - yTop));
+        ctx.rect(x, yTop, 1, Math.max(1, yBot - yTop));
       }
+      ctx.fill();
     }
 
     // Crisp color-coded transient tick markers (Amber = Kick, Cyan = Snare)
     if (showTransients && analysis && analysis.transients.length > 0) {
       const pipH = Math.max(4, Math.round(backingH * 0.24));
-      for (const m of analysis.transients) {
-        if (m.time_sec > clipDurationSec) continue;
-        if (m.band === "kick" && !showKicks) continue;
-        if (m.band === "snare" && !showSnares) continue;
-        const x = Math.round(
-          (m.time_sec / Math.max(0.05, clipDurationSec)) * backingW,
-        );
-        if (m.band === "kick") {
-          ctx.fillStyle = "rgba(245, 158, 11, 0.95)";
-          ctx.fillRect(x, 0, Math.max(1, Math.round(scaleX)), pipH);
-          ctx.fillRect(
-            x,
-            backingH - pipH,
-            Math.max(1, Math.round(scaleX)),
-            pipH,
+      const kickW = Math.max(1, Math.round(dpr));
+      const snareH = Math.round(pipH * 0.65);
+
+      if (showKicks) {
+        ctx.fillStyle = "rgba(245, 158, 11, 0.95)";
+        ctx.beginPath();
+        for (const m of analysis.transients) {
+          if (m.band !== "kick" || m.time_sec > clipDurationSec) continue;
+          const x = Math.round(
+            (m.time_sec / Math.max(0.05, clipDurationSec)) * backingW,
           );
-        } else {
-          ctx.fillStyle = "rgba(34, 211, 238, 0.65)";
-          ctx.fillRect(
-            x,
-            backingH - Math.round(pipH * 0.65),
-            1,
-            Math.round(pipH * 0.65),
-          );
+          ctx.rect(x, 0, kickW, pipH);
+          ctx.rect(x, backingH - pipH, kickW, pipH);
         }
+        ctx.fill();
+      }
+
+      if (showSnares) {
+        ctx.fillStyle = "rgba(34, 211, 238, 0.65)";
+        ctx.beginPath();
+        for (const m of analysis.transients) {
+          if (m.band !== "snare" || m.time_sec > clipDurationSec) continue;
+          const x = Math.round(
+            (m.time_sec / Math.max(0.05, clipDurationSec)) * backingW,
+          );
+          ctx.rect(x, backingH - snareH, 1, snareH);
+        }
+        ctx.fill();
       }
     }
   }, [
     audioFile,
     analysis,
     clipDurationSec,
-    clipWidthPx,
+    backingWidthPx,
     showTransients,
     showKicks,
     showSnares,
@@ -260,7 +276,7 @@ function ClipWaveformCanvas({
       className="pointer-events-none absolute inset-0 w-full h-full"
     />
   );
-}
+});
 
 export function TimelineEditor({
   hideUndoRedo = false,
@@ -306,6 +322,8 @@ export function TimelineEditor({
   const upsertScene = useTaktStore((s) => s.upsertScene);
   const setTimelineTransport = useTaktStore((s) => s.setTimelineTransport);
   const setClipAudioAnalysis = useTaktStore((s) => s.setClipAudioAnalysis);
+  const pickNativeAudioFile = useTaktStore((s) => s.pickNativeAudioFile);
+  const loadAudioFileFromPath = useTaktStore((s) => s.loadAudioFileFromPath);
   const releaseScene = useTaktStore((s) => s.releaseScene);
   const undoShow = useTaktStore((s) => s.undoShow);
   const redoShow = useTaktStore((s) => s.redoShow);
@@ -351,10 +369,20 @@ export function TimelineEditor({
   const [displayPlayheadSec, setDisplayPlayheadSec] = useState(
     timelinePlayheadSec,
   );
+  const livePlayheadSecRef = useRef<number>(timelinePlayheadSec);
+  livePlayheadSecRef.current = timelinePlaying
+    ? livePlayheadSecRef.current
+    : displayPlayheadSec;
 
   const musicInputRef = useRef<HTMLInputElement | null>(null);
   const lanesScrollRef = useRef<HTMLDivElement | null>(null);
+  const trackHeaderColRef = useRef<HTMLDivElement | null>(null);
   const lanesViewportRef = useRef<HTMLDivElement | null>(null);
+  const playheadLineRef = useRef<HTMLDivElement | null>(null);
+  const playheadHitboxRef = useRef<HTMLDivElement | null>(null);
+  const playheadHandleRef = useRef<HTMLDivElement | null>(null);
+  const playheadInputRef = useRef<HTMLInputElement | null>(null);
+  const lastPlayheadInputSyncMsRef = useRef<number>(0);
   const localClipOverrideRef = useRef<{
     trackId: string;
     clipIndex: number;
@@ -428,6 +456,16 @@ export function TimelineEditor({
   );
   const pxPerSec = 24 * timelineZoom;
   const viewportWidthPx = Math.max(640, Math.round(viewportDurationSec * pxPerSec));
+  const timelineZoomRef = useRef(timelineZoom);
+  timelineZoomRef.current = timelineZoom;
+  const viewportDurationSecRef = useRef(viewportDurationSec);
+  viewportDurationSecRef.current = viewportDurationSec;
+  const viewportWidthPxRef = useRef(viewportWidthPx);
+  viewportWidthPxRef.current = viewportWidthPx;
+  const pendingZoomAnchorRef = useRef<{
+    timeSec: number;
+    anchorOffsetX: number;
+  } | null>(null);
 
   const effectiveBpm =
     currentTimeline?.tempo_map[0]?.bpm ?? (showState.bpm > 0 ? showState.bpm : 120);
@@ -455,15 +493,49 @@ export function TimelineEditor({
     return null;
   }, [currentTimeline, selectedClip]);
 
-  // Smooth 60fps playhead interpolation + auto-follow scroll
+  // Smooth 60fps playhead interpolation + auto-follow scroll (direct DOM ref updates: 0 React re-renders during playback)
   useEffect(() => {
+    const syncPlayheadDom = (sec: number, nowMs: number, forceInput: boolean) => {
+      livePlayheadSecRef.current = sec;
+      const pct = Math.max(
+        0,
+        Math.min(100, (sec / Math.max(0.1, viewportDurationSec)) * 100),
+      );
+      const leftCss = `${pct}%`;
+      if (playheadLineRef.current) {
+        playheadLineRef.current.style.left = leftCss;
+      }
+      if (playheadHitboxRef.current) {
+        playheadHitboxRef.current.style.left = leftCss;
+      }
+      if (playheadHandleRef.current) {
+        playheadHandleRef.current.style.left = leftCss;
+        const gridOff = currentTimeline?.grid_offset_sec ?? 0;
+        const bpm = currentTimeline?.tempo_map[0]?.bpm ?? showState.bpm ?? 120;
+        playheadHandleRef.current.textContent =
+          timeUnit === "beats"
+            ? `${secToGridBeats(sec, bpm, gridOff).toFixed(1)}b (${sec.toFixed(2)}s)`
+            : `${sec.toFixed(2)}s`;
+      }
+      if (
+        playheadInputRef.current &&
+        document.activeElement !== playheadInputRef.current &&
+        (forceInput || nowMs - lastPlayheadInputSyncMsRef.current >= 100)
+      ) {
+        lastPlayheadInputSyncMsRef.current = nowMs;
+        playheadInputRef.current.value = String(Number(sec.toFixed(2)));
+      }
+    };
+
     if (
       !timelinePlaying ||
       !currentTimeline ||
       activeTimelineId !== currentTimeline.id
     ) {
       if (clipDragState?.mode !== "scrub") {
+        livePlayheadSecRef.current = timelinePlayheadSec;
         setDisplayPlayheadSec(timelinePlayheadSec);
+        syncPlayheadDom(timelinePlayheadSec, 0, true);
       }
       return;
     }
@@ -478,10 +550,12 @@ export function TimelineEditor({
       if (contentDurationSec > 0 && rawHead >= contentDurationSec) {
         if (currentTimeline.loop_timeline) {
           const wrapped = rawHead % contentDurationSec;
+          syncPlayheadDom(wrapped, nowMs, true);
           setDisplayPlayheadSec(wrapped);
           void setTimelineTransport(currentTimeline.id, true, wrapped);
           return;
         } else {
+          syncPlayheadDom(contentDurationSec, nowMs, true);
           setDisplayPlayheadSec(contentDurationSec);
           void setTimelineTransport(currentTimeline.id, false, contentDurationSec);
           const ownerScene = showState.scenes.find(
@@ -494,17 +568,21 @@ export function TimelineEditor({
         }
       }
 
-      setDisplayPlayheadSec(rawHead);
+      syncPlayheadDom(rawHead, nowMs, false);
 
       // Auto-follow playhead so it stays inside the scrollable viewport
       const scroller = lanesScrollRef.current;
-      if (scroller && scroller.clientWidth > 50) {
-        const headX = (rawHead / Math.max(0.1, viewportDurationSec)) * viewportWidthPx;
+      const headerWidth = trackHeaderColRef.current?.offsetWidth ?? 0;
+      const visibleLanesW = scroller ? scroller.clientWidth - headerWidth : 0;
+      if (scroller && visibleLanesW > 50) {
+        const headX =
+          (rawHead / Math.max(0.1, viewportDurationSec)) *
+          viewportWidthPxRef.current;
         const leftEdge = scroller.scrollLeft;
-        const rightEdge = leftEdge + scroller.clientWidth;
-        const margin = Math.min(80, scroller.clientWidth * 0.15);
+        const rightEdge = leftEdge + visibleLanesW;
+        const margin = Math.min(80, visibleLanesW * 0.15);
         if (headX > rightEdge - margin || headX < leftEdge) {
-          scroller.scrollLeft = Math.max(0, headX - scroller.clientWidth * 0.25);
+          scroller.scrollLeft = Math.max(0, headX - visibleLanesW * 0.25);
         }
       }
 
@@ -516,6 +594,7 @@ export function TimelineEditor({
     if (typeof requestAnimationFrame === "function") {
       rafId = requestAnimationFrame(step);
     } else {
+      syncPlayheadDom(timelinePlayheadSec, 0, true);
       setDisplayPlayheadSec(timelinePlayheadSec);
     }
 
@@ -531,12 +610,13 @@ export function TimelineEditor({
     currentTimeline,
     releaseScene,
     setTimelineTransport,
+    showState.bpm,
     showState.scenes,
+    timeUnit,
     timelinePlayheadAnchorMs,
     timelinePlayheadSec,
     timelinePlaying,
     viewportDurationSec,
-    viewportWidthPx,
   ]);
 
   // Sync Web Audio playback without double-start jitter:
@@ -1405,14 +1485,13 @@ export function TimelineEditor({
     setSelectedClip({ trackId: targetTrack.id, clipIndex: insertedIndex });
   };
 
-  const dropAudioFileToTrack = async (
-    file: File,
+  const insertDecodedAudioClip = async (
+    asset: DecodedAudioAsset,
+    analysis: AudioAnalysisResult,
     trackId: string,
     atSec: number,
   ) => {
     if (!currentTimeline) return;
-    setTimelineNotice(null);
-    const { asset, analysis } = await decodeAudioFile(file, sensitivity);
     setClipAudioAnalysis(asset.key, analysis, currentTimeline.id);
 
     const hasExistingMusic = currentTimeline.tracks.some((tr) =>
@@ -1507,6 +1586,46 @@ export function TimelineEditor({
       );
       setSelectedClip({ trackId: targetTrack.id, clipIndex: insertedIndex });
     }
+  };
+
+  const dropAudioFileToTrack = async (
+    file: File,
+    trackId: string,
+    atSec: number,
+  ) => {
+    if (!currentTimeline) return;
+    setTimelineNotice(null);
+    const { asset, analysis } = await decodeAudioFile(file, sensitivity);
+    await insertDecodedAudioClip(asset, analysis, trackId, atSec);
+  };
+
+  const handleAddMusicClick = async () => {
+    if (!currentTimeline) return;
+    if (isTauriEnvironment()) {
+      setTimelineNotice(null);
+      const pickedPath = await pickNativeAudioFile("Select Music File");
+      if (!pickedPath) return;
+      try {
+        const { asset, analysis } = await loadAudioFileFromPath(
+          pickedPath,
+          sensitivity,
+        );
+        await insertDecodedAudioClip(
+          asset,
+          analysis,
+          "__new__",
+          displayPlayheadSec,
+        );
+      } catch (err) {
+        setTimelineNotice(
+          err instanceof Error
+            ? err.message
+            : "Failed to load selected audio file.",
+        );
+      }
+      return;
+    }
+    musicInputRef.current?.click();
   };
 
   const switchTrackType = async (trackId: string, nextType: TrackType) => {
@@ -1639,7 +1758,7 @@ export function TimelineEditor({
 
   const handleSplitClipAtPlayhead = async () => {
     if (!currentTimeline) return;
-    const tSplit = displayPlayheadSec;
+    const tSplit = livePlayheadSecRef.current;
 
     let targetTrackId = resolvedSelectedClip?.trackId ?? "";
     let targetClipIdx = resolvedSelectedClip?.clipIndex ?? -1;
@@ -1985,32 +2104,91 @@ export function TimelineEditor({
     setTimelineNotice(null);
   };
 
-  const handleViewportWheel = (e: WheelEvent<HTMLDivElement>) => {
-    if (!e.ctrlKey) return;
-    e.preventDefault();
+  const requestZoomChange = useCallback(
+    (computeNextZoom: (prevZoom: number) => number, anchorOffsetX?: number) => {
+      const prevZoom = timelineZoomRef.current;
+      const nextZoom = Math.max(
+        0.2,
+        Math.min(8.0, Number(computeNextZoom(prevZoom).toFixed(2))),
+      );
+      if (nextZoom === prevZoom) return;
+
+      const scroller = lanesScrollRef.current;
+      const viewportEl = lanesViewportRef.current;
+      if (scroller) {
+        const headerWidth = trackHeaderColRef.current?.offsetWidth ?? 0;
+        const visibleLanesW = Math.max(0, scroller.clientWidth - headerWidth);
+        const resolvedOffsetX =
+          anchorOffsetX !== undefined && Number.isFinite(anchorOffsetX)
+            ? anchorOffsetX
+            : visibleLanesW / 2;
+        const measuredViewportW = viewportEl?.getBoundingClientRect().width ?? 0;
+        const curViewportW =
+          measuredViewportW > 10
+            ? measuredViewportW
+            : Math.max(visibleLanesW, viewportWidthPxRef.current);
+        const curDur = Math.max(0.1, viewportDurationSecRef.current);
+        const timeSec =
+          ((scroller.scrollLeft + resolvedOffsetX) / Math.max(1, curViewportW)) *
+          curDur;
+        pendingZoomAnchorRef.current = {
+          timeSec,
+          anchorOffsetX: resolvedOffsetX,
+        };
+      }
+
+      timelineZoomRef.current = nextZoom;
+      setTimelineZoom(nextZoom);
+    },
+    [],
+  );
+
+  // Synchronously adjust scrollLeft before browser paint so zooming never flashes 1 frame at the old scroll offset
+  useLayoutEffect(() => {
+    const anchor = pendingZoomAnchorRef.current;
+    if (!anchor) return;
+    pendingZoomAnchorRef.current = null;
+
     const scroller = lanesScrollRef.current;
-    const rect = scroller?.getBoundingClientRect();
-    const cursorOffsetX =
-      rect && Number.isFinite(e.clientX) ? e.clientX - rect.left : 0;
-    const prevScrollLeft = scroller?.scrollLeft ?? 0;
-    const prevZoom = timelineZoom;
-    const factor = e.deltaY < 0 ? 1.25 : 0.8;
-    const nextZoom = Math.max(
-      0.2,
-      Math.min(8.0, Number((prevZoom * factor).toFixed(2))),
+    if (!scroller) return;
+    const headerWidth = trackHeaderColRef.current?.offsetWidth ?? 0;
+    const visibleLanesW = Math.max(0, scroller.clientWidth - headerWidth);
+    const viewportEl = lanesViewportRef.current;
+    const measuredW = viewportEl?.getBoundingClientRect().width ?? 0;
+    const nextViewportW =
+      measuredW > 10 ? measuredW : Math.max(visibleLanesW, viewportWidthPx);
+    const curDur = Math.max(0.1, viewportDurationSec);
+    scroller.scrollLeft = Math.max(
+      0,
+      (anchor.timeSec / curDur) * nextViewportW - anchor.anchorOffsetX,
     );
-    if (nextZoom === prevZoom) return;
-    setTimelineZoom(nextZoom);
-    if (scroller) {
-      const ratio = nextZoom / prevZoom;
-      requestAnimationFrame(() => {
-        scroller.scrollLeft = Math.max(
-          0,
-          (prevScrollLeft + cursorOffsetX) * ratio - cursorOffsetX,
-        );
-      });
-    }
-  };
+  }, [timelineZoom, viewportWidthPx, viewportDurationSec]);
+
+  // Attach a non-passive wheel listener so Ctrl/Cmd+Wheel cleanly prevents native WebView/browser zoom
+  const hasCurrentTimeline = Boolean(currentTimeline);
+  useEffect(() => {
+    const scroller = lanesScrollRef.current;
+    if (!scroller) return;
+
+    const onWheel = (e: globalThis.WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      if (e.deltaY === 0) return;
+      const rect = scroller.getBoundingClientRect();
+      const headerWidth = trackHeaderColRef.current?.offsetWidth ?? 0;
+      const visibleLanesW = Math.max(0, scroller.clientWidth - headerWidth);
+      const cursorOffsetX = Number.isFinite(e.clientX)
+        ? e.clientX - (rect.left + headerWidth)
+        : visibleLanesW / 2;
+      const factor = e.deltaY < 0 ? 1.25 : 0.8;
+      requestZoomChange((prevZoom) => prevZoom * factor, cursorOffsetX);
+    };
+
+    scroller.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      scroller.removeEventListener("wheel", onWheel);
+    };
+  }, [hasCurrentTimeline, requestZoomChange]);
 
   const scrubFromClientX = (clientX: number) => {
     if (!currentTimeline || !Number.isFinite(clientX)) return;
@@ -2027,21 +2205,43 @@ export function TimelineEditor({
     void setTimelineTransport(currentTimeline.id, timelinePlaying, sec);
   };
 
-  const getBlockColors = (blockId: string | null): [string, string] | null => {
-    if (!blockId) return null;
-    const blk = showState.fx_library.find((b) => b.id === blockId);
-    if (!blk) return null;
-    for (const el of blk.elements) {
-      if (el.kind === "scene_sequence") continue;
-      if (el.palette_ref) {
-        const pal = showState.color_palettes.find((p) => p.id === el.palette_ref);
-        if (pal) return [pal.hex_start, pal.hex_end];
-      }
-      if (el.kind === "static_trait" && el.trait === "color" && el.hex_start) {
-        return [el.hex_start, el.hex_end ?? el.hex_start];
+  const blockColorsById = useMemo(() => {
+    const palById = new Map(showState.color_palettes.map((p) => [p.id, p]));
+    const map = new Map<string, [string, string]>();
+    for (const blk of showState.fx_library) {
+      for (const el of blk.elements) {
+        if (el.kind === "scene_sequence") continue;
+        if (el.palette_ref) {
+          const pal = palById.get(el.palette_ref);
+          if (pal) {
+            map.set(blk.id, [pal.hex_start, pal.hex_end]);
+            break;
+          }
+        }
+        if (el.kind === "static_trait" && el.trait === "color" && el.hex_start) {
+          map.set(blk.id, [el.hex_start, el.hex_end ?? el.hex_start]);
+          break;
+        }
       }
     }
-    return null;
+    return map;
+  }, [showState.color_palettes, showState.fx_library]);
+
+  const ownerSceneByBlockId = useMemo(() => {
+    const map = new Map<string, (typeof showState.scenes)[number]>();
+    for (const sc of showState.scenes) {
+      for (const ref of sc.block_refs) {
+        if (!map.has(ref)) {
+          map.set(ref, sc);
+        }
+      }
+    }
+    return map;
+  }, [showState.scenes]);
+
+  const getBlockColors = (blockId: string | null): [string, string] | null => {
+    if (!blockId) return null;
+    return blockColorsById.get(blockId) ?? null;
   };
 
   const playheadPct = Math.max(
@@ -2169,18 +2369,22 @@ export function TimelineEditor({
             >
               <Clock className="w-3 h-3 text-ember" />
               <input
+                ref={playheadInputRef}
                 aria-label="Timeline Playhead Sec"
                 type="number"
                 min={0}
                 step={0.1}
                 value={Number(displayPlayheadSec.toFixed(2))}
-                onChange={(e) =>
+                onChange={(e) => {
+                  const next = Number(e.target.value) || 0;
+                  livePlayheadSecRef.current = next;
+                  setDisplayPlayheadSec(next);
                   void setTimelineTransport(
                     currentTimeline.id,
                     timelinePlaying,
-                    Number(e.target.value) || 0,
-                  )
-                }
+                    next,
+                  );
+                }}
                 className="w-12 bg-ink border border-steel rounded px-1 py-0.5 font-mono text-[10px] text-frost"
               />
             </label>
@@ -2227,11 +2431,7 @@ export function TimelineEditor({
               <button
                 type="button"
                 data-testid="timeline-zoom-out"
-                onClick={() =>
-                  setTimelineZoom((z) =>
-                    Math.max(0.2, Number((z - 0.25).toFixed(2))),
-                  )
-                }
+                onClick={() => requestZoomChange((z) => z - 0.25)}
                 title="Zoom Out"
                 className="p-0.5 text-mist hover:text-ember"
               >
@@ -2240,7 +2440,7 @@ export function TimelineEditor({
               <button
                 type="button"
                 data-testid="timeline-zoom-reset"
-                onClick={() => setTimelineZoom(1.0)}
+                onClick={() => requestZoomChange(() => 1.0)}
                 title="Reset Zoom to 1.0x"
                 className="px-1 text-frost"
               >
@@ -2249,11 +2449,7 @@ export function TimelineEditor({
               <button
                 type="button"
                 data-testid="timeline-zoom-in"
-                onClick={() =>
-                  setTimelineZoom((z) =>
-                    Math.min(8.0, Number((z + 0.5).toFixed(2))),
-                  )
-                }
+                onClick={() => requestZoomChange((z) => z + 0.5)}
                 title="Zoom In"
                 className="p-0.5 text-mist hover:text-ember"
               >
@@ -2645,7 +2841,7 @@ export function TimelineEditor({
             <button
               type="button"
               data-testid="timeline-add-music-btn"
-              onClick={() => musicInputRef.current?.click()}
+              onClick={() => void handleAddMusicClick()}
               title="Add Music Track from Audio File (or drag and drop MP3/WAV/OGG/FLAC onto any track)"
               className="flex items-center gap-1 px-1.5 py-1 rounded border border-steel bg-ink hover:border-cobalt font-mono text-[10px] text-frost"
             >
@@ -2732,10 +2928,19 @@ export function TimelineEditor({
           </div>
         )}
 
-        <div className="flex-1 min-h-0 flex overflow-y-auto bg-pitch">
-          {/* Left Sticky Track Header Column */}
-          <div className="w-36 shrink-0 border-r border-steel bg-slate-dark flex flex-col">
-            <div className="h-7 border-b border-steel px-2 flex items-center justify-between font-mono text-[9px] text-fog shrink-0">
+        {/* Single Unified 2D Scroll Viewport (Sticky Track Headers + Sticky Ruler) */}
+        <div
+          ref={lanesScrollRef}
+          data-testid="timeline-scroll-container"
+          className="flex-1 min-h-0 overflow-auto bg-pitch"
+        >
+          <div className="flex min-w-full min-h-full w-max">
+            {/* Left Sticky Track Header Column */}
+            <div
+              ref={trackHeaderColRef}
+              className="sticky left-0 z-30 w-36 shrink-0 border-r border-steel bg-slate-dark flex flex-col"
+            >
+              <div className="sticky top-0 z-40 h-7 border-b border-steel bg-slate-dark px-2 flex items-center justify-between font-mono text-[9px] text-fog shrink-0">
               <span>
                 {timeUnit === "beats"
                   ? `BARS (${Math.ceil(secToBeats(viewportDurationSec) / 4)})`
@@ -2802,19 +3007,18 @@ export function TimelineEditor({
             </div>
           </div>
 
-          {/* Right Scrollable Infinite Time-Aligned Viewport (Ctrl+Wheel Zoom) */}
+          {/* Right Time-Aligned Viewport (Ctrl+Wheel Zoom) */}
           <div
-            ref={lanesScrollRef}
-            onWheel={handleViewportWheel}
-            className="flex-1 min-w-0 overflow-x-auto"
+            ref={lanesViewportRef}
+            style={{
+              width: `${viewportWidthPx}px`,
+              minWidth: `${viewportWidthPx}px`,
+            }}
+            className="relative grow shrink-0 flex flex-col"
           >
-            <div
-              ref={lanesViewportRef}
-              style={{ width: `${viewportWidthPx}px` }}
-              className="relative flex flex-col min-w-full"
-            >
               {/* Full-Height Vertical Playhead Cursor */}
               <div
+                ref={playheadLineRef}
                 data-testid="nle-playhead-line"
                 style={{ left: `${playheadPct}%` }}
                 className="pointer-events-none absolute top-0 bottom-0 w-0.5 bg-ember z-20"
@@ -2854,7 +3058,7 @@ export function TimelineEditor({
                     initialFadeOutSec: 0,
                   });
                 }}
-                className={`relative h-7 shrink-0 border-b border-steel bg-ink select-none ${
+                className={`sticky top-0 z-[25] h-7 shrink-0 border-b border-steel bg-ink select-none ${
                   clipDragState?.mode === "scrub"
                     ? "cursor-ew-resize"
                     : "cursor-pointer"
@@ -2875,10 +3079,12 @@ export function TimelineEditor({
                   </div>
                 ))}
                 <div
+                  ref={playheadHitboxRef}
                   style={{ left: `${playheadPct}%` }}
                   className="absolute top-0 bottom-0 w-3 -translate-x-1/2 cursor-ew-resize z-10"
                 />
                 <div
+                  ref={playheadHandleRef}
                   data-testid="timeline-playhead-handle"
                   style={{ left: `${playheadPct}%` }}
                   className="absolute top-0 -translate-x-1/2 px-1 bg-ember text-void font-mono text-[9px] font-bold rounded-b whitespace-nowrap cursor-ew-resize z-20"
@@ -2889,8 +3095,53 @@ export function TimelineEditor({
                 </div>
               </div>
 
-              {/* Track Clip Lanes */}
-              {currentTimeline.tracks.map((track) => (
+              {/* Track Clip Lanes + Shared Full-Height Beat & Transient Backdrop */}
+              <div className="relative flex flex-col bg-void">
+                {(showBeats || projectTransients) && (
+                  <div className="pointer-events-none absolute inset-0 z-0 overflow-hidden">
+                    {/* Beat Grid Vertical Lines (rendered once across all tracks) */}
+                    {showBeats &&
+                      beatGridMarkers.map((bt, bIdx) => {
+                        const isBar = bIdx % 4 === 0;
+                        if (!isBar && pxPerSec < 18) return null;
+                        return (
+                          <div
+                            key={`bg-${bIdx}`}
+                            data-testid={isBar ? "beat-grid-bar" : "beat-grid-sub"}
+                            style={{ left: `${(bt / viewportDurationSec) * 100}%` }}
+                            className={`pointer-events-none absolute top-0 bottom-0 ${
+                              isBar
+                                ? "border-l-2 border-frost/35"
+                                : "border-l border-steel/45"
+                            }`}
+                          />
+                        );
+                      })}
+
+                    {/* Optional Projected Transient Guidelines (Amber = Kick, Cyan = Snare) */}
+                    {projectTransients &&
+                      timelineTransients
+                        .filter((m) =>
+                          m.band === "kick" ? showKicks : showSnares,
+                        )
+                        .map((m, mIdx) => (
+                          <div
+                            key={`tr-${mIdx}`}
+                            data-testid={`projected-transient-${m.band}`}
+                            style={{
+                              left: `${(m.time_sec / viewportDurationSec) * 100}%`,
+                            }}
+                            className={`pointer-events-none absolute top-0 bottom-0 border-l ${
+                              m.band === "kick"
+                                ? "border-amber-400/55"
+                                : "border-cyan-400/35"
+                            }`}
+                          />
+                        ))}
+                  </div>
+                )}
+
+                {currentTimeline.tracks.map((track) => (
                 <div
                   key={track.id}
                   data-testid={`track-lane-${track.id}`}
@@ -2911,7 +3162,7 @@ export function TimelineEditor({
                     const frac =
                       rect.width > 10 && Number.isFinite(e.clientX)
                         ? Math.max(0, Math.min(1, (e.clientX - rect.left) / vw))
-                        : displayPlayheadSec / Math.max(0.1, viewportDurationSec);
+                        : livePlayheadSecRef.current / Math.max(0.1, viewportDurationSec);
                     const dropSec = Number((frac * viewportDurationSec).toFixed(3));
 
                     const droppedFile = e.dataTransfer?.files?.[0];
@@ -2930,49 +3181,9 @@ export function TimelineEditor({
                     if (!sid) return;
                     void dropSceneToTrack(sid, track.id, dropSec);
                   }}
-                  className="relative h-14 shrink-0 border-b border-steel/70 bg-void overflow-hidden select-none"
+                  className="relative z-[1] h-14 shrink-0 border-b border-steel/70 bg-transparent overflow-hidden select-none"
                   title="Double-click or drop a Scene / Audio file here; drag clip to move, Alt+Drag to duplicate, or drag edges to trim/stretch"
                 >
-                  {/* Beat Grid Vertical Lines (Neutral slate/white: bold bars, subtle beats) */}
-                  {showBeats &&
-                    beatGridMarkers.map((bt, bIdx) => {
-                      const isBar = bIdx % 4 === 0;
-                      if (!isBar && pxPerSec < 18) return null;
-                      return (
-                        <div
-                          key={`bg-${bIdx}`}
-                          data-testid={isBar ? "beat-grid-bar" : "beat-grid-sub"}
-                          style={{ left: `${(bt / viewportDurationSec) * 100}%` }}
-                          className={`pointer-events-none absolute top-0 bottom-0 ${
-                            isBar
-                              ? "border-l-2 border-frost/35"
-                              : "border-l border-steel/45"
-                          }`}
-                        />
-                      );
-                    })}
-
-                  {/* Optional Projected Transient Guidelines (Amber = Kick, Cyan = Snare) */}
-                  {projectTransients &&
-                    timelineTransients
-                      .filter((m) =>
-                        m.band === "kick" ? showKicks : showSnares,
-                      )
-                      .map((m, mIdx) => (
-                        <div
-                          key={`tr-${mIdx}`}
-                          data-testid={`projected-transient-${m.band}`}
-                          style={{
-                            left: `${(m.time_sec / viewportDurationSec) * 100}%`,
-                          }}
-                          className={`pointer-events-none absolute top-0 bottom-0 border-l ${
-                            m.band === "kick"
-                              ? "border-amber-400/55"
-                              : "border-cyan-400/35"
-                          }`}
-                        />
-                      ))}
-
                   {/* Interactive Clip Blocks */}
                   {track.clips.map((rawClip, idx) => {
                     const ov = localClipOverrideRef.current;
@@ -3004,9 +3215,7 @@ export function TimelineEditor({
                     const colors = getBlockColors(clip.ref_block);
                     const ownerScene =
                       !isMusicClip && clip.ref_block
-                        ? showState.scenes.find((s) =>
-                            s.block_refs.includes(clip.ref_block!),
-                          )
+                        ? ownerSceneByBlockId.get(clip.ref_block)
                         : undefined;
                     const bankColor = ownerScene?.bank
                       ? bankColors[ownerScene.bank.trim()]
@@ -3073,7 +3282,12 @@ export function TimelineEditor({
                             audioFile={clip.audio_file}
                             analysis={clipAudioAnalysis}
                             clipDurationSec={clip.duration_sec}
-                            clipWidthPx={(widthPct / 100) * viewportWidthPx}
+                            backingWidthPx={quantizeWaveformBackingWidth(
+                              (widthPct / 100) * viewportWidthPx,
+                              typeof window !== "undefined"
+                                ? Math.min(2, window.devicePixelRatio || 1)
+                                : 1,
+                            )}
                             showTransients={showTransients}
                             showKicks={showKicks}
                             showSnares={showSnares}
@@ -3362,8 +3576,12 @@ export function TimelineEditor({
                           />
                           <div className="flex items-center justify-between gap-1 text-[10px] font-mono text-frost bg-void/60 rounded px-1">
                             {isMusicClip ? (
-                              <span className="truncate">
-                                [MUSIC] {clip.audio_file} (
+                              <span
+                                className="truncate"
+                                title={clip.audio_file ?? undefined}
+                              >
+                                [MUSIC]{" "}
+                                {extractAudioFileName(clip.audio_file ?? "")} (
                                 {clip.duration_sec.toFixed(1)}s
                                 {clipAudioAnalysis
                                   ? ` · ${Math.round(clipAudioAnalysis.estimated_bpm)} BPM`
@@ -3551,7 +3769,8 @@ export function TimelineEditor({
                     );
                   })()}
                 </div>
-              ))}
+                ))}
+              </div>
 
               {/* Drop Zone Below Last Track */}
               <div

@@ -2,12 +2,13 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "../../test/testFixtures";
 
 async function mountStudioWithTube() {
   await useTaktStore
     .getState()
     .patchFixtures(
-      "age/rlcv3_8_segment_tube.json",
+      TEST_TUBE_8SEG_ID,
       "34ch Pixel Mode",
       "Tube Dock",
       1,
@@ -25,6 +26,7 @@ describe("Palettes, Static Dock Controls & Live Mixer Normal Usage", () => {
         MouseEvent;
     }
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("edits RGB channels, preserves color across toggle off/on, and picks color via HS square", async () => {

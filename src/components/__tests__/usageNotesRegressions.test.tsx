@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../../App";
 import { evaluateSpatialShader2DPhase } from "../../lib/mixerLogic";
 import { useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "../../test/testFixtures";
 
 describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
   beforeEach(() => {
@@ -11,6 +12,7 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
         MouseEvent;
     }
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("L2: hides 2D viewer cell numbers when fixture is too small so text does not overlap", async () => {
@@ -49,7 +51,7 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
       await useTaktStore
         .getState()
         .patchFixtures(
-          "age/rlcv3_8_segment_tube.json",
+          TEST_TUBE_8SEG_ID,
           "34ch Pixel Mode",
           "Tiny Tube",
           1,
@@ -104,7 +106,7 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Curve",
         1,
@@ -156,7 +158,7 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Map",
         1,
@@ -321,7 +323,7 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
 
     // L9: Clicking a preset keeps Visual Builder open (Raw JSON Editor not forced)
     await act(async () => {
-      fireEvent.click(screen.getByText("RLCV3 8-Segment RGBW Tube"));
+      fireEvent.click(screen.getByText("Test 8-Segment RGBW Tube"));
       await Promise.resolve();
     });
     expect(screen.queryByLabelText("Raw OFL JSON Editor")).not.toBeInTheDocument();
@@ -369,7 +371,7 @@ describe("Usage Notes Automated Regressions (docs/usage_notes.md)", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Gizmo",
         2,

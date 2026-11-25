@@ -5,10 +5,12 @@ import {
   createDefaultBuilderDraft,
 } from "../../lib/oflBuilder";
 import { parkKey, useTaktStore } from "../useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "../../test/testFixtures";
 
 describe("useTaktStore", () => {
   beforeEach(() => {
     useTaktStore.getState().resetForTest();
+    seedTestFixturesInStore();
   });
 
   it("applies decoded binary frames to universe DMX buffers and telemetry", () => {
@@ -76,9 +78,11 @@ describe("useTaktStore", () => {
     });
   });
 
-  it("loads shipped OFL fixtures, validates, saves, and deletes user fixtures", async () => {
+  it("loads the standard RLCV3 profile, validates, saves, and deletes user fixtures", async () => {
+    useTaktStore.getState().resetForTest();
     await useTaktStore.getState().loadFixtures();
-    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(2);
+    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(1);
+    expect(useTaktStore.getState().fixtureSummaries[0].id).toBe("standard/rlcv3.json");
 
     const draft = createDefaultBuilderDraft();
     draft.name = "Bench Test Bar";
@@ -87,7 +91,7 @@ describe("useTaktStore", () => {
       .getState()
       .saveUserFixture("Bench Test Bar", validJson);
     expect(saveRes.ok).toBe(true);
-    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(3);
+    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(2);
 
     const badSave = await useTaktStore
       .getState()
@@ -97,7 +101,7 @@ describe("useTaktStore", () => {
     await useTaktStore
       .getState()
       .deleteUserFixture("user/bench_test_bar.json");
-    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(2);
+    expect(useTaktStore.getState().fixtureSummaries).toHaveLength(1);
   });
 
   it("patches split fixtures, undoes/redoes, coalesces grid drags, and exports/imports XML", async () => {
@@ -131,7 +135,7 @@ describe("useTaktStore", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Left",
         1,
@@ -185,7 +189,7 @@ describe("useTaktStore", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube Live",
         1,
@@ -265,7 +269,7 @@ describe("useTaktStore", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube FX",
         1,
@@ -344,7 +348,7 @@ describe("useTaktStore", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube TL",
         1,
@@ -435,7 +439,7 @@ describe("useTaktStore", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Split Tube",
         1,
@@ -463,7 +467,7 @@ describe("useTaktStore", () => {
     await useTaktStore
       .getState()
       .patchFixtures(
-        "age/rlcv3_8_segment_tube.json",
+        TEST_TUBE_8SEG_ID,
         "34ch Pixel Mode",
         "Tube UX",
         1,
@@ -801,7 +805,7 @@ describe("useTaktStore", () => {
       await useTaktStore
         .getState()
         .patchFixtures(
-          "age/rlcv3_8_segment_tube.json",
+          TEST_TUBE_8SEG_ID,
           "34ch Pixel Mode",
           "Edited Tube",
           1,

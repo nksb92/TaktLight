@@ -103,6 +103,35 @@ function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: n
   return { h, s, v: max };
 }
 
+function PalettesLiveCellPreview() {
+  const compiledCells = useTaktStore((s) => s.compiledCells);
+  const cellPreviewRgbd = useTaktStore((s) => s.cellPreviewRgbd);
+  return (
+    <div
+      data-testid="scene-live-cell-preview"
+      className="bg-slate border border-steel rounded-panel p-2.5 flex flex-wrap gap-1.5"
+    >
+      {compiledCells.map((cell, idx) => {
+        const base = idx * 4;
+        const r = cellPreviewRgbd[base] ?? 0;
+        const g = cellPreviewRgbd[base + 1] ?? 0;
+        const b = cellPreviewRgbd[base + 2] ?? 0;
+        const d = cellPreviewRgbd[base + 3] ?? 0;
+        const scale = d / 255;
+        return (
+          <div
+            key={`${cell.fixture_id}-${cell.cell_index}`}
+            className="w-8 h-8 rounded border border-steel"
+            style={{
+              backgroundColor: `rgb(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)})`,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 export function PalettesAndControls({
   hideUndoRedo = false,
   hideGroups = false,
@@ -115,7 +144,6 @@ export function PalettesAndControls({
   const showState = useTaktStore((s) => s.showState);
   const liveLayers = useTaktStore((s) => s.liveLayers);
   const compiledCells = useTaktStore((s) => s.compiledCells);
-  const cellPreviewRgbd = useTaktStore((s) => s.cellPreviewRgbd);
   const fixtureDetailsCache = useTaktStore((s) => s.fixtureDetailsCache);
   const activeGroupFilterId = useTaktStore((s) => s.activeGroupFilterId);
   const selectedSceneId = useTaktStore((s) => s.selectedSceneId);
@@ -1027,28 +1055,7 @@ export function PalettesAndControls({
           </div>
         </section>
 
-        <div
-          data-testid="scene-live-cell-preview"
-          className="bg-slate border border-steel rounded-panel p-2.5 flex flex-wrap gap-1.5"
-        >
-          {compiledCells.map((cell, idx) => {
-            const base = idx * 4;
-            const r = cellPreviewRgbd[base] ?? 0;
-            const g = cellPreviewRgbd[base + 1] ?? 0;
-            const b = cellPreviewRgbd[base + 2] ?? 0;
-            const d = cellPreviewRgbd[base + 3] ?? 0;
-            const scale = d / 255;
-            return (
-              <div
-                key={`${cell.fixture_id}-${cell.cell_index}`}
-                className="w-8 h-8 rounded border border-steel"
-                style={{
-                  backgroundColor: `rgb(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)})`,
-                }}
-              />
-            );
-          })}
-        </div>
+        <PalettesLiveCellPreview />
       </div>
     );
   }

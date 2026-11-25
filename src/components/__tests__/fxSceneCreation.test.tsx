@@ -2,12 +2,14 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { useTaktStore } from "../../store/useTaktStore";
+import { seedTestFixturesInStore, TEST_TUBE_8SEG_ID } from "../../test/testFixtures";
 
 async function setupStudioWithTube() {
+  seedTestFixturesInStore();
   await useTaktStore
     .getState()
     .patchFixtures(
-      "age/rlcv3_8_segment_tube.json",
+      TEST_TUBE_8SEG_ID,
       "34ch Pixel Mode",
       "Tube FX",
       1,

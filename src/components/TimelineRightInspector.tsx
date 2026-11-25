@@ -328,10 +328,13 @@ export function TimelineRightInspector({
               ) : (
                 <div
                   className="flex flex-col gap-1"
-                  title="Decoded audio track file for this music clip"
+                  title={resolvedClip.clip.audio_file}
                 >
                   <span className="text-fog">Audio File</span>
-                  <div className="bg-pitch border border-cobalt/50 rounded px-2 py-1 text-xs text-frost truncate">
+                  <div
+                    className="bg-pitch border border-cobalt/50 rounded px-2 py-1 text-xs text-frost truncate"
+                    title={resolvedClip.clip.audio_file}
+                  >
                     {resolvedClip.clip.audio_file}
                   </div>
                 </div>

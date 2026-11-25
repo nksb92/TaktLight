@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::mixer::color::{CompiledColorPalette, CompiledDimmerPalette};
+use crate::mixer::quantizer::resolve_slot_oklab;
+use crate::ofl::expander::ChannelRole;
 use crate::ofl::library::FixtureLibrary;
 use crate::state::plan::{CompiledCell, CompiledChannelSlot, CompiledFixture, CompiledGroup, RenderPlan};
 
@@ -68,6 +70,13 @@ pub fn compile_render_plan(
                 }
             }
 
+            let wheel_slot_oklabs = match &ch.role {
+                ChannelRole::WheelSlot { slots, .. } => {
+                    slots.iter().map(resolve_slot_oklab).collect()
+                }
+                _ => Vec::new(),
+            };
+
             compiled_channels.push(CompiledChannelSlot {
                 universe_id,
                 universe_index,
@@ -77,10 +86,11 @@ pub fn compile_render_plan(
                 target: ch.target.clone(),
                 role: ch.role.clone(),
                 fine_channel_offset: ch.fine_channel_offset,
+                wheel_slot_oklabs,
             });
         }
 
-        compiled_fixtures.push(CompiledFixture {
+        let mut compiled_fx = CompiledFixture {
             id: inst.id.clone(),
             name: inst.name.clone(),
             profile: inst.profile.clone(),
@@ -89,7 +99,14 @@ pub fn compile_render_plan(
             cell_start,
             cell_count,
             channels: compiled_channels,
-        });
+            has_hardware_shutter: false,
+            fixture_has_master_intensity: false,
+            has_fixture_white: false,
+            cell_has_dedicated_intensity: Vec::new(),
+            cell_has_white: Vec::new(),
+        };
+        compiled_fx.compute_precomputed_flags();
+        compiled_fixtures.push(compiled_fx);
     }
 
     let mut compiled_groups = Vec::with_capacity(show.groups.len());
@@ -212,11 +229,11 @@ mod tests {
 
     #[test]
     fn compiles_split_fixture_with_per_channel_universe_address_and_group_ordering() {
-        let lib = FixtureLibrary::load(None);
+        let lib = FixtureLibrary::load_with_test_fixtures();
         let mut show = ShowState::default();
         show.patch.push(FixtureInstance {
             id: "fx_201".into(),
-            profile: "age/rlcv3_8_segment_tube.json".into(),
+            profile: "user/test_tube_8seg.json".into(),
             mode: "34ch Pixel Mode".into(),
             name: "Tube Left".into(),
             universe: 1,

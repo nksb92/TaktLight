@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::mixer::color::{CompiledColorPalette, CompiledDimmerPalette};
 use crate::mixer::traits::SmartControlLayer;
 use crate::ofl::expander::{ChannelRole, ChannelTarget};
+use crate::ofl::model::OflColor;
 use crate::show::patch::FixtureCalibration;
 use crate::show::spatial::OrderRule;
 use crate::show::xml::{FxBlockDef, SceneDef, TimelineDef};
@@ -76,6 +77,8 @@ pub struct CompiledChannelSlot {
     pub target: ChannelTarget,
     pub role: ChannelRole,
     pub fine_channel_offset: Option<usize>,
+    #[serde(default)]
+    pub wheel_slot_oklabs: Vec<Option<[f32; 3]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,6 +91,58 @@ pub struct CompiledFixture {
     pub cell_start: usize,
     pub cell_count: u16,
     pub channels: Vec<CompiledChannelSlot>,
+    #[serde(default)]
+    pub has_hardware_shutter: bool,
+    #[serde(default)]
+    pub fixture_has_master_intensity: bool,
+    #[serde(default)]
+    pub has_fixture_white: bool,
+    #[serde(default)]
+    pub cell_has_dedicated_intensity: Vec<bool>,
+    #[serde(default)]
+    pub cell_has_white: Vec<bool>,
+}
+
+impl CompiledFixture {
+    pub fn compute_precomputed_flags(&mut self) {
+        self.has_hardware_shutter = self
+            .channels
+            .iter()
+            .any(|c| matches!(c.role, ChannelRole::ShutterStrobe { .. }));
+        self.fixture_has_master_intensity = self
+            .channels
+            .iter()
+            .any(|c| c.target == ChannelTarget::Fixture && c.role == ChannelRole::Intensity);
+        self.has_fixture_white = self.channels.iter().any(|c| {
+            matches!(
+                c.role,
+                ChannelRole::ColorIntensity {
+                    color: OflColor::White | OflColor::WarmWhite | OflColor::ColdWhite
+                }
+            )
+        });
+        let n = self.cell_count as usize;
+        self.cell_has_dedicated_intensity = vec![false; n];
+        self.cell_has_white = vec![false; n];
+        for ch in &self.channels {
+            if let ChannelTarget::Cell { cell_index, .. } = ch.target {
+                let idx = cell_index as usize;
+                if idx < n {
+                    if ch.role == ChannelRole::Intensity {
+                        self.cell_has_dedicated_intensity[idx] = true;
+                    }
+                    if matches!(
+                        ch.role,
+                        ChannelRole::ColorIntensity {
+                            color: OflColor::White | OflColor::WarmWhite | OflColor::ColdWhite
+                        }
+                    ) {
+                        self.cell_has_white[idx] = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

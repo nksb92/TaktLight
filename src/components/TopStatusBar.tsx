@@ -15,7 +15,8 @@ import {
   ShieldAlert,
   XCircle,
 } from "lucide-react";
-import { type ChangeEvent, useEffect, useRef, useState } from "react";
+import { type ChangeEvent, memo, useEffect, useRef, useState } from "react";
+import pkg from "../../package.json";
 import {
   AdapterSelection,
   isTauriEnvironment,
@@ -37,20 +38,56 @@ function keyToSelection(key: string): AdapterSelection {
   return { mode: "named", name, subnet_cidr };
 }
 
-export function TopStatusBar() {
+const EngineTelemetryPill = memo(function EngineTelemetryPill() {
   const telemetry = useTaktStore((s) => s.telemetry);
   const jitterSamplesUs = useTaktStore((s) => s.jitterSamplesUs);
+
+  const meanMs = (telemetry.meanUs / 1000).toFixed(2);
+  const p99Ms = (telemetry.p99JitterUs / 1000).toFixed(2);
+  const hz =
+    telemetry.meanUs > 0
+      ? (1_000_000 / telemetry.meanUs).toFixed(1)
+      : "44.0";
+  const recentDrops = jitterSamplesUs.filter((dt) => dt > 34_090.5).length;
+  const timingHealthy =
+    jitterSamplesUs.length > 0 ? recentDrops === 0 : telemetry.droppedFrames === 0;
+
+  return (
+    <HelpTooltip text="Real-time 44 Hz DMX engine loop rate, mean frame interval, and p99 jitter.">
+      <div
+        className={`flex items-center gap-2 px-3 py-1 rounded-md border font-mono text-xs ${
+          timingHealthy
+            ? "bg-pitch border-pine text-mist"
+            : "bg-pitch border-signal text-frost"
+        }`}
+      >
+        <span
+          className={`w-2 h-2 rounded-full ${
+            timingHealthy ? "bg-pine" : "bg-signal animate-pulse"
+          }`}
+        />
+        <span>
+          {hz} Hz | {meanMs} ms ± {p99Ms} ms
+        </span>
+      </div>
+    </HelpTooltip>
+  );
+});
+
+export function TopStatusBar() {
   const parkedChannels = useTaktStore((s) => s.parkedChannels);
   const blackout = useTaktStore((s) => s.blackout);
   const grandMaster = useTaktStore((s) => s.grandMaster);
   const interfaces = useTaktStore((s) => s.interfaces);
   const adapterSelection = useTaktStore((s) => s.adapterSelection);
   const isOffline = useTaktStore((s) => s.isOffline);
+  const lastNetworkError = useTaktStore((s) => s.lastNetworkError);
   const outputEnabled = useTaktStore((s) => s.outputEnabled);
   const discoveryAvailable = useTaktStore((s) => s.discoveryAvailable);
   const activeInterface = useTaktStore((s) => s.activeInterface);
   const discoveredNodes = useTaktStore((s) => s.discoveredNodes);
   const isDirty = useTaktStore((s) => s.isDirty);
+  const autosaveEnabled = useTaktStore((s) => s.autosaveEnabled);
   const recentProjects = useTaktStore((s) => s.recentProjects);
   const studioLayout = useTaktStore((s) => s.studioLayout);
 
@@ -58,6 +95,7 @@ export function TopStatusBar() {
   const setGrandMaster = useTaktStore((s) => s.setGrandMaster);
   const setNetworkAdapter = useTaktStore((s) => s.setNetworkAdapter);
   const setOutputEnabled = useTaktStore((s) => s.setOutputEnabled);
+  const setAutosaveEnabled = useTaktStore((s) => s.setAutosaveEnabled);
   const requestProjectAction = useTaktStore((s) => s.requestProjectAction);
   const saveProjectToFile = useTaktStore((s) => s.saveProjectToFile);
   const saveProjectAsFile = useTaktStore((s) => s.saveProjectAsFile);
@@ -137,11 +175,13 @@ export function TopStatusBar() {
       } else if (key === "s") {
         e.preventDefault();
         e.stopPropagation();
-        void handleSaveProject();
+        setOpenMenu(null);
+        void saveProjectToFile();
       } else if (key === "o") {
         e.preventDefault();
         e.stopPropagation();
-        void handleOpenProject();
+        setOpenMenu(null);
+        void requestProjectAction({ type: "open_project" });
       } else if (key === "n") {
         e.preventDefault();
         e.stopPropagation();
@@ -151,19 +191,10 @@ export function TopStatusBar() {
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  });
+  }, [requestProjectAction, saveProjectAsFile, saveProjectToFile]);
 
   const parkedCount = Object.keys(parkedChannels).length;
   const onlineNodeCount = discoveredNodes.filter((n) => n.online).length;
-  const meanMs = (telemetry.meanUs / 1000).toFixed(2);
-  const p99Ms = (telemetry.p99JitterUs / 1000).toFixed(2);
-  const hz =
-    telemetry.meanUs > 0
-      ? (1_000_000 / telemetry.meanUs).toFixed(1)
-      : "44.0";
-  const recentDrops = jitterSamplesUs.filter((dt) => dt > 34_090.5).length;
-  const timingHealthy =
-    jitterSamplesUs.length > 0 ? recentDrops === 0 : telemetry.droppedFrames === 0;
   const lastRecent = recentProjects[0] ?? null;
 
   return (
@@ -174,6 +205,12 @@ export function TopStatusBar() {
           <div className="w-1.5 h-6 rounded-full bg-ember" />
           <span className="font-sans font-semibold text-base tracking-wide text-mist">
             TAKTLIGHT
+          </span>
+          <span
+            data-testid="app-version-badge"
+            className="font-mono text-[10px] text-fog/80 tracking-tight self-end pb-0.5"
+          >
+            v{pkg.version}
           </span>
         </div>
 
@@ -346,6 +383,29 @@ export function TopStatusBar() {
 
                 <button
                   type="button"
+                  role="menuitemcheckbox"
+                  aria-checked={autosaveEnabled}
+                  data-testid="menu-file-autosave-toggle"
+                  onClick={() => {
+                    void setAutosaveEnabled(!autosaveEnabled);
+                  }}
+                  className="px-3 py-1.5 text-left text-mist hover:bg-ink hover:text-frost flex items-center justify-between gap-3"
+                >
+                  <span className="flex items-center gap-2">
+                    <History className="w-3.5 h-3.5 text-fog" />
+                    <span>Autosave</span>
+                  </span>
+                  <span
+                    className={`text-[10px] font-semibold ${
+                      autosaveEnabled ? "text-pine" : "text-fog"
+                    }`}
+                  >
+                    {autosaveEnabled ? "ON" : "OFF"}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
                   role="menuitem"
                   data-testid="menu-file-close"
                   onClick={() => {
@@ -514,25 +574,8 @@ export function TopStatusBar() {
           </HelpTooltip>
         </div>
 
-        {/* 44 Hz Telemetry Pill */}
-        <HelpTooltip text="Real-time 44 Hz DMX engine loop rate, mean frame interval, and p99 jitter.">
-          <div
-            className={`flex items-center gap-2 px-3 py-1 rounded-md border font-mono text-xs ${
-              timingHealthy
-                ? "bg-pitch border-pine text-mist"
-                : "bg-pitch border-signal text-frost"
-            }`}
-          >
-            <span
-              className={`w-2 h-2 rounded-full ${
-                timingHealthy ? "bg-pine" : "bg-signal animate-pulse"
-              }`}
-            />
-            <span>
-              {hz} Hz | {meanMs} ms ± {p99Ms} ms
-            </span>
-          </div>
-        </HelpTooltip>
+        {/* 44 Hz Telemetry Pill (isolated memo component to avoid 44 Hz header re-renders) */}
+        <EngineTelemetryPill />
 
         {/* Active Warning Badges */}
         {parkedCount > 0 && (
@@ -586,21 +629,38 @@ export function TopStatusBar() {
             ))}
           </select>
 
-          <span
-            className={`font-mono text-[10px] uppercase px-1.5 py-0.5 rounded ${
-              isOffline || !outputEnabled
-                ? "bg-slate text-fog border border-steel"
-                : "bg-pine/25 text-mist border border-pine"
-            }`}
+          <HelpTooltip
+            text={
+              lastNetworkError
+                ? `Network error: ${lastNetworkError}`
+                : !outputEnabled
+                  ? "Art-Net / sACN DMX transmission is currently paused."
+                  : isOffline
+                    ? "Running in offline loopback mode (no packets transmitted)."
+                    : `Transmitting DMX via ${activeInterface ? `${activeInterface.name} (${activeInterface.ipv4})` : "selected adapter"}.`
+            }
           >
-            {!outputEnabled
-              ? "TX OFF"
-              : isOffline
-                ? "OFFLINE"
-                : activeInterface
-                  ? activeInterface.ipv4
-                  : "LIVE"}
-          </span>
+            <span
+              data-testid="network-status-badge"
+              className={`font-mono text-[10px] uppercase px-1.5 py-0.5 rounded ${
+                lastNetworkError && isOffline
+                  ? "bg-signal/20 text-signal border border-signal"
+                  : isOffline || !outputEnabled
+                    ? "bg-slate text-fog border border-steel"
+                    : "bg-pine/25 text-mist border border-pine"
+              }`}
+            >
+              {!outputEnabled
+                ? "TX OFF"
+                : isOffline
+                  ? lastNetworkError
+                    ? "NET ERR"
+                    : "OFFLINE"
+                  : activeInterface
+                    ? activeInterface.ipv4
+                    : "LIVE"}
+            </span>
+          </HelpTooltip>
 
           <button
             type="button"

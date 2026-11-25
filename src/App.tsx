@@ -19,6 +19,9 @@ export function App() {
   const pendingUnsavedAction = useTaktStore((s) => s.pendingUnsavedAction);
   const cancelUnsavedAction = useTaktStore((s) => s.cancelUnsavedAction);
   const confirmUnsavedAction = useTaktStore((s) => s.confirmUnsavedAction);
+  const hasAutosaveRecovery = useTaktStore((s) => s.hasAutosaveRecovery);
+  const recoverAutosave = useTaktStore((s) => s.recoverAutosave);
+  const discardAutosave = useTaktStore((s) => s.discardAutosave);
 
   useEffect(() => {
     const disconnect = initEngineConnection();
@@ -138,6 +141,34 @@ export function App() {
       }
     >
       <TopStatusBar />
+      {hasAutosaveRecovery && (
+        <div
+          data-testid="autosave-recovery-banner"
+          className="shrink-0 bg-ember/15 border-b border-ember px-4 py-1.5 flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-frost"
+        >
+          <span>
+            An unsaved autosave snapshot newer than this project was found.
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              data-testid="autosave-discard-btn"
+              onClick={() => void discardAutosave()}
+              className="px-2.5 py-0.5 rounded border border-steel bg-ink text-mist hover:border-fog"
+            >
+              Discard
+            </button>
+            <button
+              type="button"
+              data-testid="autosave-recover-btn"
+              onClick={() => void recoverAutosave()}
+              className="px-2.5 py-0.5 rounded bg-ember hover:bg-burnt text-frost font-semibold"
+            >
+              Recover Autosave
+            </button>
+          </div>
+        </div>
+      )}
       <main
         className={
           isStudio

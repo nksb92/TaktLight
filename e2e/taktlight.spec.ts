@@ -228,9 +228,13 @@ test.describe("TaktLight Real-Browser E2E", () => {
     );
 
     await page.getByRole("button", { name: /^Fixtures$/i }).click();
-    await page.getByText("RLCV3 8-Segment RGBW Tube", { exact: true }).click();
+    await page.getByRole("button", { name: /New Builder Draft/i }).click();
+    await page.getByTestId("add-mode-btn").click();
+    await page.getByLabel("Fixture Name").fill("Studio Test Tube");
+    await page.getByRole("button", { name: /Save to User Library/i }).click();
+    await page.getByText("Studio Test Tube", { exact: true }).click();
     await expect(page.getByTestId("fixture-builder-context-banner")).toContainText(
-      "BUILT-IN PRESET",
+      "EDITING USER FIXTURE",
     );
     await expect(page.getByLabel("Fixture Name")).toBeVisible();
     await expect(page.getByLabel("Raw OFL JSON Editor")).toBeHidden();
