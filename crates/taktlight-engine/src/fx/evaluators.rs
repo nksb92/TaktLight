@@ -86,6 +86,31 @@ fn temporal_phase_f64(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn evaluate_curve_1d_phase(
+    waveform: Waveform1D,
+    base_phase_cycles: f64,
+    u_i: f32,
+    phase_deg: f32,
+    phase_spread_deg: f32,
+    duty: Option<f32>,
+    amplitude: f32,
+    offset: f32,
+    is_bipolar_add_dimmer: bool,
+) -> f32 {
+    let phi = (base_phase_cycles
+        + (phase_deg as f64) / 360.0
+        + (u_i as f64) * ((phase_spread_deg as f64) / 360.0))
+        .rem_euclid(1.0) as f32;
+    let w_uni = waveform.eval_unipolar(phi, duty);
+    let w = if is_bipolar_add_dimmer {
+        2.0 * w_uni - 1.0
+    } else {
+        w_uni
+    };
+    offset + amplitude * w
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_curve_1d_scalar(
     waveform: Waveform1D,
     b_block: f64,
@@ -100,15 +125,62 @@ pub fn evaluate_curve_1d_scalar(
     is_bipolar_add_dimmer: bool,
 ) -> f32 {
     let base_phase = temporal_phase_f64(b_block, t_local, rate_beats, speed_hz);
-    let phi = (base_phase + (u_i as f64) * ((phase_spread_deg as f64) / 360.0)).rem_euclid(1.0)
-        as f32;
-    let w_uni = waveform.eval_unipolar(phi, duty);
-    let w = if is_bipolar_add_dimmer {
-        2.0 * w_uni - 1.0
+    evaluate_curve_1d_phase(
+        waveform,
+        base_phase,
+        u_i,
+        0.0,
+        phase_spread_deg,
+        duty,
+        amplitude,
+        offset,
+        is_bipolar_add_dimmer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_step_chase_phase(
+    base_phase_cycles: f64,
+    u_i: f32,
+    cell_count: usize,
+    active_ratio: Option<f32>,
+    pixels_on: Option<u16>,
+    one_way: bool,
+    fade: f32,
+    amplitude: f32,
+) -> f32 {
+    let p = base_phase_cycles.rem_euclid(1.0) as f32;
+    let abs_d = if one_way {
+        let phi_chase = p;
+        ((u_i - phi_chase + 0.5).rem_euclid(1.0) - 0.5).abs()
     } else {
-        w_uni
+        let phi_chase = if p < 0.5 { p * 2.0 } else { (1.0 - p) * 2.0 };
+        (u_i - phi_chase).abs()
     };
-    offset + amplitude * w
+
+    let ratio = if let Some(px) = pixels_on {
+        if cell_count > 0 {
+            ((px.max(1) as f32) / (cell_count as f32)).clamp(1e-4, 1.0)
+        } else {
+            1.0
+        }
+    } else {
+        active_ratio
+            .unwrap_or(1.0 / (cell_count.max(1) as f32))
+            .clamp(1e-4, 1.0)
+    };
+    let half_w = 0.5 * ratio;
+    let ramp_w = fade.clamp(0.0, 1.0) * half_w;
+    let flat_half = half_w - ramp_w;
+
+    let window = if abs_d <= flat_half + 1e-6 {
+        1.0
+    } else if abs_d < half_w && ramp_w > 1e-6 {
+        ((half_w - abs_d) / ramp_w).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    window * amplitude
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -123,26 +195,17 @@ pub fn evaluate_step_chase_scalar(
     fade: f32,
     amplitude: f32,
 ) -> f32 {
-    let phi_chase = temporal_phase_f64(b_block, t_local, step_beats, speed_hz).rem_euclid(1.0)
-        as f32;
-    let d_i = (u_i - phi_chase + 0.5).rem_euclid(1.0) - 0.5;
-    let abs_d = d_i.abs();
-
-    let ratio = active_ratio
-        .unwrap_or(1.0 / (cell_count.max(1) as f32))
-        .clamp(1e-4, 1.0);
-    let half_w = 0.5 * ratio;
-    let ramp_w = fade.clamp(0.0, 1.0) * half_w;
-    let flat_half = half_w - ramp_w;
-
-    let window = if abs_d <= flat_half + 1e-6 {
-        1.0
-    } else if abs_d < half_w && ramp_w > 1e-6 {
-        ((half_w - abs_d) / ramp_w).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    window * amplitude
+    let base_phase = temporal_phase_f64(b_block, t_local, step_beats, speed_hz);
+    evaluate_step_chase_phase(
+        base_phase,
+        u_i,
+        cell_count,
+        active_ratio,
+        None,
+        true,
+        fade,
+        amplitude,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -180,6 +243,74 @@ impl FromStr for Shader2DKind {
     }
 }
 
+/// Convert `spatial_freq` to the normalized gizmo half-extent (`0.08..=2.0`).
+pub fn spatial_freq_to_box_half_norm(spatial_freq: f32) -> f32 {
+    let pattern_scale = (1.0f32 / spatial_freq.max(0.05)).clamp(0.25, 10.0);
+    (0.2 * pattern_scale).clamp(0.08, 2.0)
+}
+
+/// Resolve independent `(box_half_x, box_half_y)` gizmo bounds, falling back to `spatial_freq`.
+pub fn resolve_gizmo_half_extents(
+    spatial_freq: f32,
+    box_half_x: Option<f32>,
+    box_half_y: Option<f32>,
+) -> (f32, f32) {
+    let fallback = spatial_freq_to_box_half_norm(spatial_freq);
+    let hx = box_half_x.unwrap_or(fallback).clamp(0.05, 2.0);
+    let hy = box_half_y.unwrap_or(fallback).clamp(0.05, 2.0);
+    (hx, hy)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_spatial_shader_2d_phase(
+    shader: Shader2DKind,
+    norm_xy: [f32; 2],
+    base_phase_cycles: f64,
+    spatial_freq: f32,
+    color_width: f32,
+    direction_deg: f32,
+    center_x: f32,
+    center_y: f32,
+    transform: Option<&str>,
+) -> f32 {
+    let box_half_norm = spatial_freq_to_box_half_norm(spatial_freq);
+    let mut dx = norm_xy[0] - center_x;
+    let mut dy = norm_xy[1] - center_y;
+    match transform {
+        Some("mirror_x") => dx = dx.abs() - 0.5 * box_half_norm,
+        Some("mirror_y") => dy = dy.abs() - 0.5 * box_half_norm,
+        Some("invert") => {
+            dx = -dx;
+            dy = -dy;
+        }
+        _ => {}
+    }
+    let phi = base_phase_cycles.rem_euclid(1.0) as f32;
+    let k = spatial_freq / color_width.clamp(0.1, 4.0);
+    let theta = direction_deg.to_radians();
+
+    let s = match shader {
+        Shader2DKind::LinearSweep => (k * (dx * theta.cos() + dy * theta.sin()) - phi).rem_euclid(1.0),
+        Shader2DKind::RadialWave => {
+            let base = 0.5 + 0.5 * (TAU * (k * (dx * dx + dy * dy).sqrt() - phi)).sin();
+            if transform == Some("invert") {
+                1.0 - base
+            } else {
+                base
+            }
+        }
+        Shader2DKind::Pinwheel => {
+            ((dy.atan2(dx) / TAU) * k.round().max(1.0) - phi).rem_euclid(1.0)
+        }
+        Shader2DKind::Plasma => {
+            0.5 + 0.25
+                * ((TAU * (k * dx + phi)).sin()
+                    + (TAU * (k * dy - phi)).sin())
+        }
+    };
+    s.clamp(0.0, 1.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_spatial_shader_2d(
     shader: Shader2DKind,
@@ -193,27 +324,18 @@ pub fn evaluate_spatial_shader_2d(
     center_x: f32,
     center_y: f32,
 ) -> f32 {
-    let phi = temporal_phase_f64(b_block, t_local, rate_beats, speed_hz).rem_euclid(1.0) as f32;
-    let dx = canvas_xy[0] - center_x;
-    let dy = canvas_xy[1] - center_y;
-    let k = spatial_freq;
-    let theta = direction_deg.to_radians();
-
-    let s = match shader {
-        Shader2DKind::LinearSweep => (k * (dx * theta.cos() + dy * theta.sin()) - phi).rem_euclid(1.0),
-        Shader2DKind::RadialWave => {
-            0.5 + 0.5 * (TAU * (k * (dx * dx + dy * dy).sqrt() - phi)).sin()
-        }
-        Shader2DKind::Pinwheel => {
-            ((dy.atan2(dx) / TAU) * k.round().max(1.0) - phi).rem_euclid(1.0)
-        }
-        Shader2DKind::Plasma => {
-            0.5 + 0.25
-                * ((TAU * (k * canvas_xy[0] + phi)).sin()
-                    + (TAU * (k * canvas_xy[1] - phi)).sin())
-        }
-    };
-    s.clamp(0.0, 1.0)
+    let base_phase = temporal_phase_f64(b_block, t_local, rate_beats, speed_hz);
+    evaluate_spatial_shader_2d_phase(
+        shader,
+        canvas_xy,
+        base_phase,
+        spatial_freq,
+        1.0,
+        direction_deg,
+        center_x,
+        center_y,
+        None,
+    )
 }
 
 #[cfg(test)]

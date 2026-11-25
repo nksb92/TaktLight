@@ -5,7 +5,7 @@ import {
   Download,
   Move,
   Redo2,
-  RotateCcw,
+  Sun,
   Trash2,
   Undo2,
   Upload,
@@ -16,11 +16,12 @@ import {
   type FixtureInstance,
   getFixtureFootprint,
   getUniverseFreeStats,
-  inheritNextUniverse,
   previewPlacement,
+  resolveUniverseDisplayConfig,
   type WhiteMode,
 } from "../lib/patchLogic";
 import { type UniverseConfig, useTaktStore } from "../store/useTaktStore";
+import { HelpTooltip } from "./HelpTooltip";
 
 interface CellOwnership {
   fixture: FixtureInstance;
@@ -39,34 +40,6 @@ function formatFootprintLabel(inst: FixtureInstance): string {
   return `${headStr} + U${fp.tail.universe}.${pad3(fp.tail.startAddress)} to U${fp.tail.universe}.${pad3(fp.tail.endAddress)}`;
 }
 
-function resolveUniverseDisplayConfig(
-  universes: UniverseConfig[],
-  targetId: number,
-): { config: UniverseConfig; isPreview: boolean } {
-  const existing = universes.find((u) => u.id === targetId);
-  if (existing) return { config: existing, isPreview: false };
-
-  const sorted = [...universes].sort((a, b) => a.id - b.id);
-  let base: UniverseConfig =
-    sorted[sorted.length - 1] ?? {
-      id: 1,
-      review_output: false,
-      protocol: {
-        protocol: "art_net",
-        mode: { mode: "broadcast" },
-        net: 0,
-        subnet: 0,
-        uni: 0,
-      },
-    };
-  let curId = base.id;
-  while (curId < targetId) {
-    base = inheritNextUniverse(base, curId + 1);
-    curId += 1;
-  }
-  return { config: { ...base, review_output: false }, isPreview: true };
-}
-
 function formatProtocolSublabel(config: UniverseConfig): string {
   if (config.protocol.protocol === "art_net") {
     return `Net ${config.protocol.net} Sub ${config.protocol.subnet} Uni ${config.protocol.uni}`;
@@ -81,30 +54,34 @@ export function PatchView() {
   const rolloverEnabled = useTaktStore((s) => s.rolloverEnabled);
   const canUndo = useTaktStore((s) => s.canUndo);
   const canRedo = useTaktStore((s) => s.canRedo);
-  const patchToast = useTaktStore((s) => s.patchToast);
   const crossProtocolWarning = useTaktStore((s) => s.crossProtocolWarning);
   const selectedFixtureInstanceId = useTaktStore(
     (s) => s.selectedFixtureInstanceId,
   );
   const focusedPatchUniverse = useTaktStore((s) => s.focusedPatchUniverse);
+  const identifiedFixtureId = useTaktStore((s) => s.identifiedFixtureId);
 
   const patchFixtures = useTaktStore((s) => s.patchFixtures);
+  const setIdentifiedFixture = useTaktStore((s) => s.setIdentifiedFixture);
   const moveFixturePatch = useTaktStore((s) => s.moveFixturePatch);
   const unpatchFixture = useTaktStore((s) => s.unpatchFixture);
   const updateFixtureCalibration = useTaktStore(
     (s) => s.updateFixtureCalibration,
   );
   const setRolloverEnabled = useTaktStore((s) => s.setRolloverEnabled);
+  const resolveSplitFixtures = useTaktStore((s) => s.resolveSplitFixtures);
   const markUniverseReviewed = useTaktStore((s) => s.markUniverseReviewed);
+  const configureUniverse = useTaktStore((s) => s.configureUniverse);
   const undoShow = useTaktStore((s) => s.undoShow);
   const redoShow = useTaktStore((s) => s.redoShow);
   const exportShowXml = useTaktStore((s) => s.exportShowXml);
   const importShowXml = useTaktStore((s) => s.importShowXml);
+  const openProjectFromFile = useTaktStore((s) => s.openProjectFromFile);
   const selectFixtureInstance = useTaktStore((s) => s.selectFixtureInstance);
   const setFocusedPatchUniverse = useTaktStore(
     (s) => s.setFocusedPatchUniverse,
   );
-  const dismissToast = useTaktStore((s) => s.dismissToast);
+  const setActiveTab = useTaktStore((s) => s.setActiveTab);
 
   const [selectedProfileId, setSelectedProfileId] = useState<string>(
     fixtureSummaries[0]?.id ?? "",
@@ -124,13 +101,99 @@ export function PatchView() {
   const [startAddress, setStartAddress] = useState<number>(1);
 
   const [movingFixtureId, setMovingFixtureId] = useState<string | null>(null);
+  const [pointerDragging, setPointerDragging] = useState<boolean>(false);
   const [hoverTarget, setHoverTarget] = useState<{
     universe: number;
     address: number;
   } | null>(null);
+  const [editingUniverseId, setEditingUniverseId] = useState<number | null>(
+    null,
+  );
+  const [patchContextMenu, setPatchContextMenu] = useState<{
+    fixtureId: string;
+    x: number;
+    y: number;
+  } | null>(null);
   const [exportedXml, setExportedXml] = useState<string | null>(null);
   const [xmlError, setXmlError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const [pendingDrag, setPendingDrag] = useState<{
+    fixtureId: string;
+    startX: number;
+    startY: number;
+    universe: number;
+    address: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!patchContextMenu) return;
+    const close = () => setPatchContextMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [patchContextMenu]);
+
+  useEffect(() => {
+    if (!pendingDrag) return;
+    let dragging = false;
+    let latestTarget: { universe: number; address: number } | null = null;
+
+    const resolveCellAt = (
+      x: number,
+      y: number,
+    ): { universe: number; address: number } | null => {
+      if (typeof document.elementFromPoint !== "function") return null;
+      const el = document.elementFromPoint(x, y) as HTMLElement | null;
+      const btn = el?.closest?.("[data-patch-uni][data-patch-ch]") as
+        | HTMLElement
+        | null;
+      if (!btn) return null;
+      const uni = Number(btn.dataset.patchUni);
+      const ch = Number(btn.dataset.patchCh);
+      if (Number.isNaN(uni) || Number.isNaN(ch)) return null;
+      return { universe: uni, address: ch };
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (!dragging) {
+        const dist = Math.hypot(
+          e.clientX - pendingDrag.startX,
+          e.clientY - pendingDrag.startY,
+        );
+        if (dist < 5) return;
+        dragging = true;
+        setPointerDragging(true);
+        setMovingFixtureId(pendingDrag.fixtureId);
+      }
+      const hit = resolveCellAt(e.clientX, e.clientY);
+      if (hit) {
+        latestTarget = hit;
+        setHoverTarget(hit);
+      }
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      if (dragging) {
+        const hit = resolveCellAt(e.clientX, e.clientY) ?? latestTarget;
+        if (hit) {
+          void moveFixturePatch(pendingDrag.fixtureId, hit.universe, hit.address);
+        }
+        setPointerDragging(false);
+        setMovingFixtureId(null);
+        setHoverTarget(null);
+      }
+      setPendingDrag(null);
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+  }, [moveFixturePatch, pendingDrag]);
 
   useEffect(() => {
     if (!activeProfile) return;
@@ -272,6 +335,17 @@ export function PatchView() {
     return map;
   }, [showState.patch]);
 
+  const fixtureOrderIndexById = useMemo(() => {
+    const sorted = [...showState.patch].sort(
+      (a, b) => a.universe - b.universe || a.address - b.address || a.id.localeCompare(b.id),
+    );
+    const map = new Map<string, number>();
+    sorted.forEach((fx, idx) => {
+      map.set(fx.id, idx);
+    });
+    return map;
+  }, [showState.patch]);
+
   const selectedFixture = useMemo(
     () =>
       showState.patch.find((f) => f.id === selectedFixtureInstanceId) ??
@@ -318,6 +392,23 @@ export function PatchView() {
     }
   };
 
+  const handleImportClick = async () => {
+    setXmlError(null);
+    try {
+      const result = await openProjectFromFile();
+      if (result === "unsupported") {
+        fileInputRef.current?.click();
+      } else if (result === "opened") {
+        const xml = await exportShowXml();
+        setExportedXml(xml);
+      }
+    } catch (err) {
+      setXmlError(
+        err instanceof Error ? err.message : "Failed to import .takt.xml show",
+      );
+    }
+  };
+
   const handleImportFile = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -360,65 +451,94 @@ export function PatchView() {
               onClick={() =>
                 setFocusedPatchUniverse(Math.max(1, focusedPatchUniverse - 1))
               }
+              aria-label="Prev"
               title="Previous Universe Pair (PageUp)"
-              className="px-2 py-1 rounded text-xs font-mono text-mist hover:bg-slate-dark disabled:opacity-40 flex items-center gap-1"
+              className="p-1 rounded text-xs font-mono text-mist hover:bg-slate-dark disabled:opacity-40 flex items-center"
             >
               <ChevronLeft className="w-3.5 h-3.5" />
-              <span>Prev</span>
             </button>
-            <span className="px-2.5 font-mono text-xs text-frost font-medium">
-              Pair: U{focusedPatchUniverse} &amp; U{focusedPatchUniverse + 1}
+            <span className="px-2 font-mono text-xs text-frost font-medium">
+              U{focusedPatchUniverse} &amp; U{focusedPatchUniverse + 1}
             </span>
             <button
               type="button"
               onClick={() => setFocusedPatchUniverse(focusedPatchUniverse + 1)}
+              aria-label="Next"
               title="Next Universe Pair (PageDown)"
-              className="px-2 py-1 rounded text-xs font-mono text-mist hover:bg-slate-dark flex items-center gap-1"
+              className="p-1 rounded text-xs font-mono text-mist hover:bg-slate-dark flex items-center"
             >
-              <span>Next</span>
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
           </div>
 
-          <button
-            type="button"
-            aria-pressed={rolloverEnabled}
-            onClick={() => void setRolloverEnabled(!rolloverEnabled)}
-            title="Toggle universe spillover split mode (Shortcut: R)"
-            className={`px-3 py-1.5 rounded-md border font-mono text-xs font-semibold transition-colors ${
-              rolloverEnabled
-                ? "bg-ember border-ember text-frost"
-                : "bg-ink border-steel text-fog hover:text-mist"
-            }`}
-          >
-            {rolloverEnabled ? "Rollover: ON" : "Rollover: OFF"}
-          </button>
+          <HelpTooltip text="When ON, fixtures patched near channel 512 automatically spill remaining channels into the next universe. Shortcut: R.">
+            <button
+              type="button"
+              role="switch"
+              data-testid="toggle-rollover-split"
+              aria-checked={rolloverEnabled}
+              onClick={() => void setRolloverEnabled(!rolloverEnabled)}
+              className="flex items-center gap-2 px-2.5 py-1 rounded-md border border-steel bg-ink font-mono text-xs font-semibold text-mist hover:border-ember transition-colors"
+            >
+              <span
+                className={`relative inline-flex w-8 h-4 rounded-full transition-colors ${
+                  rolloverEnabled ? "bg-ember" : "bg-slate-dark border border-steel"
+                }`}
+              >
+                <span
+                  className={`inline-block w-3 h-3 rounded-full bg-frost transition-transform mt-0.5 ${
+                    rolloverEnabled ? "translate-x-4" : "translate-x-0.5"
+                  }`}
+                />
+              </span>
+              <span>{rolloverEnabled ? "Rollover: ON" : "Rollover: OFF"}</span>
+            </button>
+          </HelpTooltip>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1">
             <button
               type="button"
               disabled={!canUndo}
               onClick={() => void undoShow()}
+              aria-label="Undo"
               title="Undo (Ctrl+Z)"
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-ember disabled:opacity-40"
+              className="p-1.5 rounded-md bg-ink border border-steel text-mist hover:border-ember disabled:opacity-40"
             >
               <Undo2 className="w-3.5 h-3.5" />
-              <span>Undo</span>
             </button>
             <button
               type="button"
               disabled={!canRedo}
               onClick={() => void redoShow()}
+              aria-label="Redo"
               title="Redo (Ctrl+Y)"
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-ember disabled:opacity-40"
+              className="p-1.5 rounded-md bg-ink border border-steel text-mist hover:border-ember disabled:opacity-40"
             >
               <Redo2 className="w-3.5 h-3.5" />
-              <span>Redo</span>
             </button>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {movingFixture && (
+            <div className="flex items-center gap-2 mr-1">
+              <span className="px-2 py-0.5 rounded bg-ember/20 border border-ember text-ember font-mono text-xs">
+                Moving {movingFixture.name}: click any channel cell or press Esc to cancel
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setMovingFixtureId(null);
+                  setPointerDragging(false);
+                  setPendingDrag(null);
+                  setHoverTarget(null);
+                }}
+                className="px-2 py-1 rounded bg-ink border border-steel text-xs text-fog hover:text-mist"
+              >
+                Cancel Move
+              </button>
+            </div>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -429,19 +549,21 @@ export function PatchView() {
           />
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-cobalt"
+            aria-label="Import .takt.xml"
+            title="Import .takt.xml"
+            onClick={() => void handleImportClick()}
+            className="p-1.5 rounded-md bg-ink border border-steel text-mist hover:border-cobalt"
           >
             <Upload className="w-3.5 h-3.5 text-cobalt" />
-            <span>Import .takt.xml</span>
           </button>
           <button
             type="button"
+            aria-label="Export .takt.xml"
+            title="Export .takt.xml"
             onClick={() => void handleExportXml()}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-ink border border-steel text-xs font-sans text-mist hover:border-ember"
+            className="p-1.5 rounded-md bg-ink border border-steel text-mist hover:border-ember"
           >
             <Download className="w-3.5 h-3.5 text-ember" />
-            <span>Export .takt.xml</span>
           </button>
         </div>
       </section>
@@ -455,58 +577,24 @@ export function PatchView() {
         </div>
       )}
 
-      {/* Placement Toast & Cross-Protocol Warning */}
-      {(patchToast || crossProtocolWarning || movingFixture) && (
+      {/* Conditional Cross Protocol Warning */}
+      {!rolloverEnabled &&
+        (crossProtocolWarning ||
+          showState.patch.some((inst) => getFixtureFootprint(inst).tail !== null)) && (
         <div className="bg-slate-dark border border-steel rounded-panel px-3 py-2 flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2.5 text-xs">
-            {patchToast && (
-              <span className="font-mono text-frost">{patchToast}</span>
-            )}
-            {crossProtocolWarning && (
-              <span className="px-2 py-0.5 rounded bg-signal/20 border border-signal text-signal font-mono font-semibold flex items-center gap-1">
-                <AlertTriangle className="w-3.5 h-3.5" />
-                <span>CROSS PROTOCOL SPLIT</span>
-              </span>
-            )}
-            {movingFixture && (
-              <span className="px-2 py-0.5 rounded bg-ember/20 border border-ember text-ember font-mono">
-                Moving {movingFixture.name}: click any channel cell or press Esc to cancel
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            {patchToast && canUndo && (
-              <button
-                type="button"
-                data-testid="toast-undo-button"
-                onClick={() => void undoShow()}
-                className="flex items-center gap-1 px-2.5 py-1 rounded bg-ember text-frost font-mono text-xs font-medium hover:bg-burnt"
-              >
-                <RotateCcw className="w-3 h-3" />
-                <span>Undo</span>
-              </button>
-            )}
-            {movingFixture && (
-              <button
-                type="button"
-                onClick={() => {
-                  setMovingFixtureId(null);
-                  setHoverTarget(null);
-                }}
-                className="px-2 py-1 rounded bg-ink border border-steel text-xs text-fog hover:text-mist"
-              >
-                Cancel Move
-              </button>
-            )}
-            {patchToast && (
-              <button
-                type="button"
-                onClick={() => dismissToast()}
-                className="px-2 py-1 rounded bg-ink border border-steel text-xs text-fog hover:text-mist"
-              >
-                Dismiss
-              </button>
-            )}
+            <span className="px-2 py-0.5 rounded bg-signal/20 border border-signal text-signal font-mono font-semibold flex items-center gap-1">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              <span>CROSS PROTOCOL SPLIT</span>
+            </span>
+            <button
+              type="button"
+              data-testid="resolve-split-fixtures-button"
+              onClick={() => void resolveSplitFixtures()}
+              className="px-2.5 py-0.5 rounded bg-ember hover:bg-burnt text-frost font-mono text-xs font-semibold transition-colors"
+            >
+              Move Split Fixtures to Valid Spot
+            </button>
           </div>
         </div>
       )}
@@ -514,6 +602,26 @@ export function PatchView() {
       {xmlError && (
         <div className="bg-signal/15 border border-signal rounded-panel px-3 py-2 text-xs text-signal font-mono">
           {xmlError}
+        </div>
+      )}
+
+      {fixtureSummaries.length === 0 && (
+        <div
+          data-testid="empty-fixtures-onboarding-banner"
+          className="bg-slate-dark border border-ember/60 rounded-panel px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3"
+        >
+          <div className="text-xs text-mist">
+            <span className="font-semibold text-frost">No fixture profiles loaded yet.</span>{" "}
+            Create a custom fixture or import an Open Fixture Library (.json) profile before patching.
+          </div>
+          <button
+            type="button"
+            data-testid="go-to-fixtures-btn"
+            onClick={() => setActiveTab("fixtures")}
+            className="px-3 py-1.5 rounded bg-ember hover:bg-burnt text-frost font-sans text-xs font-semibold transition-colors"
+          >
+            Open Fixture Builder
+          </button>
         </div>
       )}
 
@@ -534,11 +642,15 @@ export function PatchView() {
               onChange={(e) => setSelectedProfileId(e.target.value)}
               className="bg-ink border border-steel rounded px-2.5 py-1.5 text-xs text-frost font-sans focus:outline-none focus:border-ember"
             >
-              {fixtureSummaries.map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.name}
-                </option>
-              ))}
+              {fixtureSummaries.length === 0 ? (
+                <option value="">No fixture profiles (add in Fixtures)</option>
+              ) : (
+                fixtureSummaries.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.name}
+                  </option>
+                ))
+              )}
             </select>
           </div>
 
@@ -685,20 +797,28 @@ export function PatchView() {
                 isPreview ? "border-dashed border-steel" : "border-steel"
               }`}
             >
-              <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 relative">
                 <div className="flex items-center gap-2">
                   <span className="font-mono text-sm font-semibold text-frost">
                     Universe {uniId}
                   </span>
-                  <span
-                    className={`px-2 py-0.5 rounded font-mono text-[10px] font-semibold uppercase border ${
+                  <button
+                    type="button"
+                    data-testid={`universe-protocol-btn-${uniId}`}
+                    onClick={() =>
+                      setEditingUniverseId(
+                        editingUniverseId === uniId ? null : uniId,
+                      )
+                    }
+                    title="Click to configure Art-Net or sACN protocol"
+                    className={`px-2 py-0.5 rounded font-mono text-[10px] font-semibold uppercase border transition-colors cursor-pointer ${
                       isArtNet
-                        ? "bg-ember/15 border-ember text-ember"
-                        : "bg-cobalt/15 border-cobalt text-cobalt"
+                        ? "bg-ember/15 border-ember text-ember hover:bg-ember/25"
+                        : "bg-cobalt/15 border-cobalt text-cobalt hover:bg-cobalt/25"
                     }`}
                   >
-                    {isArtNet ? "ARTNET" : "SACN"}
-                  </span>
+                    {isArtNet ? "ARTNET" : "SACN"} ▾
+                  </button>
                   <span className="font-mono text-[11px] text-fog">
                     {formatProtocolSublabel(config)}
                   </span>
@@ -720,6 +840,200 @@ export function PatchView() {
                 <span className="font-mono text-xs text-mist">
                   {stats.freeChannels} free | largest block {stats.largestBlock}
                 </span>
+
+                {/* Universe Protocol Editor Popover */}
+                {editingUniverseId === uniId && (
+                  <div
+                    data-testid={`universe-protocol-popover-${uniId}`}
+                    className="w-full mt-1 bg-slate-dark border border-steel rounded p-2.5 flex flex-wrap items-center gap-2 font-mono text-[11px]"
+                  >
+                    <label className="flex items-center gap-1 text-fog">
+                      <span>Protocol</span>
+                      <select
+                        aria-label={`Universe ${uniId} Protocol`}
+                        value={config.protocol.protocol}
+                        onChange={(e) => {
+                          const nextProto = e.target.value;
+                          if (nextProto === "art_net") {
+                            void configureUniverse({
+                              id: uniId,
+                              review_output: false,
+                              protocol: {
+                                protocol: "art_net",
+                                mode: { mode: "broadcast" },
+                                net: 0,
+                                subnet: Math.floor((uniId - 1) / 16) % 16,
+                                uni: (uniId - 1) % 16,
+                              },
+                            });
+                          } else {
+                            void configureUniverse({
+                              id: uniId,
+                              review_output: false,
+                              protocol: {
+                                protocol: "sacn",
+                                mode: { mode: "multicast" },
+                                sacn_universe: Math.max(1, uniId),
+                                priority: 100,
+                              },
+                            });
+                          }
+                        }}
+                        className="bg-ink border border-steel rounded px-1.5 py-0.5 text-frost"
+                      >
+                        <option value="art_net">Art-Net</option>
+                        <option value="sacn">sACN (E1.31)</option>
+                      </select>
+                    </label>
+
+                    {config.protocol.protocol === "art_net" ? (
+                      <>
+                        <label className="flex items-center gap-1 text-fog">
+                          <span>Net</span>
+                          <input
+                            aria-label={`Universe ${uniId} ArtNet Net`}
+                            type="number"
+                            min={0}
+                            max={127}
+                            value={config.protocol.net}
+                            onChange={(e) => {
+                              if (config.protocol.protocol !== "art_net") return;
+                              void configureUniverse({
+                                ...config,
+                                review_output: false,
+                                protocol: {
+                                  ...config.protocol,
+                                  net: Math.max(
+                                    0,
+                                    Math.min(127, Number(e.target.value) || 0),
+                                  ),
+                                },
+                              });
+                            }}
+                            className="w-12 bg-ink border border-steel rounded px-1 py-0.5 text-frost"
+                          />
+                        </label>
+                        <label className="flex items-center gap-1 text-fog">
+                          <span>Sub</span>
+                          <input
+                            aria-label={`Universe ${uniId} ArtNet Subnet`}
+                            type="number"
+                            min={0}
+                            max={15}
+                            value={config.protocol.subnet}
+                            onChange={(e) => {
+                              if (config.protocol.protocol !== "art_net") return;
+                              void configureUniverse({
+                                ...config,
+                                review_output: false,
+                                protocol: {
+                                  ...config.protocol,
+                                  subnet: Math.max(
+                                    0,
+                                    Math.min(15, Number(e.target.value) || 0),
+                                  ),
+                                },
+                              });
+                            }}
+                            className="w-12 bg-ink border border-steel rounded px-1 py-0.5 text-frost"
+                          />
+                        </label>
+                        <label className="flex items-center gap-1 text-fog">
+                          <span>Uni</span>
+                          <input
+                            aria-label={`Universe ${uniId} ArtNet Uni`}
+                            type="number"
+                            min={0}
+                            max={15}
+                            value={config.protocol.uni}
+                            onChange={(e) => {
+                              if (config.protocol.protocol !== "art_net") return;
+                              void configureUniverse({
+                                ...config,
+                                review_output: false,
+                                protocol: {
+                                  ...config.protocol,
+                                  uni: Math.max(
+                                    0,
+                                    Math.min(15, Number(e.target.value) || 0),
+                                  ),
+                                },
+                              });
+                            }}
+                            className="w-12 bg-ink border border-steel rounded px-1 py-0.5 text-frost"
+                          />
+                        </label>
+                      </>
+                    ) : (
+                      <>
+                        <label className="flex items-center gap-1 text-fog">
+                          <span>sACN Uni</span>
+                          <input
+                            aria-label={`Universe ${uniId} sACN Universe`}
+                            type="number"
+                            min={1}
+                            max={63999}
+                            value={config.protocol.sacn_universe}
+                            onChange={(e) => {
+                              if (config.protocol.protocol !== "sacn") return;
+                              void configureUniverse({
+                                ...config,
+                                review_output: false,
+                                protocol: {
+                                  ...config.protocol,
+                                  sacn_universe: Math.max(
+                                    1,
+                                    Math.min(
+                                      63999,
+                                      Number(e.target.value) || 1,
+                                    ),
+                                  ),
+                                },
+                              });
+                            }}
+                            className="w-16 bg-ink border border-steel rounded px-1 py-0.5 text-frost"
+                          />
+                        </label>
+                        <label className="flex items-center gap-1 text-fog">
+                          <span>Priority</span>
+                          <input
+                            aria-label={`Universe ${uniId} sACN Priority`}
+                            type="number"
+                            min={0}
+                            max={200}
+                            value={config.protocol.priority}
+                            onChange={(e) => {
+                              if (config.protocol.protocol !== "sacn") return;
+                              void configureUniverse({
+                                ...config,
+                                review_output: false,
+                                protocol: {
+                                  ...config.protocol,
+                                  priority: Math.max(
+                                    0,
+                                    Math.min(
+                                      200,
+                                      Number(e.target.value) || 100,
+                                    ),
+                                  ),
+                                },
+                              });
+                            }}
+                            className="w-14 bg-ink border border-steel rounded px-1 py-0.5 text-frost"
+                          />
+                        </label>
+                      </>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => setEditingUniverseId(null)}
+                      className="ml-auto px-2 py-0.5 rounded bg-ink border border-steel text-mist hover:border-ember"
+                    >
+                      Done
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* 32x16 512-Channel Grid */}
@@ -733,13 +1047,23 @@ export function PatchView() {
 
                   let cellBg = "bg-ink text-fog/60 hover:bg-slate-dark";
                   if (owner) {
+                    const altTint =
+                      (fixtureOrderIndexById.get(owner.fixture.id) ?? 0) % 2 === 1;
+                    const isFixtureStart =
+                      owner.segment === "head" && ch === owner.fixture.address;
+
                     if (isSelected) {
                       cellBg = "bg-ember text-frost font-semibold";
-                    } else if (owner.isSplit) {
-                      cellBg =
-                        "bg-plum/30 border border-dashed border-ember text-frost";
+                    } else if (owner.isSplit && !rolloverEnabled) {
+                      cellBg = "bg-signal/30 border border-signal text-frost";
+                    } else if (altTint) {
+                      cellBg = isFixtureStart
+                        ? "bg-teal-500/25 text-frost font-bold"
+                        : "bg-teal-500/20 text-mist";
                     } else {
-                      cellBg = "bg-cobalt/25 border border-cobalt/60 text-mist";
+                      cellBg = isFixtureStart
+                        ? "bg-cobalt/35 text-frost font-bold"
+                        : "bg-cobalt/25 text-mist";
                     }
                   }
 
@@ -760,28 +1084,31 @@ export function PatchView() {
                     <button
                       key={ch}
                       type="button"
-                      draggable={Boolean(owner)}
                       title={titleText}
+                      data-patch-uni={uniId}
+                      data-patch-ch={ch}
                       data-testid={`patch-u${uniId}-ch${ch}`}
-                      onDragStart={() => {
-                        if (owner) setMovingFixtureId(owner.fixture.id);
-                      }}
-                      onDragOver={(e) => {
+                      onPointerDown={(e) => {
+                        if (e.button !== 0 || !owner) return;
                         e.preventDefault();
-                        if (movingFixtureId) {
-                          setHoverTarget({ universe: uniId, address: ch });
-                        }
+                        selectFixtureInstance(owner.fixture.id);
+                        setPendingDrag({
+                          fixtureId: owner.fixture.id,
+                          startX: e.clientX,
+                          startY: e.clientY,
+                          universe: uniId,
+                          address: ch,
+                        });
                       }}
-                      onDrop={(e) => {
+                      onContextMenu={(e) => {
+                        if (!owner) return;
                         e.preventDefault();
-                        if (movingFixtureId) {
-                          void moveFixturePatch(movingFixtureId, uniId, ch);
-                          setMovingFixtureId(null);
-                          setHoverTarget(null);
-                        }
-                      }}
-                      onDragEnd={() => {
-                        setHoverTarget(null);
+                        selectFixtureInstance(owner.fixture.id);
+                        setPatchContextMenu({
+                          fixtureId: owner.fixture.id,
+                          x: e.clientX,
+                          y: e.clientY,
+                        });
                       }}
                       onMouseEnter={() => {
                         if (movingFixtureId) {
@@ -789,6 +1116,7 @@ export function PatchView() {
                         }
                       }}
                       onClick={() => {
+                        if (pointerDragging) return;
                         if (movingFixtureId) {
                           void moveFixturePatch(movingFixtureId, uniId, ch);
                           setMovingFixtureId(null);
@@ -802,7 +1130,9 @@ export function PatchView() {
                           setStartAddress(ch);
                         }
                       }}
-                      className={`h-4 text-[8px] font-mono rounded-[2px] flex items-center justify-center select-none transition-colors ${cellBg} ${ghostClass}`}
+                      className={`h-4 text-[8px] font-mono rounded-[2px] flex items-center justify-center select-none transition-colors ${
+                        owner ? "cursor-grab active:cursor-grabbing" : ""
+                      } ${cellBg} ${ghostClass}`}
                     >
                       {ch === 1 || ch % 16 === 1 || owner ? ch : ""}
                     </button>
@@ -825,6 +1155,16 @@ export function PatchView() {
                         key={`${uniId}-${fx.id}`}
                         data-testid={`patch-block-${fx.id}`}
                         onClick={() => selectFixtureInstance(fx.id)}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          selectFixtureInstance(fx.id);
+                          setPatchContextMenu({
+                            fixtureId: fx.id,
+                            x: e.clientX,
+                            y: e.clientY,
+                          });
+                        }}
+                        title="Click to select · Right-click for Move / Unpatch"
                         className={`flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5 rounded border text-xs cursor-pointer ${
                           isSelected
                             ? "bg-pitch border-ember text-frost"
@@ -839,40 +1179,73 @@ export function PatchView() {
                             {formatFootprintLabel(fx)}
                           </span>
                           {fp.tail && (
-                            <span className="px-1.5 py-0.5 rounded border border-dashed border-ember bg-ember/15 font-mono text-[10px] text-ember">
+                            <span
+                              className={`px-1.5 py-0.5 rounded border font-mono text-[10px] ${
+                                rolloverEnabled
+                                  ? "border-steel bg-ink text-fog"
+                                  : "border-signal bg-signal/20 text-signal"
+                              }`}
+                            >
                               U{fp.head.universe} to U{fp.tail.universe} split
                             </span>
                           )}
                         </div>
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1">
                           <button
                             type="button"
+                            data-testid={`locate-fixture-${fx.id}`}
+                            aria-label={`Locate ${fx.name}`}
+                            aria-pressed={identifiedFixtureId === fx.id}
+                            title={
+                              identifiedFixtureId === fx.id
+                                ? "Stop Locating Fixture"
+                                : "Locate / Identify Fixture (100% Open White)"
+                            }
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void setIdentifiedFixture(
+                                identifiedFixtureId === fx.id ? null : fx.id,
+                              );
+                            }}
+                            className={`p-1 rounded border transition-colors ${
+                              identifiedFixtureId === fx.id
+                                ? "bg-frost border-frost text-void"
+                                : "bg-slate-dark border-steel text-mist hover:border-frost"
+                            }`}
+                          >
+                            <Sun className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Move ${fx.name}`}
+                            title="Move Fixture"
                             onClick={(e) => {
                               e.stopPropagation();
                               setMovingFixtureId(
                                 movingFixtureId === fx.id ? null : fx.id,
                               );
+                              setPointerDragging(false);
                               setHoverTarget(null);
                             }}
-                            className={`flex items-center gap-1 px-2 py-0.5 rounded border font-mono text-[10px] ${
+                            className={`p-1 rounded border ${
                               movingFixtureId === fx.id
                                 ? "bg-ember border-ember text-frost"
                                 : "bg-slate-dark border-steel text-mist hover:border-ember"
                             }`}
                           >
                             <Move className="w-3 h-3" />
-                            <span>Move</span>
                           </button>
                           <button
                             type="button"
+                            aria-label={`Unpatch ${fx.name}`}
+                            title="Unpatch Fixture"
                             onClick={(e) => {
                               e.stopPropagation();
                               void unpatchFixture(fx.id);
                             }}
-                            className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-dark border border-steel font-mono text-[10px] text-signal hover:border-signal"
+                            className="p-1 rounded bg-slate-dark border border-steel text-signal hover:border-signal"
                           >
                             <Trash2 className="w-3 h-3" />
-                            <span>Unpatch</span>
                           </button>
                         </div>
                       </div>
@@ -901,16 +1274,20 @@ export function PatchView() {
 
           {!selectedFixture ? (
             <p className="text-xs font-mono text-fog">
-              Patch and select a fixture to adjust gamma, dimmer bounds, and white channel calibration.
+              Select a fixture above.
             </p>
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-gamma"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  Gamma
+                  <span>Gamma</span>
+                  <HelpTooltip
+                    testId="cal-help-gamma"
+                    text="Perceptual dimming curve exponent (1.0 = linear DMX, 2.2 = standard smooth LED fade curve at low brightness)."
+                  />
                 </label>
                 <input
                   id="cal-gamma"
@@ -935,9 +1312,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-min-dimmer"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  Min Dimmer DMX
+                  <span>Min Dimmer DMX</span>
+                  <HelpTooltip
+                    testId="cal-help-min-dimmer"
+                    text="Lowest non-zero DMX value (0–254) where the LEDs visibly ignite. Raises the bottom floor to eliminate dead low-end fades."
+                  />
                 </label>
                 <input
                   id="cal-min-dimmer"
@@ -961,9 +1342,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-max-dimmer"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  Max Dimmer DMX
+                  <span>Max Dimmer DMX</span>
+                  <HelpTooltip
+                    testId="cal-help-max-dimmer"
+                    text="Upper DMX ceiling (1–255) for dimmer output. Useful to match brightness across different fixture models or cap peak output."
+                  />
                 </label>
                 <input
                   id="cal-max-dimmer"
@@ -987,9 +1372,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-white-mode"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  White Mode
+                  <span>White Mode</span>
+                  <HelpTooltip
+                    testId="cal-help-white-mode"
+                    text="Controls how RGBW fixtures use their White LED: 'replace' moves shared RGB into W, 'add' boosts W alongside RGB, 'off' uses RGB only."
+                  />
                 </label>
                 <select
                   id="cal-white-mode"
@@ -1009,9 +1398,13 @@ export function PatchView() {
               <div className="flex flex-col gap-1">
                 <label
                   htmlFor="cal-white-gain"
-                  className="text-[11px] font-mono uppercase text-fog"
+                  className="text-[11px] font-mono uppercase text-fog flex items-center gap-1"
                 >
-                  White Gain
+                  <span>White Gain</span>
+                  <HelpTooltip
+                    testId="cal-help-white-gain"
+                    text="Multiplier (0.0–2.0) applied to the derived White channel to balance white LED intensity against RGB."
+                  />
                 </label>
                 <input
                   id="cal-white-gain"
@@ -1054,11 +1447,44 @@ export function PatchView() {
             </pre>
           ) : (
             <p className="text-xs font-mono text-fog">
-              Click Export .takt.xml to generate and preview the current show file.
+              No XML snapshot exported.
             </p>
           )}
         </div>
       </section>
+
+      {patchContextMenu && (
+        <div
+          data-testid="patch-fixture-context-menu"
+          style={{ left: patchContextMenu.x, top: patchContextMenu.y }}
+          className="fixed z-50 bg-slate-dark border border-steel rounded shadow-2xl py-1 min-w-[140px] font-mono text-xs flex flex-col"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              setMovingFixtureId(patchContextMenu.fixtureId);
+              setPointerDragging(false);
+              setHoverTarget(null);
+              setPatchContextMenu(null);
+            }}
+            className="px-3 py-1.5 text-left text-mist hover:bg-ink flex items-center gap-2"
+          >
+            <Move className="w-3.5 h-3.5 text-ember" />
+            <span>Move Fixture</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void unpatchFixture(patchContextMenu.fixtureId);
+              setPatchContextMenu(null);
+            }}
+            className="px-3 py-1.5 text-left text-signal hover:bg-ink flex items-center gap-2"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Unpatch</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

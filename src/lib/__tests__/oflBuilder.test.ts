@@ -3,6 +3,7 @@ import {
   buildOflFixtureJson,
   createDefaultBuilderDraft,
   getDefaultShippedFixtures,
+  parseOflJsonToDraft,
   validateAndExpandOflLocally,
 } from "../oflBuilder";
 
@@ -63,10 +64,81 @@ describe("oflBuilder", () => {
     ).toBe(true);
   });
 
-  it("provides shipped RLCV3 and RLCV4 profiles offline", () => {
+  it("ships with the standard RLCV3 fixture profile", () => {
     const shipped = getDefaultShippedFixtures();
-    expect(shipped).toHaveLength(2);
-    expect(shipped[0].summary.pixel_count).toBe(8);
-    expect(shipped[1].summary.pixel_count).toBe(16);
+    expect(shipped).toHaveLength(1);
+    expect(shipped[0].summary.id).toBe("standard/rlcv3.json");
+    expect(shipped[0].summary.name).toBe("RLCV3");
+    expect(shipped[0].summary.origin).toBe("standard");
+    expect(shipped[0].summary.pixel_count).toBe(24);
+  });
+
+  it("supports custom RGB orders, white/WW+CW modes, white position, and round-trips via parseOflJsonToDraft", () => {
+    const draft = createDefaultBuilderDraft();
+    draft.includeMasterDimmer = false;
+    draft.includeStrobe = false;
+    draft.isMatrix = true;
+    draft.pixelCountX = 2;
+    draft.rgbOrder = "GRB";
+    draft.whiteMode = "ww_cw";
+    draft.whitePosition = "before";
+
+    const json = buildOflFixtureJson(draft);
+    const res = validateAndExpandOflLocally(json);
+    expect(res.valid).toBe(true);
+    expect(res.expanded_modes[0].channel_count).toBe(10);
+    expect(
+      res.expanded_modes[0].channels.slice(0, 5).map((c) => c.name),
+    ).toEqual([
+      "Warm White 1",
+      "Cold White 1",
+      "Green 1",
+      "Red 1",
+      "Blue 1",
+    ]);
+
+    const parsedBack = parseOflJsonToDraft(json);
+    expect(parsedBack).not.toBeNull();
+    expect(parsedBack?.rgbOrder).toBe("GRB");
+    expect(parsedBack?.whiteMode).toBe("ww_cw");
+    expect(parsedBack?.whitePosition).toBe("before");
+  });
+
+  it("handles parseOflJsonToDraft edge cases, single-pixel white/RGB modes, and schema rejections", () => {
+    expect(parseOflJsonToDraft("{ invalid")).toBeNull();
+    expect(parseOflJsonToDraft(JSON.stringify({ name: "" }))?.name).toBe(
+      "Studio RGBW Pixel Bar",
+    );
+
+    const invalidSyntax = validateAndExpandOflLocally("{ broken");
+    expect(invalidSyntax.valid).toBe(false);
+    expect(invalidSyntax.issues.length).toBeGreaterThan(0);
+
+    const emptyObj = validateAndExpandOflLocally("{}");
+    expect(emptyObj.valid).toBe(false);
+
+    const singleRgb = createDefaultBuilderDraft();
+    singleRgb.isMatrix = false;
+    singleRgb.colorMode = "rgb";
+    singleRgb.whiteMode = "none";
+    singleRgb.includeMasterDimmer = true;
+    singleRgb.includeStrobe = true;
+    const singleJson = buildOflFixtureJson(singleRgb);
+    const singleRes = validateAndExpandOflLocally(singleJson);
+    expect(singleRes.valid).toBe(true);
+    expect(singleRes.pixel_count).toBe(1);
+
+    const parsedSingle = parseOflJsonToDraft(singleJson);
+    expect(parsedSingle).not.toBeNull();
+    expect(parsedSingle?.isMatrix).toBe(false);
+
+    const wheelOnly = createDefaultBuilderDraft();
+    wheelOnly.isMatrix = false;
+    wheelOnly.colorMode = "wheel";
+    wheelOnly.includeMasterDimmer = false;
+    wheelOnly.includeStrobe = false;
+    const wheelRes = validateAndExpandOflLocally(buildOflFixtureJson(wheelOnly));
+    expect(wheelRes.valid).toBe(true);
+    expect(wheelRes.expanded_modes[0].channel_count).toBe(1);
   });
 });

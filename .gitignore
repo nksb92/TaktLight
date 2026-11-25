@@ -1,11 +1,16 @@
 # Rust / Tauri
 target/
-Cargo.lock
 
 # Node / Frontend
 node_modules/
 dist/
 .vite/
+coverage/
+test-results/
+playwright-report/
+
+# Local scratch notes
+docs/usage_notes.md
 
 # OS / IDE
 .DS_Store

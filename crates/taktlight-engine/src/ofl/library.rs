@@ -9,15 +9,12 @@ use super::expander::{expand_all_modes, ExpandedFixtureMode};
 use super::model::OflFixtureDefinition;
 use super::validator::{validate_ofl_json_str, SchemaValidationIssue};
 
-const EMBEDDED_RLCV3_JSON: &str =
-    include_str!("../../../../fixtures/age/rlcv3_8_segment_tube.json");
-const EMBEDDED_RLCV4_JSON: &str =
-    include_str!("../../../../fixtures/age/rlcv4_16_segment_tube.json");
+const STANDARD_RLCV3_JSON: &str = include_str!("../../../../fixtures/user/rlcv3.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FixtureOrigin {
-    AgeBuiltIn,
+    Standard,
     UserLocal,
 }
 
@@ -167,27 +164,21 @@ impl FixtureLibrary {
             entries: BTreeMap::new(),
         };
 
-        // Always load shipped AGE profiles from compile-time embeds first
-        for (id, raw) in [
-            ("age/rlcv3_8_segment_tube.json", EMBEDDED_RLCV3_JSON),
-            ("age/rlcv4_16_segment_tube.json", EMBEDDED_RLCV4_JSON),
-        ] {
-            if let Ok((def, modes)) = validate_and_parse_ofl(raw) {
-                lib.entries.insert(
-                    id.to_string(),
-                    build_detail(
-                        id.to_string(),
-                        FixtureOrigin::AgeBuiltIn,
-                        raw.to_string(),
-                        def,
-                        modes,
-                    ),
-                );
-            }
+        // Always load the single standard RLCV3 profile from compile-time embed
+        if let Ok((def, modes)) = validate_and_parse_ofl(STANDARD_RLCV3_JSON) {
+            lib.entries.insert(
+                "standard/rlcv3.json".to_string(),
+                build_detail(
+                    "standard/rlcv3.json".to_string(),
+                    FixtureOrigin::Standard,
+                    STANDARD_RLCV3_JSON.to_string(),
+                    def,
+                    modes,
+                ),
+            );
         }
 
         if let Some(root) = root_dir {
-            lib.load_folder(&root.join("age"), "age", FixtureOrigin::AgeBuiltIn);
             lib.load_folder(&root.join("user"), "user", FixtureOrigin::UserLocal);
         }
 
@@ -237,9 +228,9 @@ impl FixtureLibrary {
         let (def, modes) =
             validate_and_parse_ofl(raw_json).map_err(SaveFixtureError::Validation)?;
 
-        let formatted_json = serde_json::from_str::<serde_json::Value>(raw_json)
-            .and_then(|v| serde_json::to_string_pretty(&v))
-            .unwrap_or_else(|_| raw_json.to_string());
+        // Preserve original JSON key order (avoid serde_json::Value BTreeMap alphabetical sorting,
+        // which reorders templateChannels from Red/Green/Blue into Blue/Green/Red).
+        let formatted_json = raw_json.to_string();
         let file_name = format!("{slug}.json");
         let id = format!("user/{file_name}");
 
@@ -265,7 +256,7 @@ impl FixtureLibrary {
             return Err(format!("fixture '{id}' not found"));
         };
         if existing.summary.origin != FixtureOrigin::UserLocal {
-            return Err("built-in AGE profiles cannot be deleted".to_string());
+            return Err("standard fixture profiles cannot be deleted".to_string());
         }
         if let Some(root) = &self.root_dir {
             if let Some(file_name) = id.strip_prefix("user/") {
@@ -278,25 +269,176 @@ impl FixtureLibrary {
         self.entries.remove(id);
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn load_with_test_fixtures() -> Self {
+        let mut lib = Self::load(None);
+        lib.save_user_fixture("test_tube_8seg", tests::TEST_TUBE_8SEG_JSON)
+            .expect("valid 8-segment test tube fixture");
+        lib.save_user_fixture("test_tube_16seg", tests::TEST_TUBE_16SEG_JSON)
+            .expect("valid 16-segment test tube fixture");
+        lib
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    pub(crate) const TEST_TUBE_8SEG_JSON: &str = r#"{
+  "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+  "name": "Test 8-Segment RGBW Tube",
+  "shortName": "Test-8Px",
+  "categories": ["Pixel Bar", "Color Changer"],
+  "meta": {
+    "authors": ["Test Suite"],
+    "createDate": "2026-11-17",
+    "lastModifyDate": "2026-11-18"
+  },
+  "matrix": {
+    "pixelCount": [8, 1, 1],
+    "pixelGroups": {
+      "All": "all"
+    }
+  },
+  "availableChannels": {
+    "Master Dimmer": {
+      "defaultValue": 0,
+      "capability": { "type": "Intensity" }
+    },
+    "Strobe": {
+      "defaultValue": 0,
+      "capabilities": [
+        { "dmxRange": [0, 7], "type": "ShutterStrobe", "shutterEffect": "Closed" },
+        { "dmxRange": [8, 15], "type": "ShutterStrobe", "shutterEffect": "Open" },
+        { "dmxRange": [16, 200], "type": "ShutterStrobe", "shutterEffect": "Strobe", "speedStart": "1Hz", "speedEnd": "20Hz" },
+        { "dmxRange": [201, 255], "type": "ShutterStrobe", "shutterEffect": "Strobe", "randomTiming": true, "speedStart": "1Hz", "speedEnd": "20Hz" }
+      ]
+    },
+    "Red": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+    "Green": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+    "Blue": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } },
+    "White": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "White" } }
+  },
+  "templateChannels": {
+    "Red $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+    "Green $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+    "Blue $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } },
+    "White $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "White" } }
+  },
+  "modes": [
+    {
+      "name": "34ch Pixel Mode",
+      "shortName": "34ch",
+      "channels": [
+        "Master Dimmer",
+        "Strobe",
+        {
+          "insert": "matrixChannels",
+          "repeatFor": "eachPixelABC",
+          "channelOrder": "perPixel",
+          "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey", "White $pixelKey"]
+        }
+      ]
+    },
+    {
+      "name": "6ch Basic Mode",
+      "shortName": "6ch",
+      "channels": ["Master Dimmer", "Strobe", "Red", "Green", "Blue", "White"]
+    }
+  ]
+}"#;
+
+    pub(crate) const TEST_TUBE_16SEG_JSON: &str = r#"{
+  "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+  "name": "Test 16-Segment RGBW Tube",
+  "shortName": "Test-16Px",
+  "categories": ["Pixel Bar", "Color Changer"],
+  "meta": {
+    "authors": ["Test Suite"],
+    "createDate": "2026-11-17",
+    "lastModifyDate": "2026-11-18"
+  },
+  "matrix": {
+    "pixelCount": [16, 1, 1],
+    "pixelGroups": {
+      "All": "all"
+    }
+  },
+  "availableChannels": {
+    "Master Dimmer": {
+      "defaultValue": 0,
+      "capability": { "type": "Intensity" }
+    },
+    "Strobe": {
+      "defaultValue": 0,
+      "capabilities": [
+        { "dmxRange": [0, 7], "type": "ShutterStrobe", "shutterEffect": "Closed" },
+        { "dmxRange": [8, 15], "type": "ShutterStrobe", "shutterEffect": "Open" },
+        { "dmxRange": [16, 200], "type": "ShutterStrobe", "shutterEffect": "Strobe", "speedStart": "1Hz", "speedEnd": "20Hz" },
+        { "dmxRange": [201, 255], "type": "ShutterStrobe", "shutterEffect": "Strobe", "randomTiming": true, "speedStart": "1Hz", "speedEnd": "20Hz" }
+      ]
+    },
+    "Red": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+    "Green": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+    "Blue": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } },
+    "White": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "White" } }
+  },
+  "templateChannels": {
+    "Red $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+    "Green $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+    "Blue $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } },
+    "White $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "White" } }
+  },
+  "modes": [
+    {
+      "name": "66ch Pixel Mode",
+      "shortName": "66ch",
+      "channels": [
+        "Master Dimmer",
+        "Strobe",
+        {
+          "insert": "matrixChannels",
+          "repeatFor": "eachPixelABC",
+          "channelOrder": "perPixel",
+          "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey", "White $pixelKey"]
+        }
+      ]
+    },
+    {
+      "name": "6ch Basic Mode",
+      "shortName": "6ch",
+      "channels": ["Master Dimmer", "Strobe", "Red", "Green", "Blue", "White"]
+    }
+  ]
+}"#;
+
     #[test]
-    fn loads_shipped_rlcv3_and_rlcv4_profiles_only() {
+    fn loads_standard_rlcv3_profile_only_by_default() {
         let lib = FixtureLibrary::load(None);
         let summaries = lib.list_summaries();
-        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries.len(), 1);
 
-        let rlcv3 = lib.get_entry("age/rlcv3_8_segment_tube.json").unwrap();
-        assert_eq!(rlcv3.summary.pixel_count, 8);
-        assert_eq!(rlcv3.expanded_modes[0].channel_count, 34);
+        let rlcv3 = lib.get_entry("standard/rlcv3.json").unwrap();
+        assert_eq!(rlcv3.summary.name, "RLCV3");
+        assert_eq!(rlcv3.summary.origin, FixtureOrigin::Standard);
+        assert_eq!(rlcv3.summary.pixel_count, 24);
+        assert_eq!(rlcv3.expanded_modes.len(), 8);
+    }
 
-        let rlcv4 = lib.get_entry("age/rlcv4_16_segment_tube.json").unwrap();
-        assert_eq!(rlcv4.summary.pixel_count, 16);
-        assert_eq!(rlcv4.expanded_modes[0].channel_count, 66);
+    #[test]
+    fn test_helper_loads_8_and_16_segment_profiles() {
+        let lib = FixtureLibrary::load_with_test_fixtures();
+        let summaries = lib.list_summaries();
+        assert_eq!(summaries.len(), 3);
+
+        let tube8 = lib.get_entry("user/test_tube_8seg.json").unwrap();
+        assert_eq!(tube8.summary.pixel_count, 8);
+        assert_eq!(tube8.expanded_modes[0].channel_count, 34);
+
+        let tube16 = lib.get_entry("user/test_tube_16seg.json").unwrap();
+        assert_eq!(tube16.summary.pixel_count, 16);
+        assert_eq!(tube16.expanded_modes[0].channel_count, 66);
     }
 
     #[test]
@@ -325,6 +467,7 @@ mod tests {
         }"#;
 
         let mut lib = FixtureLibrary::load(Some(&temp_dir));
+        assert_eq!(lib.list_summaries().len(), 1);
         let saved = lib.save_user_fixture("Custom Studio Par", custom_json).unwrap();
         assert_eq!(saved.summary.id, "user/custom_studio_par.json");
         assert!(temp_dir.join("user/custom_studio_par.json").exists());
@@ -333,14 +476,49 @@ mod tests {
         let lib2 = FixtureLibrary::load(Some(&temp_dir));
         assert!(lib2.get_entry("user/custom_studio_par.json").is_some());
 
-        // Cannot delete built-in profile
-        assert!(lib.delete_user_fixture("age/rlcv3_8_segment_tube.json").is_err());
+        // Cannot delete standard profile
+        assert!(lib.delete_user_fixture("standard/rlcv3.json").is_err());
 
         // Delete user profile
         lib.delete_user_fixture("user/custom_studio_par.json").unwrap();
         assert!(!temp_dir.join("user/custom_studio_par.json").exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn save_user_fixture_preserves_rgb_channel_key_order() {
+        let mut lib = FixtureLibrary::load(None);
+        let raw = r#"{
+          "$schema": "https://raw.githubusercontent.com/OpenLightingProject/open-fixture-library/master/schemas/fixture.json",
+          "name": "RGB Order Test",
+          "categories": ["Pixel Bar"],
+          "meta": { "authors": ["User"], "createDate": "2026-11-23", "lastModifyDate": "2026-11-23" },
+          "matrix": { "pixelCount": [4, 1, 1] },
+          "templateChannels": {
+            "Red $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Red" } },
+            "Green $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Green" } },
+            "Blue $pixelKey": { "defaultValue": 0, "capability": { "type": "ColorIntensity", "color": "Blue" } }
+          },
+          "modes": [
+            {
+              "name": "12ch RGB",
+              "channels": [
+                {
+                  "insert": "matrixChannels",
+                  "repeatFor": "eachPixelABC",
+                  "channelOrder": "perPixel",
+                  "templateChannels": ["Red $pixelKey", "Green $pixelKey", "Blue $pixelKey"]
+                }
+              ]
+            }
+          ]
+        }"#;
+        let saved = lib.save_user_fixture("rgb_order_test", raw).unwrap();
+        let red_pos = saved.raw_json.find("\"Red $pixelKey\"").unwrap();
+        let green_pos = saved.raw_json.find("\"Green $pixelKey\"").unwrap();
+        let blue_pos = saved.raw_json.find("\"Blue $pixelKey\"").unwrap();
+        assert!(red_pos < green_pos && green_pos < blue_pos);
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub struct FixtureTraitState {
     pub master_dimmer: f32,
     pub master_dimmer_touched: bool,
     pub any_cell_touched: bool,
+    pub any_cell_dimmer_touched: bool,
     pub shutter: ShutterState,
     pub shutter_touched: bool,
 }
@@ -107,6 +108,7 @@ impl Default for FixtureTraitState {
             master_dimmer: 0.0,
             master_dimmer_touched: false,
             any_cell_touched: false,
+            any_cell_dimmer_touched: false,
             shutter: ShutterState::Open,
             shutter_touched: false,
         }
@@ -128,12 +130,12 @@ impl FixtureTraitState {
     }
 
     pub fn finalize_fixture_state(&mut self, grand_master: f32, blackout: bool) {
-        if !self.master_dimmer_touched && self.any_cell_touched {
+        if !self.master_dimmer_touched && self.any_cell_dimmer_touched {
             self.master_dimmer = 1.0;
         }
         if blackout {
             self.master_dimmer = 0.0;
-        } else if !self.any_cell_touched && self.master_dimmer_touched {
+        } else if !self.any_cell_dimmer_touched && self.master_dimmer_touched {
             self.master_dimmer = (self.master_dimmer * grand_master.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         }
     }
@@ -174,12 +176,31 @@ impl CellTraitState {
         touched
     }
 
-    pub fn finalize_cell_state(&mut self, grand_master: f32, blackout: bool) {
+    pub fn finalize_cell_state_with_fixture(
+        &mut self,
+        fx_state: &FixtureTraitState,
+        grand_master: f32,
+        blackout: bool,
+    ) {
         if blackout {
             self.dimmer = 0.0;
-        } else {
-            self.dimmer = (self.dimmer * grand_master.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            return;
         }
+        let gm = grand_master.clamp(0.0, 1.0);
+        if self.dimmer_touched {
+            self.dimmer = (self.dimmer * gm).clamp(0.0, 1.0);
+        } else if fx_state.master_dimmer_touched
+            && !fx_state.any_cell_dimmer_touched
+            && fx_state.master_dimmer > 0.0
+        {
+            self.dimmer = 1.0;
+        } else {
+            self.dimmer = 0.0;
+        }
+    }
+
+    pub fn finalize_cell_state(&mut self, grand_master: f32, blackout: bool) {
+        self.finalize_cell_state_with_fixture(&FixtureTraitState::default(), grand_master, blackout);
     }
 }
 
@@ -361,6 +382,7 @@ pub fn fold_layers_into_states(
                     if cell_states[cell_idx].apply_cell_delta(&delta, alpha) {
                         if let Some(&fx_idx) = cell_to_fixture.get(cell_idx) {
                             fixture_states[fx_idx].any_cell_touched = true;
+                            fixture_states[fx_idx].any_cell_dimmer_touched = true;
                         }
                     }
                 }
@@ -439,8 +461,21 @@ pub fn evaluate_layer_stack_inputs(
     for fx_state in &mut fixture_states {
         fx_state.finalize_fixture_state(grand_master, blackout);
     }
-    for cell_state in &mut cell_states {
-        cell_state.finalize_cell_state(grand_master, blackout);
+    let mut cell_to_fixture = vec![0usize; cell_count];
+    for (fx_idx, fx) in fixtures.iter().enumerate() {
+        let end = (fx.cell_start + fx.cell_count as usize).min(cell_count);
+        for slot in &mut cell_to_fixture[fx.cell_start.min(cell_count)..end] {
+            *slot = fx_idx;
+        }
+    }
+    for (cell_idx, cell_state) in cell_states.iter_mut().enumerate() {
+        let fx_state = cell_to_fixture
+            .get(cell_idx)
+            .and_then(|&fx_idx| fixture_states.get(fx_idx));
+        match fx_state {
+            Some(fs) => cell_state.finalize_cell_state_with_fixture(fs, grand_master, blackout),
+            None => cell_state.finalize_cell_state(grand_master, blackout),
+        }
     }
 
     (fixture_states, cell_states)
@@ -480,6 +515,11 @@ mod tests {
             cell_start,
             cell_count,
             channels: Vec::new(),
+            has_hardware_shutter: false,
+            fixture_has_master_intensity: false,
+            has_fixture_white: false,
+            cell_has_dedicated_intensity: vec![false; cell_count as usize],
+            cell_has_white: vec![false; cell_count as usize],
         }
     }
 
@@ -504,11 +544,13 @@ mod tests {
     fn master_dimmer_falls_back_to_one_when_untouched_and_folds_from_zero_when_targeted() {
         let mut untouched = FixtureTraitState::default();
         untouched.any_cell_touched = true;
+        untouched.any_cell_dimmer_touched = true;
         untouched.finalize_fixture_state(0.5, false);
         assert!((untouched.master_dimmer - 1.0).abs() < 1e-6);
 
         let mut targeted = FixtureTraitState::default();
         targeted.any_cell_touched = true;
+        targeted.any_cell_dimmer_touched = true;
         targeted.apply_fixture_delta(
             &FixtureTraitDelta {
                 master_dimmer: Some((MergeOp::Ltp, 0.4)),
@@ -529,6 +571,42 @@ mod tests {
         );
         master_only.finalize_fixture_state(0.5, false);
         assert!((master_only.master_dimmer - 0.4).abs() < 1e-6);
+
+        // Strict A2: color-only without dimmer leaves master_dimmer and cell.dimmer at 0.0
+        let mut color_only_fx = FixtureTraitState::default();
+        color_only_fx.any_cell_touched = true;
+        color_only_fx.finalize_fixture_state(1.0, false);
+        assert_eq!(color_only_fx.master_dimmer, 0.0);
+
+        let mut color_only_cell = CellTraitState {
+            dimmer: 0.0,
+            dimmer_touched: false,
+            color: [1.0, 0.0, 0.0],
+            color_touched: true,
+        };
+        color_only_cell.finalize_cell_state_with_fixture(&color_only_fx, 1.0, false);
+        assert_eq!(color_only_cell.dimmer, 0.0);
+
+        // Raising master_only + cell color sets cell.dimmer = 1.0 without double-applying grand_master
+        let mut color_with_master_cell = CellTraitState {
+            dimmer: 0.0,
+            dimmer_touched: false,
+            color: [1.0, 0.0, 0.0],
+            color_touched: true,
+        };
+        color_with_master_cell.finalize_cell_state_with_fixture(&master_only, 0.5, false);
+        assert!((color_with_master_cell.dimmer - 1.0).abs() < 1e-6);
+
+        // Segment dimmer only keeps cell.color at [0, 0, 0] (no implied white mix)
+        let mut dim_only_cell = CellTraitState {
+            dimmer: 0.6,
+            dimmer_touched: true,
+            color: [0.0, 0.0, 0.0],
+            color_touched: false,
+        };
+        dim_only_cell.finalize_cell_state_with_fixture(&untouched, 0.5, false);
+        assert!((dim_only_cell.dimmer - 0.3).abs() < 1e-6);
+        assert_eq!(dim_only_cell.color, [0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -585,6 +663,7 @@ mod tests {
             name: "Cyber".into(),
             hex_start: "#FF0000".into(),
             hex_end: "#0000FF".into(),
+            colors: Vec::new(),
         })];
         let dimmer_palettes = vec![CompiledDimmerPalette::from_def(&DimmerPaletteDef {
             id: "dim_h".into(),

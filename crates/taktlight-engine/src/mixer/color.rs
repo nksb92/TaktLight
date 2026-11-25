@@ -8,10 +8,14 @@ pub struct CompiledColorPalette {
     pub name: String,
     pub hex_start: String,
     pub hex_end: String,
+    #[serde(default)]
+    pub colors: Vec<String>,
     pub linear_start: [f32; 3],
     pub linear_end: [f32; 3],
     pub oklab_start: [f32; 3],
     pub oklab_end: [f32; 3],
+    #[serde(default)]
+    pub oklab_stops: Vec<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,11 +55,16 @@ pub fn srgb_channel_to_linear(c: f32) -> f32 {
 
 #[inline]
 pub fn linear_channel_to_srgb(c: f32) -> f32 {
-    let c = c.clamp(0.0, 1.0);
+    if c <= 0.0 {
+        return 0.0;
+    }
+    if c >= 1.0 {
+        return 1.0;
+    }
     if c <= 0.003_130_8 {
         12.92 * c
     } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
+        (1.055 * c.powf(1.0 / 2.4) - 0.055).clamp(0.0, 1.0)
     }
 }
 
@@ -160,32 +169,174 @@ pub fn resolve_named_css_color_to_oklab(name: &str) -> Option<[f32; 3]> {
     Some(linear_rgb_to_oklab(srgb_to_linear_rgb(srgb)))
 }
 
+pub fn sample_oklab_stops_linear(
+    stops: &[[f32; 3]],
+    w: f32,
+    gradient: f32,
+    grayscale: bool,
+    cyclic: bool,
+) -> [f32; 3] {
+    let mut rgb = if stops.is_empty() {
+        [0.0, 0.0, 0.0]
+    } else if stops.len() == 1 {
+        oklab_to_linear_rgb(stops[0])
+    } else {
+        let g = gradient.clamp(0.0, 1.0);
+        let (idx, next, frac) = if cyclic {
+            let n = stops.len();
+            let t = w.rem_euclid(1.0);
+            let pos = t * (n as f32);
+            let i = (pos.floor() as usize) % n;
+            let nxt = (i + 1) % n;
+            let f = (pos - pos.floor()).clamp(0.0, 1.0);
+            (i, nxt, f)
+        } else {
+            let n = stops.len();
+            let t = w.clamp(0.0, 1.0);
+            let pos = t * ((n - 1) as f32);
+            let i = (pos.floor() as usize).min(n - 2);
+            let nxt = i + 1;
+            let f = (pos - (i as f32)).clamp(0.0, 1.0);
+            (i, nxt, f)
+        };
+
+        let eff_frac = if g <= 1e-4 {
+            0.0
+        } else if g >= 0.9999 {
+            frac
+        } else {
+            ((frac - (1.0 - g)) / g).clamp(0.0, 1.0)
+        };
+
+        let a = stops[idx];
+        let b = stops[next];
+        let lab = [
+            a[0] + eff_frac * (b[0] - a[0]),
+            a[1] + eff_frac * (b[1] - a[1]),
+            a[2] + eff_frac * (b[2] - a[2]),
+        ];
+        oklab_to_linear_rgb(lab)
+    };
+
+    if grayscale {
+        let y = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).clamp(0.0, 1.0);
+        rgb = [y, y, y];
+    }
+    rgb
+}
+
+pub fn sample_hex_stops_linear(
+    hex_stops: &[String],
+    w: f32,
+    gradient: f32,
+    grayscale: bool,
+    cyclic: bool,
+) -> [f32; 3] {
+    if hex_stops.len() <= 16 {
+        let mut stack_stops = [[0.0f32; 3]; 16];
+        let mut count = 0usize;
+        for h in hex_stops {
+            if let Some(lab) = parse_hex_to_oklab(h) {
+                stack_stops[count] = lab;
+                count += 1;
+            }
+        }
+        return sample_oklab_stops_linear(&stack_stops[..count], w, gradient, grayscale, cyclic);
+    }
+    let oklab_stops: Vec<[f32; 3]> = hex_stops
+        .iter()
+        .filter_map(|h| parse_hex_to_oklab(h))
+        .collect();
+    sample_oklab_stops_linear(&oklab_stops, w, gradient, grayscale, cyclic)
+}
+
+pub fn sample_value_stops(stops: &[f32], w: f32, gradient: f32, cyclic: bool) -> f32 {
+    if stops.is_empty() {
+        return 0.0;
+    }
+    if stops.len() == 1 {
+        return stops[0].clamp(0.0, 1.0);
+    }
+    let g = gradient.clamp(0.0, 1.0);
+    let (idx, next, frac) = if cyclic {
+        let n = stops.len();
+        let t = w.rem_euclid(1.0);
+        let pos = t * (n as f32);
+        let i = (pos.floor() as usize) % n;
+        let nxt = (i + 1) % n;
+        let f = (pos - pos.floor()).clamp(0.0, 1.0);
+        (i, nxt, f)
+    } else {
+        let n = stops.len();
+        let t = w.clamp(0.0, 1.0);
+        let pos = t * ((n - 1) as f32);
+        let i = (pos.floor() as usize).min(n - 2);
+        let nxt = i + 1;
+        let f = (pos - (i as f32)).clamp(0.0, 1.0);
+        (i, nxt, f)
+    };
+
+    let eff_frac = if g <= 1e-4 {
+        0.0
+    } else if g >= 0.9999 {
+        frac
+    } else {
+        ((frac - (1.0 - g)) / g).clamp(0.0, 1.0)
+    };
+
+    let a = stops[idx].clamp(0.0, 1.0);
+    let b = stops[next].clamp(0.0, 1.0);
+    (a + eff_frac * (b - a)).clamp(0.0, 1.0)
+}
+
 impl CompiledColorPalette {
     pub fn from_def(def: &ColorPaletteDef) -> Self {
-        let linear_start = parse_hex_to_linear_rgb(&def.hex_start).unwrap_or([0.0, 0.0, 0.0]);
-        let linear_end = parse_hex_to_linear_rgb(&def.hex_end).unwrap_or([1.0, 1.0, 1.0]);
+        let raw_colors = def.effective_colors();
+        let hex_start = raw_colors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| def.hex_start.clone());
+        let hex_end = raw_colors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| def.hex_end.clone());
+        let linear_start = parse_hex_to_linear_rgb(&hex_start).unwrap_or([0.0, 0.0, 0.0]);
+        let linear_end = parse_hex_to_linear_rgb(&hex_end).unwrap_or([1.0, 1.0, 1.0]);
         let oklab_start = linear_rgb_to_oklab(linear_start);
         let oklab_end = linear_rgb_to_oklab(linear_end);
+        let mut oklab_stops: Vec<[f32; 3]> = raw_colors
+            .iter()
+            .filter_map(|h| parse_hex_to_oklab(h))
+            .collect();
+        if oklab_stops.is_empty() {
+            oklab_stops = vec![oklab_start, oklab_end];
+        }
         Self {
             id: def.id.clone(),
             name: def.name.clone(),
-            hex_start: def.hex_start.clone(),
-            hex_end: def.hex_end.clone(),
+            hex_start,
+            hex_end,
+            colors: raw_colors,
             linear_start,
             linear_end,
             oklab_start,
             oklab_end,
+            oklab_stops,
         }
     }
 
     pub fn sample_linear_rgb(&self, w: f32) -> [f32; 3] {
-        let t = w.clamp(0.0, 1.0);
-        let lab = [
-            self.oklab_start[0] + t * (self.oklab_end[0] - self.oklab_start[0]),
-            self.oklab_start[1] + t * (self.oklab_end[1] - self.oklab_start[1]),
-            self.oklab_start[2] + t * (self.oklab_end[2] - self.oklab_start[2]),
-        ];
-        oklab_to_linear_rgb(lab)
+        sample_oklab_stops_linear(&self.oklab_stops, w, 1.0, false, false)
+    }
+
+    pub fn sample_linear_rgb_ex(
+        &self,
+        w: f32,
+        gradient: f32,
+        grayscale: bool,
+        cyclic: bool,
+    ) -> [f32; 3] {
+        sample_oklab_stops_linear(&self.oklab_stops, w, gradient, grayscale, cyclic)
     }
 }
 
@@ -239,6 +390,7 @@ mod tests {
             name: "Cyberpunk Dual".into(),
             hex_start: "#FF5500".into(),
             hex_end: "#2255AA".into(),
+            colors: Vec::new(),
         };
         let compiled = CompiledColorPalette::from_def(&def);
         let mid_linear = compiled.sample_linear_rgb(0.5);
@@ -258,6 +410,7 @@ mod tests {
             name: "Red Green".into(),
             hex_start: "#FF0000".into(),
             hex_end: "#00FF00".into(),
+            colors: Vec::new(),
         });
         let rg_mid_lab = linear_rgb_to_oklab(rg.sample_linear_rgb(0.5));
         let naive_olive_lab = linear_rgb_to_oklab(srgb_to_linear_rgb([128, 128, 0]));
@@ -279,5 +432,31 @@ mod tests {
         assert!(resolve_named_css_color_to_oklab("Amber").is_some());
         assert!(resolve_named_css_color_to_oklab("Congo Blue").is_some());
         assert!(resolve_named_css_color_to_oklab("Gobo Starburst 7").is_none());
+    }
+
+    #[test]
+    fn multistop_cyclic_gradient_and_grayscale_work_accurately() {
+        let rainbow = CompiledColorPalette::from_def(&ColorPaletteDef {
+            id: "pal_rainbow".into(),
+            name: "Rainbow".into(),
+            hex_start: "#FF0000".into(),
+            hex_end: "#0000FF".into(),
+            colors: vec!["#FF0000".into(), "#00FF00".into(), "#0000FF".into()],
+        });
+        let at_0 = rainbow.sample_linear_rgb_ex(0.0, 1.0, false, true);
+        assert!(at_0[0] > 0.99 && at_0[1] < 0.01 && at_0[2] < 0.01);
+        let at_third = rainbow.sample_linear_rgb_ex(1.0 / 3.0 + 1e-4, 1.0, false, true);
+        assert!(at_third[1] > 0.98);
+        let at_two_thirds = rainbow.sample_linear_rgb_ex(2.0 / 3.0 + 1e-4, 1.0, false, true);
+        assert!(at_two_thirds[2] > 0.98);
+
+        // Stepped gradient (0.0) holds stop[0] across first segment
+        let stepped = rainbow.sample_linear_rgb_ex(0.25, 0.0, false, true);
+        assert!(stepped[0] > 0.99 && stepped[1] < 0.01 && stepped[2] < 0.01);
+
+        // Grayscale forces equal RGB channels
+        let gray = rainbow.sample_linear_rgb_ex(0.0, 1.0, true, true);
+        assert!((gray[0] - gray[1]).abs() < 1e-6 && (gray[1] - gray[2]).abs() < 1e-6);
+        assert!(gray[0] > 0.1 && gray[0] < 0.3);
     }
 }

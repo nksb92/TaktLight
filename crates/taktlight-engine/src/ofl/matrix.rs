@@ -159,6 +159,29 @@ pub fn order_matrix_cells_for_repeat(
             for key in keys {
                 if let Some(cell) = lookup.get(key.as_str()) {
                     out.push((*cell).clone());
+                } else if let Some(group_def) = matrix.pixel_groups.get(key.as_str()) {
+                    let members: Vec<&MatrixCell> = if group_def.as_str() == Some("all") {
+                        canonical.iter().collect()
+                    } else if let Some(arr) = group_def.as_array() {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .filter_map(|k| lookup.get(k).copied())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if !members.is_empty() {
+                        let n = members.len() as f32;
+                        let avg_u = members.iter().map(|c| c.local_uv[0]).sum::<f32>() / n;
+                        let avg_v = members.iter().map(|c| c.local_uv[1]).sum::<f32>() / n;
+                        let seg_idx = out.len() as u16;
+                        out.push(MatrixCell {
+                            cell_index: seg_idx,
+                            pixel_key: key.clone(),
+                            grid_xyz: [seg_idx, 0, 0],
+                            local_uv: [avg_u, avg_v],
+                        });
+                    }
                 }
             }
             Ok(out)
@@ -252,5 +275,132 @@ mod tests {
         assert_eq!(exp_cells[1].pixel_key, "Center");
         assert_eq!(exp_cells[2].pixel_key, "Right");
         assert!((exp_cells[1].local_uv[0] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn expands_2d_3d_pixel_keys_single_axis_counts_and_rejects_empty_matrices() {
+        // 2D pixelKeys
+        let m2d = OflMatrix {
+            pixel_count: None,
+            pixel_keys: Some(serde_json::json!([["A1", "A2"], ["B1", "B2"]])),
+            pixel_groups: BTreeMap::new(),
+        };
+        let c2d = expand_canonical_matrix_cells(&m2d).unwrap();
+        assert_eq!(c2d.len(), 4);
+        assert_eq!(c2d[3].pixel_key, "B2");
+        assert_eq!(c2d[3].grid_xyz, [1, 1, 0]);
+
+        // 3D pixelKeys
+        let m3d = OflMatrix {
+            pixel_count: None,
+            pixel_keys: Some(serde_json::json!([[["Z0"]], [["Z1"]]])),
+            pixel_groups: BTreeMap::new(),
+        };
+        let c3d = expand_canonical_matrix_cells(&m3d).unwrap();
+        assert_eq!(c3d.len(), 2);
+        assert_eq!(c3d[1].grid_xyz, [0, 0, 1]);
+
+        // Single-axis Y and Z and 1x1x1 and 2x2x2 pixel_count formatting
+        for (dims, expected_last) in [
+            ([1, 1, 1], "1"),
+            ([1, 3, 1], "3"),
+            ([1, 1, 2], "2"),
+            ([2, 2, 2], "2-2-2"),
+        ] {
+            let m = OflMatrix {
+                pixel_count: Some(dims),
+                pixel_keys: None,
+                pixel_groups: BTreeMap::new(),
+            };
+            let cells = expand_canonical_matrix_cells(&m).unwrap();
+            assert_eq!(cells.last().unwrap().pixel_key, expected_last);
+        }
+
+        // Invalid / empty matrices
+        let empty = OflMatrix {
+            pixel_count: None,
+            pixel_keys: None,
+            pixel_groups: BTreeMap::new(),
+        };
+        assert!(expand_canonical_matrix_cells(&empty).is_err());
+
+        let zero_dim = OflMatrix {
+            pixel_count: Some([0, 1, 1]),
+            pixel_keys: None,
+            pixel_groups: BTreeMap::new(),
+        };
+        assert!(expand_canonical_matrix_cells(&zero_dim).is_err());
+
+        let empty_arr = OflMatrix {
+            pixel_count: None,
+            pixel_keys: Some(serde_json::json!([])),
+            pixel_groups: BTreeMap::new(),
+        };
+        assert!(expand_canonical_matrix_cells(&empty_arr).is_err());
+
+        let null_entries = OflMatrix {
+            pixel_count: None,
+            pixel_keys: Some(serde_json::json!([null, null])),
+            pixel_groups: BTreeMap::new(),
+        };
+        assert!(expand_canonical_matrix_cells(&null_entries).is_err());
+    }
+
+    #[test]
+    fn orders_all_repeat_for_axes_and_resolves_pixel_groups() {
+        let mut groups = BTreeMap::new();
+        groups.insert("all_px".to_string(), serde_json::json!("all"));
+        groups.insert("front".to_string(), serde_json::json!(["1-1-1", "2-1-1"]));
+        groups.insert("empty_grp".to_string(), serde_json::json!({}));
+
+        let matrix = OflMatrix {
+            pixel_count: Some([2, 2, 2]),
+            pixel_keys: None,
+            pixel_groups: groups,
+        };
+
+        for order in [
+            "eachPixelXYZ",
+            "eachPixelXZY",
+            "eachPixelYXZ",
+            "eachPixelYZX",
+            "eachPixelZXY",
+            "eachPixelZYX",
+            "eachPixelGroup",
+        ] {
+            let ordered =
+                order_matrix_cells_for_repeat(&matrix, &OflRepeatFor::Order(order.into())).unwrap();
+            assert_eq!(ordered.len(), 8);
+        }
+
+        // Named pixel group ("all" and explicit array)
+        let all_res =
+            order_matrix_cells_for_repeat(&matrix, &OflRepeatFor::Order("all_px".into())).unwrap();
+        assert_eq!(all_res.len(), 8);
+
+        let front_res =
+            order_matrix_cells_for_repeat(&matrix, &OflRepeatFor::Order("front".into())).unwrap();
+        assert_eq!(front_res.len(), 2);
+
+        // Missing pixel group errors
+        assert!(
+            order_matrix_cells_for_repeat(&matrix, &OflRepeatFor::Order("nonexistent".into()))
+                .is_err()
+        );
+
+        // ExplicitKeys mixing direct key + pixel group ("all", array, and ignored invalid group)
+        let explicit = order_matrix_cells_for_repeat(
+            &matrix,
+            &OflRepeatFor::ExplicitKeys(vec![
+                "1-1-1".into(),
+                "front".into(),
+                "all_px".into(),
+                "empty_grp".into(),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(explicit.len(), 3);
+        assert_eq!(explicit[1].pixel_key, "front");
+        assert_eq!(explicit[2].pixel_key, "all_px");
     }
 }

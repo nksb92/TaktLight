@@ -1,5 +1,41 @@
 import "@testing-library/jest-dom/vitest";
 
+const createMock2dContext = () => ({
+  fillStyle: "#000000",
+  strokeStyle: "#000000",
+  lineWidth: 1,
+  globalAlpha: 1,
+  font: "10px monospace",
+  textAlign: "left",
+  textBaseline: "alphabetic",
+  clearRect: () => {},
+  fillRect: () => {},
+  strokeRect: () => {},
+  beginPath: () => {},
+  closePath: () => {},
+  moveTo: () => {},
+  lineTo: () => {},
+  arc: () => {},
+  rect: () => {},
+  stroke: () => {},
+  fill: () => {},
+  clip: () => {},
+  save: () => {},
+  restore: () => {},
+  translate: () => {},
+  rotate: () => {},
+  scale: () => {},
+  setTransform: () => {},
+  setLineDash: () => {},
+  fillText: () => {},
+  strokeText: () => {},
+  measureText: (text: string) => ({ width: text.length * 6 }),
+  createLinearGradient: () => ({ addColorStop: () => {} }),
+  createRadialGradient: () => ({ addColorStop: () => {} }),
+  drawImage: () => {},
+});
+
 Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
-  value: () => null,
+  configurable: true,
+  value: (type: string) => (type === "2d" ? createMock2dContext() : null),
 });

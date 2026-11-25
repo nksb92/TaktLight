@@ -1,0 +1,120 @@
+name: Release Windows Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version override (YYYY.M.D, e.g. 2026.11.25). Defaults to today's date."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build & Publish Windows Release
+    runs-on: windows-latest
+    shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Resolve and sync release version
+        id: version
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $ver = "${{ github.ref_name }}".TrimStart("v")
+          } elseif ("${{ inputs.version }}" -ne "") {
+            $ver = "${{ inputs.version }}".TrimStart("v")
+          } else {
+            $now = [DateTime]::UtcNow
+            $ver = "$($now.Year).$($now.Month).$($now.Day)"
+          }
+          node scripts/sync-version.mjs $ver
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=v$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Run Rust tests
+        run: cargo test
+
+      - name: Run TypeScript check and Vitest suite
+        run: |
+          npx tsc --noEmit
+          npm run test -- --run
+
+      - name: Build Tauri release (EXE + NSIS installer)
+        run: npm run tauri -- build
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $installer = Get-Item "target\release\bundle\nsis\TaktLight_${ver}_x64-setup.exe"
+          $portable = Get-Item "target\release\taktlight-app.exe"
+          $out = "target\release\bundle\nsis\SHA256SUMS.txt"
+          $lines = foreach ($f in @($installer, $portable)) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $f.FullName).Hash.ToLower()
+            "$hash  $($f.Name)"
+          }
+          Set-Content -Path $out -Value $lines -Encoding ascii
+          Get-Content $out
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: taktlight-windows-${{ steps.version.outputs.version }}
+          path: |
+            target/release/bundle/nsis/TaktLight_${{ steps.version.outputs.version }}_x64-setup.exe
+            target/release/taktlight-app.exe
+            target/release/bundle/nsis/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $tag = "${{ github.ref_name }}"
+          $installer = "target\release\bundle\nsis\TaktLight_${ver}_x64-setup.exe"
+          $portable = "target\release\taktlight-app.exe"
+          $checksums = "target\release\bundle\nsis\SHA256SUMS.txt"
+
+          $notes = @(
+            "### Downloads (Windows x64)"
+            "- ``TaktLight_${ver}_x64-setup.exe`` — Windows NSIS installer (recommended)"
+            "- ``taktlight-app.exe`` — Portable standalone executable"
+            "- ``SHA256SUMS.txt`` — SHA-256 verification hashes"
+            ""
+            "> **Windows SmartScreen Notice:** This release is unsigned. On first launch, Windows SmartScreen may show an `"Unknown publisher`" warning; choose **More info -> Run anyway** to proceed."
+          ) -join "`n"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $installer $portable $checksums --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            gh release create $tag $installer $portable $checksums `
+              --title "TaktLight $ver" `
+              --notes $notes `
+              --generate-notes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

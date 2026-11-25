@@ -1,7 +1,6 @@
-import rlcv3Profile from "../../fixtures/age/rlcv3_8_segment_tube.json";
-import rlcv4Profile from "../../fixtures/age/rlcv4_16_segment_tube.json";
+import rlcv3Profile from "../../fixtures/user/rlcv3.json";
 
-export type FixtureOrigin = "age_built_in" | "user_local";
+export type FixtureOrigin = "standard" | "user_local";
 
 export interface SchemaValidationIssue {
   instance_path: string;
@@ -111,6 +110,19 @@ export interface CustomMacroChannelDraft {
   defaultValue: number;
 }
 
+export type RgbChannelOrder = "RGB" | "RBG" | "GRB" | "GBR" | "BRG" | "BGR";
+export type WhiteChannelMode = "none" | "white" | "ww_cw";
+export type WhiteChannelPosition = "after" | "before";
+
+export const RGB_CHANNEL_ORDERS: RgbChannelOrder[] = [
+  "RGB",
+  "RBG",
+  "GRB",
+  "GBR",
+  "BRG",
+  "BGR",
+];
+
 export interface FixtureBuilderDraft {
   name: string;
   shortName: string;
@@ -123,7 +135,10 @@ export interface FixtureBuilderDraft {
   strobeRandom: boolean;
   strobeMinHz: number;
   strobeMaxHz: number;
-  colorMode: "rgb" | "rgbw" | "wheel";
+  colorMode: "rgb" | "wheel";
+  rgbOrder: RgbChannelOrder;
+  whiteMode: WhiteChannelMode;
+  whitePosition: WhiteChannelPosition;
   wheelSlots: WheelSlotDraft[];
   isMatrix: boolean;
   pixelCountX: number;
@@ -175,7 +190,10 @@ export function createDefaultBuilderDraft(): FixtureBuilderDraft {
     strobeRandom: true,
     strobeMinHz: 1,
     strobeMaxHz: 20,
-    colorMode: "rgbw",
+    colorMode: "rgb",
+    rgbOrder: "RGB",
+    whiteMode: "white",
+    whitePosition: "after",
     wheelSlots: [
       { type: "Open", name: "Open White", colorHex: "#FFFFFF" },
       { type: "Color", name: "Amber", colorHex: "#FF5500" },
@@ -190,11 +208,279 @@ export function createDefaultBuilderDraft(): FixtureBuilderDraft {
   };
 }
 
+const RGB_LETTER_TO_OFL: Record<"R" | "G" | "B", string> = {
+  R: "Red",
+  G: "Green",
+  B: "Blue",
+};
+
+export function resolveDraftColorNames(
+  draft: Pick<
+    FixtureBuilderDraft,
+    "colorMode" | "rgbOrder" | "whiteMode" | "whitePosition"
+  >,
+): string[] {
+  if (draft.colorMode === "wheel") return [];
+  const rgbNames = draft.rgbOrder
+    .split("")
+    .map((letter) => RGB_LETTER_TO_OFL[letter as "R" | "G" | "B"])
+    .filter(Boolean);
+  const whiteNames =
+    draft.whiteMode === "white"
+      ? ["White"]
+      : draft.whiteMode === "ww_cw"
+        ? ["Warm White", "Cold White"]
+        : [];
+  return draft.whitePosition === "before"
+    ? [...whiteNames, ...rgbNames]
+    : [...rgbNames, ...whiteNames];
+}
+
 export function sanitizeSlug(raw: string): string {
   return raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
+}
+
+const CANONICAL_COLOR_ORDER: Record<string, number> = {
+  red: 0,
+  green: 1,
+  blue: 2,
+  white: 3,
+  "warm white": 4,
+  "cold white": 5,
+  amber: 6,
+  yellow: 7,
+  cyan: 8,
+  magenta: 9,
+  lime: 10,
+  indigo: 11,
+  uv: 12,
+};
+
+function channelSortRank(
+  key: string,
+  channelDef: unknown,
+  preferredColorOrder?: Record<string, number>,
+): [number, number] {
+  const colorOrder = preferredColorOrder ?? CANONICAL_COLOR_ORDER;
+  const ch =
+    channelDef && typeof channelDef === "object"
+      ? (channelDef as Record<string, unknown>)
+      : null;
+  const single =
+    ch?.capability && typeof ch.capability === "object"
+      ? (ch.capability as Record<string, unknown>)
+      : null;
+  const caps = single
+    ? [single]
+    : Array.isArray(ch?.capabilities)
+      ? (ch.capabilities as Record<string, unknown>[])
+      : [];
+
+  const firstType = typeof caps[0]?.type === "string" ? caps[0].type : "";
+  if (firstType === "Intensity") return [0, 0];
+  if (caps.some((c) => c?.type === "ShutterStrobe")) return [1, 0];
+  if (firstType === "ColorIntensity") {
+    const color =
+      typeof caps[0]?.color === "string" ? caps[0].color.toLowerCase() : "";
+    return [
+      2,
+      colorOrder[color] ?? (CANONICAL_COLOR_ORDER[color] !== undefined ? 100 + CANONICAL_COLOR_ORDER[color] : 199),
+    ];
+  }
+  if (caps.some((c) => c?.type === "WheelSlot")) return [3, 0];
+
+  // Fallback by channel name when capability metadata is absent
+  const lower = key.toLowerCase();
+  if (lower.includes("dimmer") || lower.includes("intensity")) return [0, 1];
+  if (lower.includes("strobe") || lower.includes("shutter")) return [1, 1];
+  for (const [colorName, idx] of Object.entries(colorOrder)) {
+    if (lower.startsWith(colorName)) return [2, idx];
+  }
+  for (const [colorName, idx] of Object.entries(CANONICAL_COLOR_ORDER)) {
+    if (lower.startsWith(colorName)) return [2, 100 + idx];
+  }
+  return [4, 0];
+}
+
+export function orderOflChannelKeys(
+  keys: string[],
+  channelsMap?: Record<string, unknown>,
+  preferredColorNames?: string[],
+): string[] {
+  const preferredMap =
+    preferredColorNames && preferredColorNames.length > 0
+      ? Object.fromEntries(
+          preferredColorNames.map((name, idx) => [name.toLowerCase(), idx]),
+        )
+      : undefined;
+  return keys
+    .map((key, index) => ({
+      key,
+      index,
+      rank: channelSortRank(key, channelsMap?.[key], preferredMap),
+    }))
+    .sort((a, b) => {
+      if (a.rank[0] !== b.rank[0]) return a.rank[0] - b.rank[0];
+      if (a.rank[1] !== b.rank[1]) return a.rank[1] - b.rank[1];
+      return a.index - b.index;
+    })
+    .map((item) => item.key);
+}
+
+export function parseOflJsonToDraft(rawJson: string): FixtureBuilderDraft | null {
+  try {
+    const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return null;
+    const base = createDefaultBuilderDraft();
+    const avail = (parsed.availableChannels ?? {}) as Record<string, Record<string, unknown>>;
+    const tmpl = (parsed.templateChannels ?? {}) as Record<string, Record<string, unknown>>;
+    const modes = Array.isArray(parsed.modes)
+      ? (parsed.modes as { name?: string; channels?: unknown[] }[])
+      : [];
+    const matrix = parsed.matrix as
+      | { pixelCount?: number[]; pixelKeys?: unknown[][][] }
+      | undefined;
+    const pixelCount = Array.isArray(matrix?.pixelCount) ? matrix.pixelCount : null;
+    const pixelKeys = Array.isArray(matrix?.pixelKeys) ? matrix.pixelKeys : null;
+    const isMatrix = Boolean(
+      (pixelCount && pixelCount.length >= 2) || (pixelKeys && pixelKeys.length > 0),
+    );
+    const derivedX = pixelCount
+      ? Math.max(1, Number(pixelCount[0]) || 1)
+      : pixelKeys && Array.isArray(pixelKeys[0]) && Array.isArray(pixelKeys[0][0])
+        ? Math.max(1, pixelKeys[0][0].length)
+        : 1;
+    const derivedY = pixelCount
+      ? Math.max(1, Number(pixelCount[1]) || 1)
+      : pixelKeys && Array.isArray(pixelKeys[0])
+        ? Math.max(1, pixelKeys[0].length)
+        : 1;
+    const derivedZ = pixelCount
+      ? Math.max(1, Number(pixelCount[2]) || 1)
+      : pixelKeys
+        ? Math.max(1, pixelKeys.length)
+        : 1;
+
+    const allChKeys = [...Object.keys(avail), ...Object.keys(tmpl)].map((k) =>
+      k.toLowerCase(),
+    );
+    const hasWheel = allChKeys.some((k) => k.includes("wheel"));
+    const colorMode: FixtureBuilderDraft["colorMode"] = hasWheel ? "wheel" : "rgb";
+
+    // Infer RGB order, white mode, and white position from mode 0 channel sequence
+    const extractColorFromDef = (def: unknown): string | null => {
+      if (!def || typeof def !== "object") return null;
+      const cap = (def as { capability?: { type?: string; color?: string } })
+        .capability;
+      if (cap?.type === "ColorIntensity" && typeof cap.color === "string") {
+        return cap.color;
+      }
+      return null;
+    };
+
+    const orderedColors: string[] = [];
+    const firstModeChannels = Array.isArray(modes[0]?.channels)
+      ? modes[0].channels
+      : [];
+    for (const entry of firstModeChannels) {
+      if (typeof entry === "string") {
+        const color = extractColorFromDef(avail[entry]);
+        if (color) orderedColors.push(color);
+      } else if (
+        entry &&
+        typeof entry === "object" &&
+        (entry as { insert?: string }).insert === "matrixChannels"
+      ) {
+        const tmplList = (entry as { templateChannels?: unknown[] })
+          .templateChannels;
+        if (Array.isArray(tmplList)) {
+          for (const t of tmplList) {
+            if (typeof t === "string") {
+              const color = extractColorFromDef(tmpl[t]);
+              if (color) orderedColors.push(color);
+            }
+          }
+        }
+      }
+    }
+    if (orderedColors.length === 0) {
+      for (const def of [...Object.values(avail), ...Object.values(tmpl)]) {
+        const color = extractColorFromDef(def);
+        if (color) orderedColors.push(color);
+      }
+    }
+
+    const rgbLetters: string[] = [];
+    for (const c of orderedColors) {
+      const letter =
+        c === "Red" ? "R" : c === "Green" ? "G" : c === "Blue" ? "B" : null;
+      if (letter && !rgbLetters.includes(letter)) {
+        rgbLetters.push(letter);
+      }
+    }
+    const candidateOrder = rgbLetters.join("") as RgbChannelOrder;
+    const rgbOrder: RgbChannelOrder = RGB_CHANNEL_ORDERS.includes(candidateOrder)
+      ? candidateOrder
+      : "RGB";
+
+    const hasWarmWhite = orderedColors.includes("Warm White");
+    const hasColdWhite = orderedColors.includes("Cold White");
+    const hasWhite =
+      orderedColors.includes("White") || hasWarmWhite || hasColdWhite;
+    const whiteMode: WhiteChannelMode =
+      hasWarmWhite && hasColdWhite ? "ww_cw" : hasWhite ? "white" : "none";
+
+    const firstRgbIdx = orderedColors.findIndex(
+      (c) => c === "Red" || c === "Green" || c === "Blue",
+    );
+    const firstWhiteIdx = orderedColors.findIndex(
+      (c) => c === "White" || c === "Warm White" || c === "Cold White",
+    );
+    const whitePosition: WhiteChannelPosition =
+      firstWhiteIdx >= 0 && firstRgbIdx >= 0 && firstWhiteIdx < firstRgbIdx
+        ? "before"
+        : "after";
+
+    const includeMasterDimmer = Object.keys(avail).some((k) =>
+      k.toLowerCase().includes("dimmer"),
+    );
+    const includeStrobe = Object.keys(avail).some(
+      (k) => k.toLowerCase().includes("strobe") || k.toLowerCase().includes("shutter"),
+    );
+
+    const categories = Array.isArray(parsed.categories) ? parsed.categories : [];
+    const meta = parsed.meta as { authors?: string[] } | undefined;
+
+    return {
+      ...base,
+      name: typeof parsed.name === "string" && parsed.name.trim() ? parsed.name : base.name,
+      shortName:
+        typeof parsed.shortName === "string" && parsed.shortName.trim()
+          ? parsed.shortName
+          : base.shortName,
+      category: typeof categories[0] === "string" ? categories[0] : base.category,
+      author:
+        Array.isArray(meta?.authors) && typeof meta.authors[0] === "string"
+          ? meta.authors[0]
+          : base.author,
+      modeName: modes[0]?.name ?? base.modeName,
+      includeMasterDimmer,
+      includeStrobe,
+      colorMode,
+      rgbOrder,
+      whiteMode,
+      whitePosition,
+      isMatrix,
+      pixelCountX: isMatrix ? derivedX : 1,
+      pixelCountY: isMatrix ? derivedY : 1,
+      pixelCountZ: isMatrix ? derivedZ : 1,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function buildStrobeCapabilities(
@@ -242,7 +528,10 @@ function buildStrobeCapabilities(
   ];
 }
 
-export function buildOflFixtureJson(draft: FixtureBuilderDraft): string {
+export function buildOflFixtureJson(
+  draft: FixtureBuilderDraft,
+  options?: { includeDefaultMode?: boolean },
+): string {
   const today = new Date().toISOString().slice(0, 10);
   const availableChannels: Record<string, unknown> = {};
   const templateChannels: Record<string, unknown> = {};
@@ -276,12 +565,7 @@ export function buildOflFixtureJson(draft: FixtureBuilderDraft): string {
     modeChannels.push("Strobe");
   }
 
-  const colorNames =
-    draft.colorMode === "rgbw"
-      ? ["Red", "Green", "Blue", "White"]
-      : draft.colorMode === "rgb"
-        ? ["Red", "Green", "Blue"]
-        : [];
+  const colorNames = resolveDraftColorNames(draft);
 
   if (draft.colorMode === "wheel") {
     const slots =
@@ -394,13 +678,16 @@ export function buildOflFixtureJson(draft: FixtureBuilderDraft): string {
   }
 
   const expandedCountPreview = computeDraftChannelCount(draft);
-  root.modes = [
-    {
-      name: draft.modeName.trim() || `${expandedCountPreview}ch Mode`,
-      shortName: `${expandedCountPreview}ch`,
-      channels: modeChannels,
-    },
-  ];
+  root.modes =
+    options?.includeDefaultMode === false
+      ? []
+      : [
+          {
+            name: draft.modeName.trim() || `${expandedCountPreview}ch Mode`,
+            shortName: `${expandedCountPreview}ch`,
+            channels: modeChannels,
+          },
+        ];
 
   return JSON.stringify(root, null, 2);
 }
@@ -412,7 +699,7 @@ function computeDraftChannelCount(draft: FixtureBuilderDraft): number {
   if (draft.colorMode === "wheel") {
     count += 1;
   } else {
-    const colorCh = draft.colorMode === "rgbw" ? 4 : 3;
+    const colorCh = resolveDraftColorNames(draft).length;
     const pixels = draft.isMatrix
       ? Math.max(1, draft.pixelCountX) *
         Math.max(1, draft.pixelCountY) *
@@ -751,6 +1038,11 @@ export function validateAndExpandOflLocally(
       def: Record<string, unknown> | null;
       target: ChannelTarget;
     }> = [];
+    let modeCellsOverride: MatrixCell[] | null = null;
+    const pixelGroups =
+      (doc.matrix as { pixelGroups?: Record<string, unknown> } | undefined)
+        ?.pixelGroups ?? {};
+    const canonicalByKey = new Map(canonicalCells.map((c) => [c.pixel_key, c]));
 
     for (const entry of rawMode.channels) {
       if (entry === null) {
@@ -788,6 +1080,7 @@ export function validateAndExpandOflLocally(
       } else if (entry && typeof entry === "object") {
         const ins = entry as {
           insert?: string;
+          repeatFor?: string | string[];
           channelOrder?: "perPixel" | "perChannel";
           templateChannels?: string[];
         };
@@ -798,6 +1091,43 @@ export function validateAndExpandOflLocally(
             message: "matrixChannels insert requires matrix definition",
           });
           continue;
+        }
+        let targetCells = canonicalCells;
+        if (Array.isArray(ins.repeatFor)) {
+          const resolved: MatrixCell[] = [];
+          for (const key of ins.repeatFor) {
+            const direct = canonicalByKey.get(key);
+            if (direct) {
+              resolved.push(direct);
+            } else if (key in pixelGroups) {
+              const gDef = pixelGroups[key];
+              const members: MatrixCell[] =
+                gDef === "all"
+                  ? canonicalCells
+                  : Array.isArray(gDef)
+                    ? gDef
+                        .map((k) => canonicalByKey.get(String(k)))
+                        .filter((c): c is MatrixCell => Boolean(c))
+                    : [];
+              if (members.length > 0) {
+                const avgU =
+                  members.reduce((sum, c) => sum + c.local_uv[0], 0) / members.length;
+                const avgV =
+                  members.reduce((sum, c) => sum + c.local_uv[1], 0) / members.length;
+                const segIdx = resolved.length;
+                resolved.push({
+                  cell_index: segIdx,
+                  pixel_key: key,
+                  grid_xyz: [segIdx, 0, 0],
+                  local_uv: [avgU, avgV],
+                });
+              }
+            }
+          }
+          if (resolved.length > 0) {
+            targetCells = resolved;
+            modeCellsOverride = resolved;
+          }
         }
         const tplList = ins.templateChannels ?? [];
         if (ins.channelOrder === "perChannel") {
@@ -811,7 +1141,7 @@ export function validateAndExpandOflLocally(
               });
               continue;
             }
-            for (const cell of canonicalCells) {
+            for (const cell of targetCells) {
               pending.push({
                 name: tpl.replace("$pixelKey", cell.pixel_key),
                 def,
@@ -824,7 +1154,7 @@ export function validateAndExpandOflLocally(
             }
           }
         } else {
-          for (const cell of canonicalCells) {
+          for (const cell of targetCells) {
             for (const tpl of tplList) {
               const def = templates[tpl];
               if (!def) {
@@ -900,7 +1230,7 @@ export function validateAndExpandOflLocally(
       name: rawMode.name,
       short_name: rawMode.shortName ?? `${channels.length}ch`,
       channel_count: channels.length,
-      cells: canonicalCells,
+      cells: modeCellsOverride ?? canonicalCells,
       channels,
     });
   }
@@ -947,15 +1277,6 @@ function buildDetailFromJson(
 
 export function getDefaultShippedFixtures(): FixtureDetail[] {
   return [
-    buildDetailFromJson(
-      "age/rlcv3_8_segment_tube.json",
-      "age_built_in",
-      rlcv3Profile,
-    ),
-    buildDetailFromJson(
-      "age/rlcv4_16_segment_tube.json",
-      "age_built_in",
-      rlcv4Profile,
-    ),
+    buildDetailFromJson("standard/rlcv3.json", "standard", rlcv3Profile),
   ];
 }

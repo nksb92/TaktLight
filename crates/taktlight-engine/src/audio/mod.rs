@@ -155,6 +155,12 @@ impl AudioAnalysisCache {
     }
 
     pub fn insert(&mut self, transient_sensitivity: f32, result: AudioAnalysisResult) {
+        const MAX_AUDIO_CACHE_ENTRIES: usize = 32;
+        if self.entries.len() >= MAX_AUDIO_CACHE_ENTRIES {
+            if let Some(evict_key) = self.entries.keys().next().cloned() {
+                self.entries.remove(&evict_key);
+            }
+        }
         let key = Self::key(&result.sha256, transient_sensitivity);
         self.entries.insert(key, result);
     }
@@ -244,6 +250,7 @@ struct StreamingBandAnalyzer {
     bin_hi: usize,
     window: [f32; FFT_SIZE],
     ring: Vec<f32>,
+    write_pos: usize,
     filled: usize,
     total_samples: u64,
     hop_countdown: usize,
@@ -265,6 +272,7 @@ impl StreamingBandAnalyzer {
             bin_hi,
             window: build_hann_window(),
             ring: vec![0.0f32; FFT_SIZE],
+            write_pos: 0,
             filled: 0,
             total_samples: 0,
             hop_countdown: FFT_SIZE,
@@ -276,12 +284,10 @@ impl StreamingBandAnalyzer {
     }
 
     fn push_sample(&mut self, sample: f32) {
+        self.ring[self.write_pos] = sample;
+        self.write_pos = (self.write_pos + 1) & (FFT_SIZE - 1);
         if self.filled < FFT_SIZE {
-            self.ring[self.filled] = sample;
             self.filled += 1;
-        } else {
-            self.ring.copy_within(1.., 0);
-            self.ring[FFT_SIZE - 1] = sample;
         }
         self.total_samples += 1;
         self.hop_countdown = self.hop_countdown.saturating_sub(1);
@@ -293,9 +299,11 @@ impl StreamingBandAnalyzer {
     }
 
     fn compute_frame(&mut self) {
+        let start = self.write_pos;
         for i in 0..FFT_SIZE {
+            let ring_idx = (start + i) & (FFT_SIZE - 1);
             self.fft_buf[i] = Complex {
-                re: self.ring[i] * self.window[i],
+                re: self.ring[ring_idx] * self.window[i],
                 im: 0.0,
             };
         }
@@ -661,6 +669,7 @@ pub fn analyze_wav_bytes_streaming(
     }
     let bytes_per_sample = match (audio_format, bits_per_sample) {
         (1, 16) => 2usize,
+        (1, 24) => 3usize,
         (3, 32) => 4usize,
         _ => return Err(format!("unsupported WAV format {audio_format}/{bits_per_sample}-bit")),
     };
@@ -679,9 +688,14 @@ pub fn analyze_wav_bytes_streaming(
                 let base = f * frame_bytes;
                 for c in 0..ch {
                     let s_off = base + c * bytes_per_sample;
-                    let sample = if audio_format == 1 {
+                    let sample = if audio_format == 1 && bits_per_sample == 16 {
                         let raw = i16::from_le_bytes([data[s_off], data[s_off + 1]]);
                         (raw as f32) / 32768.0
+                    } else if audio_format == 1 && bits_per_sample == 24 {
+                        let b0 = data[s_off] as i32;
+                        let b1 = (data[s_off + 1] as i32) << 8;
+                        let b2 = (data[s_off + 2] as i8 as i32) << 16;
+                        ((b0 | b1 | b2) as f32) / 8_388_608.0
                     } else {
                         f32::from_le_bytes([
                             data[s_off],

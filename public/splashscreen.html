@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TaktLight</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        user-select: none;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0a0f18;
+        color: #f2f6fb;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      .shell {
+        width: 100%;
+        height: 100%;
+        border: 1px solid #243247;
+        border-radius: 10px;
+        background: radial-gradient(circle at 50% 25%, #162236 0%, #0a0f18 72%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        padding: 24px;
+      }
+      .logo-ring {
+        width: 56px;
+        height: 56px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #ff5500, #ff8c42);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 0 28px rgba(255, 85, 0, 0.35);
+      }
+      .title {
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .subtitle {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        color: #94a3b8;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      .bar {
+        width: 220px;
+        height: 3px;
+        border-radius: 999px;
+        background: #1e293b;
+        overflow: hidden;
+        margin-top: 8px;
+      }
+      .bar-fill {
+        width: 45%;
+        height: 100%;
+        background: linear-gradient(90deg, #ff5500, #38bdf8);
+        animation: slide 1.15s ease-in-out infinite;
+      }
+      @keyframes slide {
+        0% {
+          transform: translateX(-100%);
+        }
+        100% {
+          transform: translateX(260%);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="logo-ring">
+        <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
+          <path
+            d="M13 2L4 14h7l-1 8 10-12h-7l0-8z"
+            fill="#0A0F18"
+            stroke="#0A0F18"
+            stroke-width="1.5"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </div>
+      <div class="title">TaktLight</div>
+      <div class="subtitle">DMX Lighting Controller</div>
+      <div class="bar"><div class="bar-fill"></div></div>
+    </div>
+  </body>
+</html>

@@ -26,6 +26,8 @@ pub struct ArtPollReplyNode {
     pub num_ports: u8,
     pub sw_out: [u8; 4],
     pub mac: [u8; 6],
+    #[serde(default)]
+    pub bind_index: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,7 +39,7 @@ pub struct TrackedArtNetNode {
 
 #[derive(Debug, Default, Clone)]
 pub struct NodeDiscoveryTracker {
-    nodes: BTreeMap<Ipv4Addr, TrackedArtNetNode>,
+    nodes: BTreeMap<(Ipv4Addr, u8), TrackedArtNetNode>,
 }
 
 impl NodeDiscoveryTracker {
@@ -47,7 +49,7 @@ impl NodeDiscoveryTracker {
 
     pub fn record_reply(&mut self, node: ArtPollReplyNode, now_sec: f64) {
         self.nodes.insert(
-            node.ip,
+            (node.ip, node.bind_index),
             TrackedArtNetNode {
                 node,
                 last_seen_sec: now_sec,
@@ -146,6 +148,7 @@ pub fn parse_artpoll_reply(buf: &[u8]) -> Result<ArtPollReplyNode, ProtocolError
     let num_ports = u16::from_be_bytes([buf[172], buf[173]]).min(4) as u8;
     let sw_out = [buf[190], buf[191], buf[192], buf[193]];
     let mac = [buf[201], buf[202], buf[203], buf[204], buf[205], buf[206]];
+    let bind_index = if buf.len() >= 208 { buf[207] } else { 0 };
 
     Ok(ArtPollReplyNode {
         ip,
@@ -157,6 +160,7 @@ pub fn parse_artpoll_reply(buf: &[u8]) -> Result<ArtPollReplyNode, ProtocolError
         num_ports,
         sw_out,
         mac,
+        bind_index,
     })
 }
 
@@ -272,6 +276,7 @@ mod tests {
             num_ports: 1,
             sw_out: [0, 0, 0, 0],
             mac: [1, 2, 3, 4, 5, 6],
+            bind_index: 1,
         };
 
         tracker.record_reply(node.clone(), 5.0);
@@ -281,7 +286,16 @@ mod tests {
         tracker.refresh_status(15.1);
         assert!(!tracker.nodes()[0].online);
 
-        tracker.record_reply(node, 16.0);
+        tracker.record_reply(node.clone(), 16.0);
         assert!(tracker.nodes()[0].online);
+
+        // Multi-port Art-Net 4 node with same IP but distinct BindIndex must not overwrite
+        let mut node_page2 = node;
+        node_page2.bind_index = 2;
+        node_page2.sw_out = [4, 5, 6, 7];
+        tracker.record_reply(node_page2, 16.0);
+        assert_eq!(tracker.nodes().len(), 2);
+        assert_eq!(tracker.nodes()[0].node.bind_index, 1);
+        assert_eq!(tracker.nodes()[1].node.bind_index, 2);
     }
 }

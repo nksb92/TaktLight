@@ -1,12 +1,20 @@
 {
   "name": "taktlight-ui",
   "private": true,
-  "version": "0.1.0",
+  "version": "2026.11.25",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:debug": "node scripts/launch-tauri-cdp.mjs",
+    "dev:debug:prebuilt": "node scripts/launch-tauri-cdp.mjs --prebuilt",
     "build": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "version:sync": "node scripts/sync-version.mjs",
     "test": "vitest",
+    "test:e2e": "playwright test",
+    "test:ui-layout": "playwright test e2e/ui-layout-audit.spec.ts",
+    "test:e2e:tauri": "playwright test --config=playwright.tauri.config.ts",
+    "test:dmx-sniff": "node scripts/dmx-sniffer-cli.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -19,11 +27,14 @@
     "zustand": "^5.0.2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@tauri-apps/cli": "^2.12.6",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/coverage-v8": "^2.1.9",
     "autoprefixer": "^10.4.20",
     "jsdom": "^25.0.1",
     "postcss": "^8.4.49",
