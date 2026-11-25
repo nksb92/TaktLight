@@ -73,6 +73,7 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for system architecture, OFL 
   * Outputs `target\release\taktlight-app.exe` and `target\release\bundle\nsis\TaktLight_<version>_x64-setup.exe`.
 * **Debug Build (Standalone Debug EXE):** Run `build-debug.bat`
   * Outputs `target\debug\taktlight-app.exe` with embedded frontend assets, console output, and DevTools enabled.
+* **Automated GitHub Releases:** Pushing a `vYYYY.M.D` tag (e.g. `git tag v2026.11.25 && git push origin v2026.11.25`) triggers `.github/workflows/release.yml`, which syncs the version, runs Rust and frontend tests, builds the Windows installer + portable EXE + `SHA256SUMS.txt`, and publishes the GitHub Release automatically.
 
 ### Running Tests
 * **Rust engine & backend tests:** `cargo test`
